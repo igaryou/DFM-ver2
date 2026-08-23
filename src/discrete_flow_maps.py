@@ -122,22 +122,68 @@ def sample_consistency_times(
     raise ValueError(f"Unknown consistency loss: {loss_type}")
 
 
+def source_alignment_map_from_indices(
+    mu_full: torch.Tensor,
+    target_full: torch.Tensor,
+    *,
+    num_classes: int,
+    eps: float,
+    valid_mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """One-hot-free equivalent of mean((normalize(mu) - normalize(e_y))**2)."""
+    if mu_full.shape != (
+        target_full.shape[0], num_classes, *target_full.shape[-2:]
+    ):
+        raise ValueError(
+            f"mu_full shape {tuple(mu_full.shape)} is incompatible with "
+            f"target_full {tuple(target_full.shape)} and {num_classes} classes"
+        )
+    in_range = (target_full >= 0) & (target_full < num_classes)
+    if valid_mask is None:
+        if not bool(in_range.all()):
+            raise ValueError("target_full contains an out-of-range class index")
+        gather_mask = in_range
+    else:
+        if valid_mask.shape != target_full.shape:
+            raise ValueError("valid_mask and target_full must have identical shapes")
+        valid_mask = valid_mask.to(device=target_full.device, dtype=torch.bool)
+        if bool((valid_mask & ~in_range).any()):
+            raise ValueError("a valid target pixel contains an out-of-range class index")
+        gather_mask = valid_mask & in_range
+    safe_target = torch.where(
+        gather_mask, target_full, torch.zeros_like(target_full)
+    )
+    mu_norm = F.normalize(mu_full, dim=1, eps=eps)
+    target_component = mu_norm.gather(
+        1, safe_target.unsqueeze(1)
+    ).squeeze(1)
+    # F.normalize(one_hot, eps) has magnitude 1/max(1, eps).
+    target_scale = 1.0 / max(1.0, float(eps))
+    return (
+        mu_norm.square().sum(dim=1)
+        + target_scale**2
+        - 2.0 * target_scale * target_component
+    ) / num_classes
+
+
 def sample_prior(
     config: dict,
     image: torch.Tensor,
-    target_one_hot: torch.Tensor | None,
+    target_one_hot_state: torch.Tensor | None,
     source_model,
-    valid_mask: torch.Tensor | None = None,
     *,
     target_full: torch.Tensor | None = None,
-    target_one_hot_full: torch.Tensor | None = None,
     valid_mask_full: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Sample state-resolution x0 and compute optional full-resolution supervision."""
     factor = config.get("model", {}).get("state_downsample_factor", 1)
     expected_size = state_spatial_size(image, factor)
-    batch, _, height, width = target_one_hot.shape if target_one_hot is not None else (
-        image.shape[0], config["dataset"]["num_classes"], *expected_size
+    batch, _, height, width = (
+        target_one_hot_state.shape
+        if target_one_hot_state is not None
+        else (
+            image.shape[0], config["dataset"]["num_classes"], *expected_size
+        )
     )
     if (height, width) != expected_size:
         raise AssertionError(
@@ -158,8 +204,8 @@ def sample_prior(
             "weighted_source_supervision": zero,
             "source_x0_abs": x0.detach().abs().mean(),
         }
-        if target_one_hot is not None:
-            stats["target_x1_abs"] = target_one_hot.detach().abs().mean()
+        if target_one_hot_state is not None:
+            stats["target_x1_abs"] = target_one_hot_state.detach().abs().mean()
         return x0, stats
     if source["prior_type"] == "dirichlet":
         concentration = torch.ones(classes, device=image.device, dtype=torch.float32)
@@ -173,8 +219,8 @@ def sample_prior(
             "weighted_source_supervision": zero,
             "source_x0_abs": x0.detach().abs().mean(),
         }
-        if target_one_hot is not None:
-            stats["target_x1_abs"] = target_one_hot.detach().abs().mean()
+        if target_one_hot_state is not None:
+            stats["target_x1_abs"] = target_one_hot_state.detach().abs().mean()
         return x0, stats
     if source_model is None:
         raise RuntimeError("source.prior_type=image_gaussian requires a source model")
@@ -201,27 +247,26 @@ def sample_prior(
     else:
         supervision_type = "align" if source.get("use_loss_align", False) else "none"
         supervision_weight = source.get("align_weight", 0.0)
-    if valid_mask_full is None:
-        valid_mask_full = valid_mask
-    if target_full is None and target_one_hot_full is not None:
-        target_full = target_one_hot_full.argmax(dim=1)
-    if target_full is None and target_one_hot is not None:
-        target_full = target_one_hot.argmax(dim=1)
+    if (
+        supervision_type in {"align", "cross_entropy"}
+        and target_one_hot_state is not None
+        and target_full is None
+    ):
+        raise ValueError(
+            f"source supervision {supervision_type!r} requires integer target_full"
+        )
 
     loss_align = zero
     loss_ce = zero
     if supervision_type == "align" and target_full is not None:
         mu_full = resize_continuous(mu, target_full.shape[-2:])
-        if target_one_hot_full is None:
-            target_one_hot_full = F.one_hot(
-                target_full, num_classes=classes
-            ).permute(0, 3, 1, 2).float()
-        assert target_one_hot_full.shape == mu_full.shape
-        mu_norm = F.normalize(mu_full, dim=1, eps=source["align_eps"])
-        target_norm = F.normalize(
-            target_one_hot_full.to(mu_full), dim=1, eps=source["align_eps"]
+        alignment_map = source_alignment_map_from_indices(
+            mu_full,
+            target_full,
+            num_classes=classes,
+            eps=source["align_eps"],
+            valid_mask=valid_mask_full,
         )
-        alignment_map = (mu_norm - target_norm).square().mean(dim=1)
         if valid_mask_full is None:
             loss_align = alignment_map.mean()
         else:
@@ -266,9 +311,9 @@ def sample_prior(
         "source_sigma_mean": sigma.mean(),
         "source_x0_abs": x0.detach().abs().mean(),
     }
-    if target_one_hot is not None:
-        stats["target_x1_abs"] = target_one_hot.detach().abs().mean()
-        assert x0.shape == target_one_hot.shape
+    if target_one_hot_state is not None:
+        stats["target_x1_abs"] = target_one_hot_state.detach().abs().mean()
+        assert x0.shape == target_one_hot_state.shape
     return x0, stats
 
 

@@ -133,15 +133,10 @@ def test_ade20k_train_pipeline_keeps_geometry_and_class_zero_state(tmp_path, mon
 
     torch.manual_seed(9)
     dataset = build_dataset(config, "training", augment=True)
-    transformed_image, one_hot, transformed_mask = dataset[0]
+    transformed_image, transformed_mask = dataset[0]
     assert transformed_image.shape == (3, 4, 4)
     assert transformed_mask.shape == (4, 4)
-    assert one_hot.shape == (151, 4, 4)
-    assert torch.equal(one_hot.argmax(0), transformed_mask)
-    assert torch.all(one_hot.sum(0) == 1)
-    zero = transformed_mask == 0
-    if zero.any():
-        assert torch.all(one_hot[0][zero] == 1)
+    assert transformed_mask.dtype == torch.long
 
 
 def test_photo_metric_distortion_never_changes_mask():
@@ -186,17 +181,21 @@ def test_source_alignment_uses_valid_pixel_reduction():
         },
     }
     image = torch.zeros(1, 3, 2, 2)
-    target = torch.nn.functional.one_hot(
-        torch.tensor([[[0, 1], [2, 1]]]), 3
+    target_full = torch.tensor([[[0, 1], [2, 1]]])
+    target_state = torch.nn.functional.one_hot(
+        target_full, 3
     ).permute(0, 3, 1, 2).float()
-    _, all_stats = sample_prior(config, image, target, _Source())
+    _, all_stats = sample_prior(
+        config, image, target_state, _Source(), target_full=target_full
+    )
     _, masked_stats = sample_prior(
-        config, image, target, _Source(),
-        valid_mask=torch.tensor([[[False, True], [False, False]]]),
+        config, image, target_state, _Source(), target_full=target_full,
+        valid_mask_full=torch.tensor([[[False, True], [False, False]]]),
     )
     assert masked_stats["loss_source_align"] != all_stats["loss_source_align"]
     _, ignored_stats = sample_prior(
-        config, image, target, _Source(), valid_mask=torch.zeros(1, 2, 2, dtype=torch.bool)
+        config, image, target_state, _Source(), target_full=target_full,
+        valid_mask_full=torch.zeros(1, 2, 2, dtype=torch.bool),
     )
     assert ignored_stats["loss_source_align"] == 0
 
@@ -297,7 +296,7 @@ def test_optimizer_step_budget_counts_accumulation_scheduler_and_final_validatio
     config["evaluation"]["interval"]["value"] = interval_steps
     config["wandb"]["enabled"] = False
     batches = [
-        (torch.zeros(1, 1), torch.zeros(1, 1), torch.zeros(1, dtype=torch.long))
+        (torch.zeros(1, 1), torch.zeros(1, dtype=torch.long))
         for _ in range(100)
     ]
     endpoint, source = nn.Linear(1, 1, bias=False), nn.Linear(1, 1, bias=False)

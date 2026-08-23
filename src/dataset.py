@@ -194,8 +194,7 @@ class Cityscapes20ClassDataset(Dataset):
                 "std": [0.229, 0.224, 0.225],
             })
 
-        one_hot = F.one_hot(mask, num_classes=20).permute(2, 0, 1).float()
-        return image, one_hot, mask
+        return image, mask
 
 
 class ADE20KDataset(Dataset):
@@ -300,8 +299,7 @@ class ADE20KDataset(Dataset):
             image, mask = _pad_to(
                 image, mask, *pad["size"], pad["image_value"], pad["mask_value"]
             )
-        one_hot = F.one_hot(mask, num_classes=151).permute(2, 0, 1).float()
-        return image, one_hot, mask
+        return image, mask
 
     def _validation_item(self, image: torch.Tensor, mask: torch.Tensor, index: int) -> dict:
         evaluation = self.config["evaluation"]

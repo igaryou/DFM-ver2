@@ -69,9 +69,8 @@ def main() -> None:
     dataset = build_dataset(
         config, config["dataset"]["train_split"], augment=True
     )
-    image, one_hot, target = dataset[0]
+    image, target = dataset[0]
     image = image[None].to(device)
-    one_hot = one_hot[None].to(device)
     target = target[None].to(device)
 
     endpoint, source = tiny_components(config, device)
@@ -88,7 +87,6 @@ def main() -> None:
             adapter,
             operation="stage1_objectives",
             image=image,
-            one_hot=one_hot,
             target=target,
             epoch_index=0,
             progress_in_epoch=0.0,
@@ -133,12 +131,20 @@ def main() -> None:
 
     print({
         "dataset": config["dataset"]["name"],
-        "image": tuple(image.shape),
-        "target_full": tuple(target.shape),
+        "training_batch": {
+            "image": tuple(image.shape),
+            "target_full": tuple(target.shape),
+        },
         "state": (
             int(result["stats"]["state_height"]),
             int(result["stats"]["state_width"]),
         ),
+        "one_hot_state": (
+            image.shape[0], config["dataset"]["num_classes"],
+            int(result["stats"]["state_height"]),
+            int(result["stats"]["state_width"]),
+        ),
+        "full_target_one_hot_present": False,
         "prediction": tuple(prediction.shape),
         "loss": float(result["loss"].detach()),
         "finite": bool(torch.isfinite(result["loss"])),

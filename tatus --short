@@ -1,0 +1,859 @@
+[1mdiff --git a/README.md b/README.md[m
+[1mindex 820073d..95bcab9 100644[m
+[1m--- a/README.md[m
+[1m+++ b/README.md[m
+[36m@@ -50,7 +50,9 @@[m [msource:[m
+ ```[m
+ [m
+ `align`はstate `mu`をfull resolutionへbilinear拡大して既存のnormalized[m
+[31m-alignmentを計算します。`cross_entropy`は`mu`をraw logitsとしてfull resolution[m
+[32m+[m[32malignmentを計算します。GTのfull one-hotは生成せず、normalized `mu`の二乗和と[m
+[32m+[m[32minteger GT classに対する`gather`から数学的に等価な値を求めます。[m
+[32m+[m[32m`cross_entropy`は`mu`をraw logitsとしてfull resolution[m
+ へ拡大し、softmaxせずCEへ渡します。旧`use_loss_align/align_weight`だけを持つ[m
+ configもload時に新形式へ変換されます。[m
+ [m
+[36m@@ -62,6 +64,12 @@[m [mconfigもload時に新形式へ変換されます。[m
+ primary/source CEは`ignore_index=0`です。151 stateおよび評価class 1..150は[m
+ 変更していません。Cityscapesは20 state、void index 19、評価19 classを維持します。[m
+ [m
+[32m+[m[32mtraining Dataset/DataLoaderの返り値は両datasetとも`(image, target_full)`だけです。[m
+[32m+[m[32mCPUでもGPUでも`[B,C,H,W]`のfull-resolution target one-hotは作りません。[m
+[32m+[m[32mGPUへinteger targetを転送した後、`prepare_state_targets()`がinteger GTをnearestで[m
+[32m+[m[32mstate解像度へ縮小し、その`target_state`だけをone-hot化します。ADE20K 512×512では[m
+[32m+[m[32m`one_hot_state`は`[B,151,128,128]`であり、旧`[B,151,512,512]`の1/16要素数です。[m
+[32m+[m
+ 推論はstateのC-channel continuous terminal outputをpadded入力解像度へbilinear[m
+ resizeし、padding除去、original GT解像度へのbilinear resize、最後にargmaxの順です。[m
+ ADE20Kのaspect ratio保持、幅2048以下・高さ512以下、size divisor、original-resolution[m
+[1mdiff --git a/configs/joint_psd_ade20k.yaml b/configs/joint_psd_ade20k.yaml[m
+[1mindex 5cf2f13..e685e8c 100644[m
+[1m--- a/configs/joint_psd_ade20k.yaml[m
+[1m+++ b/configs/joint_psd_ade20k.yaml[m
+[36m@@ -29,7 +29,7 @@[m [mdataset:[m
+   val_split: validation[m
+   image_size: [512, 512][m
+   crop_size: null[m
+[31m-  num_workers: 8[m
+[32m+[m[32m  num_workers: 4[m
+   pin_memory: true[m
+   persistent_workers: true[m
+ augmentation:[m
+[36m@@ -116,8 +116,8 @@[m [mtraining:[m
+   max_iterations: null[m
+   max_optimizer_steps: 160000[m
+   max_batches_per_epoch: null[m
+[31m-  batch_size: 4  # global physical batch: 2 per GPU x 2 GPUs[m
+[31m-  grad_accum_steps: 4[m
+[32m+[m[32m  batch_size: 16  # global physical batch: 8 per GPU x 2 GPUs[m
+[32m+[m[32m  grad_accum_steps: 1[m
+   optimizer:[m
+     name: adamw[m
+     lr: 1.0e-4[m
+[1mdiff --git a/scripts/smoke_real_data.py b/scripts/smoke_real_data.py[m
+[1mindex bac480f..fd37e7d 100644[m
+[1m--- a/scripts/smoke_real_data.py[m
+[1m+++ b/scripts/smoke_real_data.py[m
+[36m@@ -69,9 +69,8 @@[m [mdef main() -> None:[m
+     dataset = build_dataset([m
+         config, config["dataset"]["train_split"], augment=True[m
+     )[m
+[31m-    image, one_hot, target = dataset[0][m
+[32m+[m[32m    image, target = dataset[0][m
+     image = image[None].to(device)[m
+[31m-    one_hot = one_hot[None].to(device)[m
+     target = target[None].to(device)[m
+ [m
+     endpoint, source = tiny_components(config, device)[m
+[36m@@ -88,7 +87,6 @@[m [mdef main() -> None:[m
+             adapter,[m
+             operation="stage1_objectives",[m
+             image=image,[m
+[31m-            one_hot=one_hot,[m
+             target=target,[m
+             epoch_index=0,[m
+             progress_in_epoch=0.0,[m
+[36m@@ -133,12 +131,20 @@[m [mdef main() -> None:[m
+ [m
+     print({[m
+         "dataset": config["dataset"]["name"],[m
+[31m-        "image": tuple(image.shape),[m
+[31m-        "target_full": tuple(target.shape),[m
+[32m+[m[32m        "training_batch": {[m
+[32m+[m[32m            "image": tuple(image.shape),[m
+[32m+[m[32m            "target_full": tuple(target.shape),[m
+[32m+[m[32m        },[m
+         "state": ([m
+             int(result["stats"]["state_height"]),[m
+             int(result["stats"]["state_width"]),[m
+         ),[m
+[32m+[m[32m        "one_hot_state": ([m
+[32m+[m[32m            image.shape[0], config["dataset"]["num_classes"],[m
+[32m+[m[32m            int(result["stats"]["state_height"]),[m
+[32m+[m[32m            int(result["stats"]["state_width"]),[m
+[32m+[m[32m        ),[m
+[32m+[m[32m        "full_target_one_hot_present": False,[m
+         "prediction": tuple(prediction.shape),[m
+         "loss": float(result["loss"].detach()),[m
+         "finite": bool(torch.isfinite(result["loss"])),[m
+[1mdiff --git a/scripts/train_joint_psd_ddp.sh b/scripts/train_joint_psd_ddp.sh[m
+[1mindex 9c0897d..c4579e1 100755[m
+[1m--- a/scripts/train_joint_psd_ddp.sh[m
+[1m+++ b/scripts/train_joint_psd_ddp.sh[m
+[36m@@ -6,3 +6,12 @@[m [mPYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \[m
+ CUDA_VISIBLE_DEVICES=0,1 \[m
+ uv run torchrun --standalone --nproc_per_node=2 src/train_joint.py \[m
+   --config configs/joint_psd_cityscapes.yaml[m
+[32m+[m
+[32m+[m[32mcd /home/igarashi_25/DFM[m
+[32m+[m
+[32m+[m[32mCUDA_VISIBLE_DEVICES=2,3 \[m
+[32m+[m[32muv run torchrun \[m
+[32m+[m[32m  --standalone \[m
+[32m+[m[32m  --nproc_per_node=2 \[m
+[32m+[m[32m  src/train_joint.py \[m
+[32m+[m[32m  --config configs/joint_psd_ade20k.yaml[m
+\ No newline at end of file[m
+[1mdiff --git a/src/dataset.py b/src/dataset.py[m
+[1mindex 59b06c9..fa3fd3a 100644[m
+[1m--- a/src/dataset.py[m
+[1m+++ b/src/dataset.py[m
+[36m@@ -194,8 +194,7 @@[m [mclass Cityscapes20ClassDataset(Dataset):[m
+                 "std": [0.229, 0.224, 0.225],[m
+             })[m
+ [m
+[31m-        one_hot = F.one_hot(mask, num_classes=20).permute(2, 0, 1).float()[m
+[31m-        return image, one_hot, mask[m
+[32m+[m[32m        return image, mask[m
+ [m
+ [m
+ class ADE20KDataset(Dataset):[m
+[36m@@ -300,8 +299,7 @@[m [mclass ADE20KDataset(Dataset):[m
+             image, mask = _pad_to([m
+                 image, mask, *pad["size"], pad["image_value"], pad["mask_value"][m
+             )[m
+[31m-        one_hot = F.one_hot(mask, num_classes=151).permute(2, 0, 1).float()[m
+[31m-        return image, one_hot, mask[m
+[32m+[m[32m        return image, mask[m
+ [m
+     def _validation_item(self, image: torch.Tensor, mask: torch.Tensor, index: int) -> dict:[m
+         evaluation = self.config["evaluation"][m
+[1mdiff --git a/src/discrete_flow_maps.py b/src/discrete_flow_maps.py[m
+[1mindex 056ef6c..d97782a 100644[m
+[1m--- a/src/discrete_flow_maps.py[m
+[1m+++ b/src/discrete_flow_maps.py[m
+[36m@@ -122,22 +122,68 @@[m [mdef sample_consistency_times([m
+     raise ValueError(f"Unknown consistency loss: {loss_type}")[m
+ [m
+ [m
+[32m+[m[32mdef source_alignment_map_from_indices([m
+[32m+[m[32m    mu_full: torch.Tensor,[m
+[32m+[m[32m    target_full: torch.Tensor,[m
+[32m+[m[32m    *,[m
+[32m+[m[32m    num_classes: int,[m
+[32m+[m[32m    eps: float,[m
+[32m+[m[32m    valid_mask: torch.Tensor | None = None,[m
+[32m+[m[32m) -> torch.Tensor:[m
+[32m+[m[32m    """One-hot-free equivalent of mean((normalize(mu) - normalize(e_y))**2)."""[m
+[32m+[m[32m    if mu_full.shape != ([m
+[32m+[m[32m        target_full.shape[0], num_classes, *target_full.shape[-2:][m
+[32m+[m[32m    ):[m
+[32m+[m[32m        raise ValueError([m
+[32m+[m[32m            f"mu_full shape {tuple(mu_full.shape)} is incompatible with "[m
+[32m+[m[32m            f"target_full {tuple(target_full.shape)} and {num_classes} classes"[m
+[32m+[m[32m        )[m
+[32m+[m[32m    in_range = (target_full >= 0) & (target_full < num_classes)[m
+[32m+[m[32m    if valid_mask is None:[m
+[32m+[m[32m        if not bool(in_range.all()):[m
+[32m+[m[32m            raise ValueError("target_full contains an out-of-range class index")[m
+[32m+[m[32m        gather_mask = in_range[m
+[32m+[m[32m    else:[m
+[32m+[m[32m        if valid_mask.shape != target_full.shape:[m
+[32m+[m[32m            raise ValueError("valid_mask and target_full must have identical shapes")[m
+[32m+[m[32m        valid_mask = valid_mask.to(device=target_full.device, dtype=torch.bool)[m
+[32m+[m[32m        if bool((valid_mask & ~in_range).any()):[m
+[32m+[m[32m            raise ValueError("a valid target pixel contains an out-of-range class index")[m
+[32m+[m[32m        gather_mask = valid_mask & in_range[m
+[32m+[m[32m    safe_target = torch.where([m
+[32m+[m[32m        gather_mask, target_full, torch.zeros_like(target_full)[m
+[32m+[m[32m    )[m
+[32m+[m[32m    mu_norm = F.normalize(mu_full, dim=1, eps=eps)[m
+[32m+[m[32m    target_component = mu_norm.gather([m
+[32m+[m[32m        1, safe_target.unsqueeze(1)[m
+[32m+[m[32m    ).squeeze(1)[m
+[32m+[m[32m    # F.normalize(one_hot, eps) has magnitude 1/max(1, eps).[m
+[32m+[m[32m    target_scale = 1.0 / max(1.0, float(eps))[m
+[32m+[m[32m    return ([m
+[32m+[m[32m        mu_norm.square().sum(dim=1)[m
+[32m+[m[32m        + target_scale**2[m
+[32m+[m[32m        - 2.0 * target_scale * target_component[m
+[32m+[m[32m    ) / num_classes[m
+[32m+[m
+[32m+[m
+ def sample_prior([m
+     config: dict,[m
+     image: torch.Tensor,[m
+[31m-    target_one_hot: torch.Tensor | None,[m
+[32m+[m[32m    target_one_hot_state: torch.Tensor | None,[m
+     source_model,[m
+[31m-    valid_mask: torch.Tensor | None = None,[m
+     *,[m
+     target_full: torch.Tensor | None = None,[m
+[31m-    target_one_hot_full: torch.Tensor | None = None,[m
+     valid_mask_full: torch.Tensor | None = None,[m
+ ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:[m
+     """Sample state-resolution x0 and compute optional full-resolution supervision."""[m
+     factor = config.get("model", {}).get("state_downsample_factor", 1)[m
+     expected_size = state_spatial_size(image, factor)[m
+[31m-    batch, _, height, width = target_one_hot.shape if target_one_hot is not None else ([m
+[31m-        image.shape[0], config["dataset"]["num_classes"], *expected_size[m
+[32m+[m[32m    batch, _, height, width = ([m
+[32m+[m[32m        target_one_hot_state.shape[m
+[32m+[m[32m        if target_one_hot_state is not None[m
+[32m+[m[32m        else ([m
+[32m+[m[32m            image.shape[0], config["dataset"]["num_classes"], *expected_size[m
+[32m+[m[32m        )[m
+     )[m
+     if (height, width) != expected_size:[m
+         raise AssertionError([m
+[36m@@ -158,8 +204,8 @@[m [mdef sample_prior([m
+             "weighted_source_supervision": zero,[m
+             "source_x0_abs": x0.detach().abs().mean(),[m
+         }[m
+[31m-        if target_one_hot is not None:[m
+[31m-            stats["target_x1_abs"] = target_one_hot.detach().abs().mean()[m
+[32m+[m[32m        if target_one_hot_state is not None:[m
+[32m+[m[32m            stats["target_x1_abs"] = target_one_hot_state.detach().abs().mean()[m
+         return x0, stats[m
+     if source["prior_type"] == "dirichlet":[m
+         concentration = torch.ones(classes, device=image.device, dtype=torch.float32)[m
+[36m@@ -173,8 +219,8 @@[m [mdef sample_prior([m
+             "weighted_source_supervision": zero,[m
+             "source_x0_abs": x0.detach().abs().mean(),[m
+         }[m
+[31m-        if target_one_hot is not None:[m
+[31m-            stats["target_x1_abs"] = target_one_hot.detach().abs().mean()[m
+[32m+[m[32m        if target_one_hot_state is not None:[m
+[32m+[m[32m            stats["target_x1_abs"] = target_one_hot_state.detach().abs().mean()[m
+         return x0, stats[m
+     if source_model is None:[m
+         raise RuntimeError("source.prior_type=image_gaussian requires a source model")[m
+[36m@@ -201,27 +247,26 @@[m [mdef sample_prior([m
+     else:[m
+         supervision_type = "align" if source.get("use_loss_align", False) else "none"[m
+         supervision_weight = source.get("align_weight", 0.0)[m
+[31m-    if valid_mask_full is None:[m
+[31m-        valid_mask_full = valid_mask[m
+[31m-    if target_full is None and target_one_hot_full is not None:[m
+[31m-        target_full = target_one_hot_full.argmax(dim=1)[m
+[31m-    if target_full is None and target_one_hot is not None:[m
+[31m-        target_full = target_one_hot.argmax(dim=1)[m
+[32m+[m[32m    if ([m
+[32m+[m[32m        supervision_type in {"align", "cross_entropy"}[m
+[32m+[m[32m        and target_one_hot_state is not None[m
+[32m+[m[32m        and target_full is None[m
+[32m+[m[32m    ):[m
+[32m+[m[32m        raise ValueError([m
+[32m+[m[32m            f"source supervision {supervision_type!r} requires integer target_full"[m
+[32m+[m[32m        )[m
+ [m
+     loss_align = zero[m
+     loss_ce = zero[m
+     if supervision_type == "align" and target_full is not None:[m
+         mu_full = resize_continuous(mu, target_full.shape[-2:])[m
+[31m-        if target_one_hot_full is None:[m
+[31m-            target_one_hot_full = F.one_hot([m
+[31m-                target_full, num_classes=classes[m
+[31m-            ).permute(0, 3, 1, 2).float()[m
+[31m-        assert target_one_hot_full.shape == mu_full.shape[m
+[31m-        mu_norm = F.normalize(mu_full, dim=1, eps=source["align_eps"])[m
+[31m-        target_norm = F.normalize([m
+[31m-            target_one_hot_full.to(mu_full), dim=1, eps=source["align_eps"][m
+[32m+[m[32m        alignment_map = source_alignment_map_from_indices([m
+[32m+[m[32m            mu_full,[m
+[32m+[m[32m            target_full,[m
+[32m+[m[32m            num_classes=classes,[m
+[32m+[m[32m            eps=source["align_eps"],[m
+[32m+[m[32m            valid_mask=valid_mask_full,[m
+         )[m
+[31m-        alignment_map = (mu_norm - target_norm).square().mean(dim=1)[m
+         if valid_mask_full is None:[m
+             loss_align = alignment_map.mean()[m
+         else:[m
+[36m@@ -266,9 +311,9 @@[m [mdef sample_prior([m
+         "source_sigma_mean": sigma.mean(),[m
+         "source_x0_abs": x0.detach().abs().mean(),[m
+     }[m
+[31m-    if target_one_hot is not None:[m
+[31m-        stats["target_x1_abs"] = target_one_hot.detach().abs().mean()[m
+[31m-        assert x0.shape == target_one_hot.shape[m
+[32m+[m[32m    if target_one_hot_state is not None:[m
+[32m+[m[32m        stats["target_x1_abs"] = target_one_hot_state.detach().abs().mean()[m
+[32m+[m[32m        assert x0.shape == target_one_hot_state.shape[m
+     return x0, stats[m
+ [m
+ [m
+[1mdiff --git a/src/evaluate.py b/src/evaluate.py[m
+[1mindex 46d4fd8..ed365c9 100644[m
+[1m--- a/src/evaluate.py[m
+[1m+++ b/src/evaluate.py[m
+[36m@@ -119,7 +119,7 @@[m [mdef evaluate(config: dict, checkpoint_path: str | Path) -> dict:[m
+                     metrics.update(prediction, target)[m
+                     items.append((image, target, prediction))[m
+             else:[m
+[31m-                image, _, target = batch[m
+[32m+[m[32m                image, target = batch[m
+                 image = image.to(device, non_blocking=True)[m
+                 target = target.to(device, non_blocking=True)[m
+                 with autocast_context(config, device):[m
+[1mdiff --git a/src/trainer.py b/src/trainer.py[m
+[1mindex eab195f..dc58bbc 100644[m
+[1m--- a/src/trainer.py[m
+[1m+++ b/src/trainer.py[m
+[36m@@ -650,7 +650,7 @@[m [mdef validate([m
+                 metrics.update(prediction, target)[m
+                 visualization_items.append((image, target, prediction))[m
+         else:[m
+[31m-            image, _, target = batch[m
+[32m+[m[32m            image, target = batch[m
+             image = image.to(context.device, non_blocking=True)[m
+             target = target.to(context.device, non_blocking=True)[m
+             with autocast_context(config, context.device):[m
+[36m@@ -958,11 +958,10 @@[m [mdef run_training(config: dict, *, joint_entrypoint: bool = False) -> dict:[m
+                 is_main_process=context.is_main_process,[m
+             )[m
+             try:[m
+[31m-                for batch_index, (image, one_hot, target) in enumerate(train_loader):[m
+[32m+[m[32m                for batch_index, (image, target) in enumerate(train_loader):[m
+                     if batch_index >= epoch_total_iterations:[m
+                         break[m
+                     image = image.to(context.device, non_blocking=True)[m
+[31m-                    one_hot = one_hot.to(context.device, non_blocking=True)[m
+                     target = target.to(context.device, non_blocking=True)[m
+                     reaches_limit = ([m
+                         max_iterations is not None[m
+[36m@@ -984,7 +983,6 @@[m [mdef run_training(config: dict, *, joint_entrypoint: bool = False) -> dict:[m
+                                 training_model,[m
+                                 operation=operation,[m
+                                 image=image,[m
+[31m-                                one_hot=one_hot,[m
+                                 target=target,[m
+                                 epoch_index=epoch_index,[m
+                                 progress_in_epoch=([m
+[1mdiff --git a/src/training_objectives.py b/src/training_objectives.py[m
+[1mindex 61eceec..e8abf0c 100644[m
+[1m--- a/src/training_objectives.py[m
+[1m+++ b/src/training_objectives.py[m
+[36m@@ -24,7 +24,6 @@[m [mdef compute_model_training_objectives([m
+     *,[m
+     operation: str,[m
+     image: torch.Tensor,[m
+[31m-    one_hot: torch.Tensor,[m
+     target: torch.Tensor,[m
+     epoch_index: int,[m
+     progress_in_epoch: float,[m
+[36m@@ -42,12 +41,6 @@[m [mdef compute_model_training_objectives([m
+     batch_size = image.shape[0][m
+ [m
+     target_full = target[m
+[31m-    target_one_hot_full = one_hot[m
+[31m-    assert target_one_hot_full.shape == ([m
+[31m-        target_full.shape[0],[m
+[31m-        config["dataset"]["num_classes"],[m
+[31m-        *target_full.shape[-2:],[m
+[31m-    )[m
+     factor = config.get("model", {}).get("state_downsample_factor", 1)[m
+     state_size = state_spatial_size(image, factor)[m
+     ignore_index = config["loss"].get("ignore_index")[m
+[36m@@ -64,7 +57,6 @@[m [mdef compute_model_training_objectives([m
+         targets.one_hot_state,[m
+         source,[m
+         target_full=targets.target_full,[m
+[31m-        target_one_hot_full=target_one_hot_full,[m
+         valid_mask_full=targets.valid_mask_full,[m
+     )[m
+     image_feat = endpoint.encode_image(image)[m
+[1mdiff --git a/tests/test_ade20k.py b/tests/test_ade20k.py[m
+[1mindex bf93227..7b5e5f5 100644[m
+[1m--- a/tests/test_ade20k.py[m
+[1m+++ b/tests/test_ade20k.py[m
+[36m@@ -133,15 +133,10 @@[m [mdef test_ade20k_train_pipeline_keeps_geometry_and_class_zero_state(tmp_path, mon[m
+ [m
+     torch.manual_seed(9)[m
+     dataset = build_dataset(config, "training", augment=True)[m
+[31m-    transformed_image, one_hot, transformed_mask = dataset[0][m
+[32m+[m[32m    transformed_image, transformed_mask = dataset[0][m
+     assert transformed_image.shape == (3, 4, 4)[m
+     assert transformed_mask.shape == (4, 4)[m
+[31m-    assert one_hot.shape == (151, 4, 4)[m
+[31m-    assert torch.equal(one_hot.argmax(0), transformed_mask)[m
+[31m-    assert torch.all(one_hot.sum(0) == 1)[m
+[31m-    zero = transformed_mask == 0[m
+[31m-    if zero.any():[m
+[31m-        assert torch.all(one_hot[0][zero] == 1)[m
+[32m+[m[32m    assert transformed_mask.dtype == torch.long[m
+ [m
+ [m
+ def test_photo_metric_distortion_never_changes_mask():[m
+[36m@@ -186,17 +181,21 @@[m [mdef test_source_alignment_uses_valid_pixel_reduction():[m
+         },[m
+     }[m
+     image = torch.zeros(1, 3, 2, 2)[m
+[31m-    target = torch.nn.functional.one_hot([m
+[31m-        torch.tensor([[[0, 1], [2, 1]]]), 3[m
+[32m+[m[32m    target_full = torch.tensor([[[0, 1], [2, 1]]])[m
+[32m+[m[32m    target_state = torch.nn.functional.one_hot([m
+[32m+[m[32m        target_full, 3[m
+     ).permute(0, 3, 1, 2).float()[m
+[31m-    _, all_stats = sample_prior(config, image, target, _Source())[m
+[32m+[m[32m    _, all_stats = sample_prior([m
+[32m+[m[32m        config, image, target_state, _Source(), target_full=target_full[m
+[32m+[m[32m    )[m
+     _, masked_stats = sample_prior([m
+[31m-        config, image, target, _Source(),[m
+[31m-        valid_mask=torch.tensor([[[False, True], [False, False]]]),[m
+[32m+[m[32m        config, image, target_state, _Source(), target_full=target_full,[m
+[32m+[m[32m        valid_mask_full=torch.tensor([[[False, True], [False, False]]]),[m
+     )[m
+     assert masked_stats["loss_source_align"] != all_stats["loss_source_align"][m
+     _, ignored_stats = sample_prior([m
+[31m-        config, image, target, _Source(), valid_mask=torch.zeros(1, 2, 2, dtype=torch.bool)[m
+[32m+[m[32m        config, image, target_state, _Source(), target_full=target_full,[m
+[32m+[m[32m        valid_mask_full=torch.zeros(1, 2, 2, dtype=torch.bool),[m
+     )[m
+     assert ignored_stats["loss_source_align"] == 0[m
+ [m
+[36m@@ -297,7 +296,7 @@[m [mdef test_optimizer_step_budget_counts_accumulation_scheduler_and_final_validatio[m
+     config["evaluation"]["interval"]["value"] = interval_steps[m
+     config["wandb"]["enabled"] = False[m
+     batches = [[m
+[31m-        (torch.zeros(1, 1), torch.zeros(1, 1), torch.zeros(1, dtype=torch.long))[m
+[32m+[m[32m        (torch.zeros(1, 1), torch.zeros(1, dtype=torch.long))[m
+         for _ in range(100)[m
+     ][m
+     endpoint, source = nn.Linear(1, 1, bias=False), nn.Linear(1, 1, bias=False)[m
+[1mdiff --git a/tests/test_flow_map.py b/tests/test_flow_map.py[m
+[1mindex e00aba2..c6331e3 100644[m
+[1m--- a/tests/test_flow_map.py[m
+[1m+++ b/tests/test_flow_map.py[m
+[36m@@ -46,8 +46,9 @@[m [mdef test_image_gaussian_prior_reports_actual_detached_cfm_statistics():[m
+             return x0, mu, logvar[m
+ [m
+     image = torch.randn(2, 3, 2, 3)[m
+[31m-    target = torch.nn.functional.one_hot([m
+[31m-        torch.randint(0, 4, (2, 2, 3)), 4[m
+[32m+[m[32m    target_full = torch.randint(0, 4, (2, 2, 3))[m
+[32m+[m[32m    target_state = torch.nn.functional.one_hot([m
+[32m+[m[32m        target_full, 4[m
+     ).permute(0, 3, 1, 2).float()[m
+     config = {[m
+         "dataset": {"num_classes": 4},[m
+[36m@@ -59,7 +60,9 @@[m [mdef test_image_gaussian_prior_reports_actual_detached_cfm_statistics():[m
+             "align_eps": 1.0e-8,[m
+         },[m
+     }[m
+[31m-    x0, stats = sample_prior(config, image, target, Source())[m
+[32m+[m[32m    x0, stats = sample_prior([m
+[32m+[m[32m        config, image, target_state, Source(), target_full=target_full[m
+[32m+[m[32m    )[m
+     mu = x0 - 0.25[m
+ [m
+     assert float(stats["source_mu_abs"]) == pytest.approx([m
+[36m@@ -73,6 +76,6 @@[m [mdef test_image_gaussian_prior_reports_actual_detached_cfm_statistics():[m
+         float(x0.abs().mean())[m
+     )[m
+     assert float(stats["target_x1_abs"]) == pytest.approx([m
+[31m-        float(target.abs().mean())[m
+[32m+[m[32m        float(target_state.abs().mean())[m
+     )[m
+     assert all(not value.requires_grad for value in stats.values())[m
+[1mdiff --git a/tests/test_image_feature_sharing.py b/tests/test_image_feature_sharing.py[m
+[1mindex 34bf3b2..d5ce7a9 100644[m
+[1m--- a/tests/test_image_feature_sharing.py[m
+[1m+++ b/tests/test_image_feature_sharing.py[m
+[36m@@ -203,7 +203,6 @@[m [mdef test_bf16_objectives_encode_endpoint_image_exactly_once(operation, loss_type[m
+                 adapter,[m
+                 operation=operation,[m
+                 image=image,[m
+[31m-                one_hot=one_hot,[m
+                 target=target,[m
+                 epoch_index=0,[m
+                 progress_in_epoch=0.5,[m
+[36m@@ -237,7 +236,6 @@[m [mdef test_amp_bf16_with_fp32_jvp_uses_one_feature_per_precision():[m
+                 adapter,[m
+                 operation="joint_objectives",[m
+                 image=image,[m
+[31m-                one_hot=one_hot,[m
+                 target=target,[m
+                 epoch_index=0,[m
+                 progress_in_epoch=0.5,[m
+[36m@@ -396,7 +394,9 @@[m [mdef _reference_joint_objective([m
+ ):[m
+     config = adapter.config[m
+     endpoint = adapter.endpoint_model[m
+[31m-    x0, source_stats = sample_prior(config, image, one_hot, adapter.source_model)[m
+[32m+[m[32m    x0, source_stats = sample_prior([m
+[32m+[m[32m        config, image, one_hot, adapter.source_model, target_full=target[m
+[32m+[m[32m    )[m
+     batch_size = image.shape[0][m
+     s, u, t = _fixed_consistency_times([m
+         "ecld", batch_size, image.device[m
+[36m@@ -467,7 +467,6 @@[m [mdef test_joint_ecld_total_and_all_parameter_group_gradients_match_reference([m
+         shared_adapter,[m
+         operation="joint_objectives",[m
+         image=image,[m
+[31m-        one_hot=one_hot,[m
+         target=target,[m
+         epoch_index=0,[m
+         progress_in_epoch=0.5,[m
+[1mdiff --git a/tests/test_quarter_state.py b/tests/test_quarter_state.py[m
+[1mindex 70976a8..2ae3132 100644[m
+[1m--- a/tests/test_quarter_state.py[m
+[1m+++ b/tests/test_quarter_state.py[m
+[36m@@ -1,15 +1,18 @@[m
+ from __future__ import annotations[m
+ [m
+ from copy import deepcopy[m
+[32m+[m[32mimport inspect[m
+ [m
+ import pytest[m
+ import torch[m
+ import torch.nn as nn[m
+ import torch.nn.functional as F[m
+ [m
+[31m-from discrete_flow_maps import sample_prior[m
+[32m+[m[32mfrom discrete_flow_maps import sample_prior, source_alignment_map_from_indices[m
+ from inference import terminal_state_to_original_prediction[m
+ from model import DiscreteFlowMapModel, ImageEncoder[m
+[32m+[m[32mfrom losses import masked_mean[m
+[32m+[m[32mimport state_space[m
+ from source_model import UNetSourceGenerator[m
+ from state_space import prepare_state_targets, resize_continuous, state_spatial_size[m
+ from training_objectives import DDPCompatibleTrainingModel, compute_model_training_objectives[m
+[36m@@ -79,11 +82,63 @@[m [mdef test_target_full_and_state_are_discrete_and_have_separate_masks():[m
+     assert targets.target_full.shape == (1, 512, 1024)[m
+     assert targets.target_state.shape == (1, 128, 256)[m
+     assert targets.one_hot_state.shape == (1, 151, 128, 256)[m
+[32m+[m[32m    expected_state = F.interpolate([m
+[32m+[m[32m        target_full[:, None].float(), (128, 256), mode="nearest"[m
+[32m+[m[32m    )[:, 0].long()[m
+[32m+[m[32m    assert torch.equal(targets.target_state, expected_state)[m
+     assert targets.valid_mask_full.shape == targets.target_full.shape[m
+     assert targets.valid_mask_state.shape == targets.target_state.shape[m
+     assert not targets.valid_mask_state[:, :4, :8].any()[m
+ [m
+ [m
+[32m+[m[32m@pytest.mark.parametrize([m
+[32m+[m[32m    "classes,near_zero",[m
+[32m+[m[32m    [(7, False), (7, True), (151, False)],[m
+[32m+[m[32m)[m
+[32m+[m[32mdef test_class_index_source_alignment_is_numerically_one_hot_equivalent([m
+[32m+[m[32m    classes, near_zero[m
+[32m+[m[32m):[m
+[32m+[m[32m    torch.manual_seed(123)[m
+[32m+[m[32m    mu = torch.randn(2, classes, 5, 6)[m
+[32m+[m[32m    if near_zero:[m
+[32m+[m[32m        mu.mul_(1.0e-12)[m
+[32m+[m[32m    target = torch.randint(0, classes, (2, 5, 6))[m
+[32m+[m[32m    target[0, 0, 0] = 0[m
+[32m+[m[32m    valid = target != 0[m
+[32m+[m[32m    eps = 1.0e-8[m
+[32m+[m
+[32m+[m[32m    old_target = F.one_hot(target, classes).permute(0, 3, 1, 2).float()[m
+[32m+[m[32m    old_map = ([m
+[32m+[m[32m        F.normalize(mu, dim=1, eps=eps)[m
+[32m+[m[32m        - F.normalize(old_target, dim=1, eps=eps)[m
+[32m+[m[32m    ).square().mean(dim=1)[m
+[32m+[m[32m    new_map = source_alignment_map_from_indices([m
+[32m+[m[32m        mu, target, num_classes=classes, eps=eps, valid_mask=valid[m
+[32m+[m[32m    )[m
+[32m+[m[32m    torch.testing.assert_close(new_map, old_map, rtol=2e-6, atol=2e-7)[m
+[32m+[m[32m    torch.testing.assert_close([m
+[32m+[m[32m        masked_mean(new_map, valid), masked_mean(old_map, valid),[m
+[32m+[m[32m        rtol=2e-6, atol=2e-7,[m
+[32m+[m[32m    )[m
+[32m+[m
+[32m+[m
+[32m+[m[32mdef test_source_alignment_safely_masks_out_of_range_ignore_index():[m
+[32m+[m[32m    mu = torch.randn(2, 5, 3, 4)[m
+[32m+[m[32m    target = torch.randint(0, 5, (2, 3, 4))[m
+[32m+[m[32m    target[:, 0, 0] = 255[m
+[32m+[m[32m    valid = target != 255[m
+[32m+[m[32m    safe_target = torch.where(valid, target, torch.zeros_like(target))[m
+[32m+[m[32m    old_target = F.one_hot(safe_target, 5).permute(0, 3, 1, 2).float()[m
+[32m+[m[32m    old_map = ([m
+[32m+[m[32m        F.normalize(mu, dim=1) - F.normalize(old_target, dim=1)[m
+[32m+[m[32m    ).square().mean(1)[m
+[32m+[m[32m    new_map = source_alignment_map_from_indices([m
+[32m+[m[32m        mu, target, num_classes=5, eps=1e-12, valid_mask=valid[m
+[32m+[m[32m    )[m
+[32m+[m[32m    torch.testing.assert_close(new_map, old_map)[m
+[32m+[m[32m    torch.testing.assert_close(masked_mean(new_map, valid), masked_mean(old_map, valid))[m
+[32m+[m
+[32m+[m
+ class _QuarterEndpoint(nn.Module):[m
+     def __init__(self, classes: int):[m
+         super().__init__()[m
+[36m@@ -156,12 +211,10 @@[m [mdef test_all_consistency_objectives_run_on_quarter_state(loss_type):[m
+     adapter = DDPCompatibleTrainingModel(endpoint, None, config)[m
+     image = torch.randn(2, 3, 32, 48)[m
+     target_full = torch.randint(0, 4, (2, 32, 48))[m
+[31m-    one_hot_full = F.one_hot(target_full, 4).permute(0, 3, 1, 2).float()[m
+     result = compute_model_training_objectives([m
+         adapter,[m
+         operation="joint_objectives",[m
+         image=image,[m
+[31m-        one_hot=one_hot_full,[m
+         target=target_full,[m
+         epoch_index=0,[m
+         progress_in_epoch=0.5,[m
+[36m@@ -173,6 +226,32 @@[m [mdef test_all_consistency_objectives_run_on_quarter_state(loss_type):[m
+     assert endpoint.state_projection.weight.grad is not None[m
+ [m
+ [m
+[32m+[m[32mdef test_training_objective_only_one_hot_encodes_state_target(monkeypatch):[m
+[32m+[m[32m    assert "one_hot" not in inspect.signature([m
+[32m+[m[32m        compute_model_training_objectives[m
+[32m+[m[32m    ).parameters[m
+[32m+[m[32m    calls = [][m
+[32m+[m[32m    original = state_space.F.one_hot[m
+[32m+[m
+[32m+[m[32m    def record_one_hot(tensor, *args, **kwargs):[m
+[32m+[m[32m        calls.append(tuple(tensor.shape))[m
+[32m+[m[32m        return original(tensor, *args, **kwargs)[m
+[32m+[m
+[32m+[m[32m    monkeypatch.setattr(state_space.F, "one_hot", record_one_hot)[m
+[32m+[m[32m    config = _objective_config("psd")[m
+[32m+[m[32m    config["loss"]["consistency"]["weight"] = 0.0[m
+[32m+[m[32m    endpoint = _QuarterEndpoint(4)[m
+[32m+[m[32m    adapter = DDPCompatibleTrainingModel(endpoint, None, config)[m
+[32m+[m[32m    image = torch.randn(2, 3, 32, 48)[m
+[32m+[m[32m    target = torch.randint(0, 4, (2, 32, 48))[m
+[32m+[m[32m    result = compute_model_training_objectives([m
+[32m+[m[32m        adapter, operation="stage1_objectives", image=image, target=target,[m
+[32m+[m[32m        epoch_index=0, progress_in_epoch=0.0,[m
+[32m+[m[32m    )[m
+[32m+[m[32m    assert calls == [(2, 8, 12)][m
+[32m+[m[32m    assert torch.isfinite(result["loss"])[m
+[32m+[m
+[32m+[m
+ class _FixedQuarterSource(nn.Module):[m
+     fixed_std = 1.0[m
+ [m
+[36m@@ -188,7 +267,7 @@[m [mclass _FixedQuarterSource(nn.Module):[m
+         return mu, mu, logvar[m
+ [m
+ [m
+[31m-@pytest.mark.parametrize("supervision_type", ["align", "cross_entropy"])[m
+[32m+[m[32m@pytest.mark.parametrize("supervision_type", ["align", "cross_entropy", "none"])[m
+ def test_source_supervision_upsamples_mu_and_ignores_ade_zero(supervision_type):[m
+     image = torch.zeros(1, 3, 8, 8)[m
+     target_full = torch.zeros(1, 8, 8, dtype=torch.long)[m
+[36m@@ -197,7 +276,6 @@[m [mdef test_source_supervision_upsamples_mu_and_ignores_ade_zero(supervision_type):[m
+         target_full, num_classes=3, state_size=(2, 2),[m
+         ignore_index=0, mask_pixel_losses=True,[m
+     )[m
+[31m-    one_hot_full = F.one_hot(target_full, 3).permute(0, 3, 1, 2).float()[m
+     config = {[m
+         "dataset": {"num_classes": 3},[m
+         "model": {"state_downsample_factor": 4},[m
+[36m@@ -211,7 +289,7 @@[m [mdef test_source_supervision_upsamples_mu_and_ignores_ade_zero(supervision_type):[m
+     }[m
+     _, stats = sample_prior([m
+         config, image, targets.one_hot_state, _FixedQuarterSource(),[m
+[31m-        target_full=target_full, target_one_hot_full=one_hot_full,[m
+[32m+[m[32m        target_full=target_full,[m
+         valid_mask_full=targets.valid_mask_full,[m
+     )[m
+     assert torch.isfinite(stats["loss_source_supervision"])[m
+[36m@@ -225,16 +303,17 @@[m [mdef test_source_supervision_upsamples_mu_and_ignores_ade_zero(supervision_type):[m
+             ignore_index=0, reduction="none",[m
+         )[targets.valid_mask_full].mean()[m
+         torch.testing.assert_close(stats["loss_source_ce"], expected)[m
+[32m+[m[32m    elif supervision_type == "none":[m
+[32m+[m[32m        assert float(stats["loss_source_supervision"]) == 0.0[m
+ [m
+     all_ignored = torch.zeros_like(target_full)[m
+     ignored_targets = prepare_state_targets([m
+         all_ignored, num_classes=3, state_size=(2, 2),[m
+         ignore_index=0, mask_pixel_losses=True,[m
+     )[m
+[31m-    ignored_one_hot = F.one_hot(all_ignored, 3).permute(0, 3, 1, 2).float()[m
+     _, ignored = sample_prior([m
+         config, image, ignored_targets.one_hot_state, _FixedQuarterSource(),[m
+[31m-        target_full=all_ignored, target_one_hot_full=ignored_one_hot,[m
+[32m+[m[32m        target_full=all_ignored,[m
+         valid_mask_full=ignored_targets.valid_mask_full,[m
+     )[m
+     assert float(ignored["loss_source_supervision"]) == 0.0[m
+[1mdiff --git a/tests/test_quarter_state_smoke.py b/tests/test_quarter_state_smoke.py[m
+[1mindex ffc3b14..1272a7a 100644[m
+[1m--- a/tests/test_quarter_state_smoke.py[m
+[1m+++ b/tests/test_quarter_state_smoke.py[m
+[36m@@ -5,7 +5,6 @@[m [mfrom pathlib import Path[m
+ [m
+ import pytest[m
+ import torch[m
+[31m-import torch.nn.functional as F[m
+ [m
+ from checkpoint import ([m
+     checkpoint_payload,[m
+[36m@@ -84,12 +83,10 @@[m [mdef test_forward_backward_optimizer_evaluation_and_checkpoint_smoke([m
+     target = torch.randint(0, classes, (1, *image_size))[m
+     if config["dataset"]["name"] == "ade20k":[m
+         target[:, :4, :4] = 0[m
+[31m-    one_hot = F.one_hot(target, classes).permute(0, 3, 1, 2).float()[m
+     result = compute_model_training_objectives([m
+         adapter,[m
+         operation="stage1_objectives",[m
+         image=image,[m
+[31m-        one_hot=one_hot,[m
+         target=target,[m
+         epoch_index=0,[m
+         progress_in_epoch=0.0,[m
+[1mdiff --git a/tests/test_training_objectives.py b/tests/test_training_objectives.py[m
+[1mindex 729aa6a..ed61c19 100644[m
+[1m--- a/tests/test_training_objectives.py[m
+[1m+++ b/tests/test_training_objectives.py[m
+[36m@@ -96,8 +96,7 @@[m [mdef _config(loss_type: str, stage: str = "joint_training"):[m
+ def _batch(classes=4):[m
+     image = torch.randn(2, 3, 4, 5)[m
+     target = torch.randint(0, classes, (2, 4, 5))[m
+[31m-    one_hot = torch.nn.functional.one_hot(target, classes).permute(0, 3, 1, 2).float()[m
+[31m-    return image, one_hot, target[m
+[32m+[m[32m    return image, target[m
+ [m
+ [m
+ def test_stage1_composite_forward_never_calls_consistency(monkeypatch):[m
+[36m@@ -107,10 +106,10 @@[m [mdef test_stage1_composite_forward_never_calls_consistency(monkeypatch):[m
+     monkeypatch.setattr(losses, "compute_consistency_loss", forbidden)[m
+     config = _config("esd", "diagonal_pretrain")[m
+     adapter = DDPCompatibleTrainingModel(TinyEndpoint(), None, config)[m
+[31m-    image, one_hot, target = _batch()[m
+[32m+[m[32m    image, target = _batch()[m
+     result = compute_model_training_objectives([m
+[31m-        adapter, operation="stage1_objectives", image=image, one_hot=one_hot,[m
+[31m-        target=target, epoch_index=0, progress_in_epoch=0.0,[m
+[32m+[m[32m        adapter, operation="stage1_objectives", image=image, target=target,[m
+[32m+[m[32m        epoch_index=0, progress_in_epoch=0.0,[m
+     )[m
+     assert float(result["stats"]["loss_consistency"]) == 0.0[m
+     result["loss"].backward()[m
+[36m@@ -122,10 +121,10 @@[m [mdef test_stage2_and_joint_select_each_consistency_loss(loss_type):[m
+     for operation in ("stage2_objectives", "joint_objectives"):[m
+         config = _config(loss_type)[m
+         adapter = DDPCompatibleTrainingModel(TinyEndpoint(), None, config)[m
+[31m-        image, one_hot, target = _batch()[m
+[32m+[m[32m        image, target = _batch()[m
+         result = compute_model_training_objectives([m
+[31m-            adapter, operation=operation, image=image, one_hot=one_hot,[m
+[31m-            target=target, epoch_index=0, progress_in_epoch=0.5,[m
+[32m+[m[32m            adapter, operation=operation, image=image, target=target,[m
+[32m+[m[32m            epoch_index=0, progress_in_epoch=0.5,[m
+         )[m
+         assert result["consistency_type"] == loss_type[m
+         assert torch.isfinite(result["loss"])[m
+[36m@@ -150,10 +149,10 @@[m [mdef test_joint_samples_diagonal_and_consistency_times_independently(monkeypatch)[m
+     )[m
+     config = _config("csd")[m
+     adapter = DDPCompatibleTrainingModel(TinyEndpoint(), None, config)[m
+[31m-    image, one_hot, target = _batch()[m
+[32m+[m[32m    image, target = _batch()[m
+     result = compute_model_training_objectives([m
+[31m-        adapter, operation="joint_objectives", image=image, one_hot=one_hot,[m
+[31m-        target=target, epoch_index=0, progress_in_epoch=0.0,[m
+[32m+[m[32m        adapter, operation="joint_objectives", image=image, target=target,[m
+[32m+[m[32m        epoch_index=0, progress_in_epoch=0.0,[m
+     )[m
+     assert float(result["stats"]["diagonal_time_mean"]) == pytest.approx(0.8)[m
+     assert float(result["stats"]["consistency_s_mean"]) == pytest.approx(0.1)[m
+[1mdiff --git a/tests/test_training_progress.py b/tests/test_training_progress.py[m
+[1mindex 0e9fd5d..940bc3a 100644[m
+[1m--- a/tests/test_training_progress.py[m
+[1m+++ b/tests/test_training_progress.py[m
+[36m@@ -243,7 +243,6 @@[m [mdef test_training_logs_only_one_epoch_record_and_one_epoch_wandb_call([m
+     batches = [[m
+         ([m
+             torch.full((2, 1), float(index)),[m
+[31m-            torch.zeros(2, 1),[m
+             torch.zeros(2, dtype=torch.long),[m
+         )[m
+         for index in range(1, 5)[m
+[1mdiff --git a/uv.lock b/uv.lock[m
+[1mindex 2d4136e..42f15be 100644[m
+[1m--- a/uv.lock[m
+[1m+++ b/uv.lock[m
+[36m@@ -268,36 +268,6 @@[m [mwheels = [[m
+     { url = "https://files.pythonhosted.org/packages/e7/05/c19819d5e3d95294a6f5947fb9b9629efb316b96de511b418c53d245aae6/cycler-0.12.1-py3-none-any.whl", hash = "sha256:85cef7cff222d8644161529808465972e51340599459b8ac3ccbac5a854e0d30", size = 8321, upload-time = "2023-10-07T05:32:16.783Z" },[m
+ ][m
+ [m
+[31m-[[package]][m
+[31m-name = "dfm-cityscapes"[m
+[31m-version = "0.1.0"[m
+[31m-source = { virtual = "." }[m
+[31m-[m
+[31m-[package.optional-dependencies][m
+[31m-full = [[m
+[31m-    { name = "matplotlib" },[m
+[31m-    { name = "numpy" },[m
+[31m-    { name = "pytest" },[m
+[31m-    { name = "pyyaml" },[m
+[31m-    { name = "torch" },[m
+[31m-    { name = "torchvision" },[m
+[31m-    { name = "transformers" },[m
+[31m-    { name = "wandb" },[m
+[31m-][m
+[31m-[m
+[31m-[package.metadata][m
+[31m-requires-dist = [[m
+[31m-    { name = "matplotlib", marker = "extra == 'full'", specifier = "==3.10.9" },[m
+[31m-    { name = "numpy", marker = "extra == 'full'", specifier = "==2.4.4" },[m
+[31m-    { name = "pytest", marker = "extra == 'full'", specifier = "==9.1.1" },[m
+[31m-    { name = "pyyaml", marker = "extra == 'full'", specifier = "==6.0.3" },[m
+[31m-    { name = "torch", marker = "extra == 'full'", specifier = "==2.11.0" },[m
+[31m-    { name = "torchvision", marker = "extra == 'full'", specifier = "==0.26.0" },[m
+[31m-    { name = "transformers", marker = "extra == 'full'", specifier = "==5.10.2" },[m
+[31m-    { name = "wandb", marker = "extra == 'full'", specifier = "==0.27.0" },[m
+[31m-][m
+[31m-provides-extras = ["full"][m
+[31m-[m
+ [[package]][m
+ name = "filelock"[m
+ version = "3.31.1"[m
+[36m@@ -1239,6 +1209,36 @@[m [mwheels = [[m
+     { url = "https://files.pythonhosted.org/packages/f1/12/de94a39c2ef588c7e6455cfbe7343d3b2dc9d6b6b2f40c4c6565744c873d/pyyaml-6.0.3-cp314-cp314t-win_arm64.whl", hash = "sha256:ebc55a14a21cb14062aa4162f906cd962b28e2e9ea38f9b4391244cd8de4ae0b", size = 149341, upload-time = "2025-09-25T21:32:56.828Z" },[m
+ ][m
+ [m
+[32m+[m[32m[[package]][m
+[32m+[m[32mname = "quarter-state-dfm-segmentation"[m
+[32m+[m[32mversion = "0.2.0"[m
+[32m+[m[32msource = { virtual = "." }[m
+[32m+[m
+[32m+[m[32m[package.optional-dependencies][m
+[32m+[m[32mfull = [[m
+[32m+[m[32m    { name = "matplotlib" },[m
+[32m+[m[32m    { name = "numpy" },[m
+[32m+[m[32m    { name = "pytest" },[m
+[32m+[m[32m    { name = "pyyaml" },[m
+[32m+[m[32m    { name = "torch" },[m
+[32m+[m[32m    { name = "torchvision" },[m
+[32m+[m[32m    { name = "transformers" },[m
+[32m+[m[32m    { name = "wandb" },[m
+[32m+[m[32m][m
+[32m+[m
+[32m+[m[32m[package.metadata][m
+[32m+[m[32mrequires-dist = [[m
+[32m+[m[32m    { name = "matplotlib", marker = "extra == 'full'", specifier = "==3.10.9" },[m
+[32m+[m[32m    { name = "numpy", marker = "extra == 'full'", specifier = "==2.4.4" },[m
+[32m+[m[32m    { name = "pytest", marker = "extra == 'full'", specifier = "==9.1.1" },[m
+[32m+[m[32m    { name = "pyyaml", marker = "extra == 'full'", specifier = "==6.0.3" },[m
+[32m+[m[32m    { name = "torch", marker = "extra == 'full'", specifier = "==2.11.0" },[m
+[32m+[m[32m    { name = "torchvision", marker = "extra == 'full'", specifier = "==0.26.0" },[m
+[32m+[m[32m    { name = "transformers", marker = "extra == 'full'", specifier = "==5.10.2" },[m
+[32m+[m[32m    { name = "wandb", marker = "extra == 'full'", specifier = "==0.27.0" },[m
+[32m+[m[32m][m
+[32m+[m[32mprovides-extras = ["full"][m
+[32m+[m
+ [[package]][m
+ name = "regex"[m
+ version = "2026.7.19"[m

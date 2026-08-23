@@ -50,7 +50,9 @@ source:
 ```
 
 `align`はstate `mu`をfull resolutionへbilinear拡大して既存のnormalized
-alignmentを計算します。`cross_entropy`は`mu`をraw logitsとしてfull resolution
+alignmentを計算します。GTのfull one-hotは生成せず、normalized `mu`の二乗和と
+integer GT classに対する`gather`から数学的に等価な値を求めます。
+`cross_entropy`は`mu`をraw logitsとしてfull resolution
 へ拡大し、softmaxせずCEへ渡します。旧`use_loss_align/align_weight`だけを持つ
 configもload時に新形式へ変換されます。
 
@@ -61,6 +63,12 @@ configもload時に新形式へ変換されます。
 `valid_mask_state`はconsistency専用です。ADE20Kでは全maskが`target != 0`、
 primary/source CEは`ignore_index=0`です。151 stateおよび評価class 1..150は
 変更していません。Cityscapesは20 state、void index 19、評価19 classを維持します。
+
+training Dataset/DataLoaderの返り値は両datasetとも`(image, target_full)`だけです。
+CPUでもGPUでも`[B,C,H,W]`のfull-resolution target one-hotは作りません。
+GPUへinteger targetを転送した後、`prepare_state_targets()`がinteger GTをnearestで
+state解像度へ縮小し、その`target_state`だけをone-hot化します。ADE20K 512×512では
+`one_hot_state`は`[B,151,128,128]`であり、旧`[B,151,512,512]`の1/16要素数です。
 
 推論はstateのC-channel continuous terminal outputをpadded入力解像度へbilinear
 resizeし、padding除去、original GT解像度へのbilinear resize、最後にargmaxの順です。

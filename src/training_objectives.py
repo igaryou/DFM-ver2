@@ -24,7 +24,6 @@ def compute_model_training_objectives(
     *,
     operation: str,
     image: torch.Tensor,
-    one_hot: torch.Tensor,
     target: torch.Tensor,
     epoch_index: int,
     progress_in_epoch: float,
@@ -42,12 +41,6 @@ def compute_model_training_objectives(
     batch_size = image.shape[0]
 
     target_full = target
-    target_one_hot_full = one_hot
-    assert target_one_hot_full.shape == (
-        target_full.shape[0],
-        config["dataset"]["num_classes"],
-        *target_full.shape[-2:],
-    )
     factor = config.get("model", {}).get("state_downsample_factor", 1)
     state_size = state_spatial_size(image, factor)
     ignore_index = config["loss"].get("ignore_index")
@@ -64,7 +57,6 @@ def compute_model_training_objectives(
         targets.one_hot_state,
         source,
         target_full=targets.target_full,
-        target_one_hot_full=target_one_hot_full,
         valid_mask_full=targets.valid_mask_full,
     )
     image_feat = endpoint.encode_image(image)

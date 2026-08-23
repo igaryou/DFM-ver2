@@ -1,15 +1,18 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import inspect
 
 import pytest
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from discrete_flow_maps import sample_prior
+from discrete_flow_maps import sample_prior, source_alignment_map_from_indices
 from inference import terminal_state_to_original_prediction
 from model import DiscreteFlowMapModel, ImageEncoder
+from losses import masked_mean
+import state_space
 from source_model import UNetSourceGenerator
 from state_space import prepare_state_targets, resize_continuous, state_spatial_size
 from training_objectives import DDPCompatibleTrainingModel, compute_model_training_objectives
@@ -79,9 +82,61 @@ def test_target_full_and_state_are_discrete_and_have_separate_masks():
     assert targets.target_full.shape == (1, 512, 1024)
     assert targets.target_state.shape == (1, 128, 256)
     assert targets.one_hot_state.shape == (1, 151, 128, 256)
+    expected_state = F.interpolate(
+        target_full[:, None].float(), (128, 256), mode="nearest"
+    )[:, 0].long()
+    assert torch.equal(targets.target_state, expected_state)
     assert targets.valid_mask_full.shape == targets.target_full.shape
     assert targets.valid_mask_state.shape == targets.target_state.shape
     assert not targets.valid_mask_state[:, :4, :8].any()
+
+
+@pytest.mark.parametrize(
+    "classes,near_zero",
+    [(7, False), (7, True), (151, False)],
+)
+def test_class_index_source_alignment_is_numerically_one_hot_equivalent(
+    classes, near_zero
+):
+    torch.manual_seed(123)
+    mu = torch.randn(2, classes, 5, 6)
+    if near_zero:
+        mu.mul_(1.0e-12)
+    target = torch.randint(0, classes, (2, 5, 6))
+    target[0, 0, 0] = 0
+    valid = target != 0
+    eps = 1.0e-8
+
+    old_target = F.one_hot(target, classes).permute(0, 3, 1, 2).float()
+    old_map = (
+        F.normalize(mu, dim=1, eps=eps)
+        - F.normalize(old_target, dim=1, eps=eps)
+    ).square().mean(dim=1)
+    new_map = source_alignment_map_from_indices(
+        mu, target, num_classes=classes, eps=eps, valid_mask=valid
+    )
+    torch.testing.assert_close(new_map, old_map, rtol=2e-6, atol=2e-7)
+    torch.testing.assert_close(
+        masked_mean(new_map, valid), masked_mean(old_map, valid),
+        rtol=2e-6, atol=2e-7,
+    )
+
+
+def test_source_alignment_safely_masks_out_of_range_ignore_index():
+    mu = torch.randn(2, 5, 3, 4)
+    target = torch.randint(0, 5, (2, 3, 4))
+    target[:, 0, 0] = 255
+    valid = target != 255
+    safe_target = torch.where(valid, target, torch.zeros_like(target))
+    old_target = F.one_hot(safe_target, 5).permute(0, 3, 1, 2).float()
+    old_map = (
+        F.normalize(mu, dim=1) - F.normalize(old_target, dim=1)
+    ).square().mean(1)
+    new_map = source_alignment_map_from_indices(
+        mu, target, num_classes=5, eps=1e-12, valid_mask=valid
+    )
+    torch.testing.assert_close(new_map, old_map)
+    torch.testing.assert_close(masked_mean(new_map, valid), masked_mean(old_map, valid))
 
 
 class _QuarterEndpoint(nn.Module):
@@ -156,12 +211,10 @@ def test_all_consistency_objectives_run_on_quarter_state(loss_type):
     adapter = DDPCompatibleTrainingModel(endpoint, None, config)
     image = torch.randn(2, 3, 32, 48)
     target_full = torch.randint(0, 4, (2, 32, 48))
-    one_hot_full = F.one_hot(target_full, 4).permute(0, 3, 1, 2).float()
     result = compute_model_training_objectives(
         adapter,
         operation="joint_objectives",
         image=image,
-        one_hot=one_hot_full,
         target=target_full,
         epoch_index=0,
         progress_in_epoch=0.5,
@@ -171,6 +224,32 @@ def test_all_consistency_objectives_run_on_quarter_state(loss_type):
     assert torch.isfinite(result["loss"])
     result["loss"].backward()
     assert endpoint.state_projection.weight.grad is not None
+
+
+def test_training_objective_only_one_hot_encodes_state_target(monkeypatch):
+    assert "one_hot" not in inspect.signature(
+        compute_model_training_objectives
+    ).parameters
+    calls = []
+    original = state_space.F.one_hot
+
+    def record_one_hot(tensor, *args, **kwargs):
+        calls.append(tuple(tensor.shape))
+        return original(tensor, *args, **kwargs)
+
+    monkeypatch.setattr(state_space.F, "one_hot", record_one_hot)
+    config = _objective_config("psd")
+    config["loss"]["consistency"]["weight"] = 0.0
+    endpoint = _QuarterEndpoint(4)
+    adapter = DDPCompatibleTrainingModel(endpoint, None, config)
+    image = torch.randn(2, 3, 32, 48)
+    target = torch.randint(0, 4, (2, 32, 48))
+    result = compute_model_training_objectives(
+        adapter, operation="stage1_objectives", image=image, target=target,
+        epoch_index=0, progress_in_epoch=0.0,
+    )
+    assert calls == [(2, 8, 12)]
+    assert torch.isfinite(result["loss"])
 
 
 class _FixedQuarterSource(nn.Module):
@@ -188,7 +267,7 @@ class _FixedQuarterSource(nn.Module):
         return mu, mu, logvar
 
 
-@pytest.mark.parametrize("supervision_type", ["align", "cross_entropy"])
+@pytest.mark.parametrize("supervision_type", ["align", "cross_entropy", "none"])
 def test_source_supervision_upsamples_mu_and_ignores_ade_zero(supervision_type):
     image = torch.zeros(1, 3, 8, 8)
     target_full = torch.zeros(1, 8, 8, dtype=torch.long)
@@ -197,7 +276,6 @@ def test_source_supervision_upsamples_mu_and_ignores_ade_zero(supervision_type):
         target_full, num_classes=3, state_size=(2, 2),
         ignore_index=0, mask_pixel_losses=True,
     )
-    one_hot_full = F.one_hot(target_full, 3).permute(0, 3, 1, 2).float()
     config = {
         "dataset": {"num_classes": 3},
         "model": {"state_downsample_factor": 4},
@@ -211,7 +289,7 @@ def test_source_supervision_upsamples_mu_and_ignores_ade_zero(supervision_type):
     }
     _, stats = sample_prior(
         config, image, targets.one_hot_state, _FixedQuarterSource(),
-        target_full=target_full, target_one_hot_full=one_hot_full,
+        target_full=target_full,
         valid_mask_full=targets.valid_mask_full,
     )
     assert torch.isfinite(stats["loss_source_supervision"])
@@ -225,16 +303,17 @@ def test_source_supervision_upsamples_mu_and_ignores_ade_zero(supervision_type):
             ignore_index=0, reduction="none",
         )[targets.valid_mask_full].mean()
         torch.testing.assert_close(stats["loss_source_ce"], expected)
+    elif supervision_type == "none":
+        assert float(stats["loss_source_supervision"]) == 0.0
 
     all_ignored = torch.zeros_like(target_full)
     ignored_targets = prepare_state_targets(
         all_ignored, num_classes=3, state_size=(2, 2),
         ignore_index=0, mask_pixel_losses=True,
     )
-    ignored_one_hot = F.one_hot(all_ignored, 3).permute(0, 3, 1, 2).float()
     _, ignored = sample_prior(
         config, image, ignored_targets.one_hot_state, _FixedQuarterSource(),
-        target_full=all_ignored, target_one_hot_full=ignored_one_hot,
+        target_full=all_ignored,
         valid_mask_full=ignored_targets.valid_mask_full,
     )
     assert float(ignored["loss_source_supervision"]) == 0.0

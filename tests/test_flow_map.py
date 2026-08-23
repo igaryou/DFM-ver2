@@ -46,8 +46,9 @@ def test_image_gaussian_prior_reports_actual_detached_cfm_statistics():
             return x0, mu, logvar
 
     image = torch.randn(2, 3, 2, 3)
-    target = torch.nn.functional.one_hot(
-        torch.randint(0, 4, (2, 2, 3)), 4
+    target_full = torch.randint(0, 4, (2, 2, 3))
+    target_state = torch.nn.functional.one_hot(
+        target_full, 4
     ).permute(0, 3, 1, 2).float()
     config = {
         "dataset": {"num_classes": 4},
@@ -59,7 +60,9 @@ def test_image_gaussian_prior_reports_actual_detached_cfm_statistics():
             "align_eps": 1.0e-8,
         },
     }
-    x0, stats = sample_prior(config, image, target, Source())
+    x0, stats = sample_prior(
+        config, image, target_state, Source(), target_full=target_full
+    )
     mu = x0 - 0.25
 
     assert float(stats["source_mu_abs"]) == pytest.approx(
@@ -73,6 +76,6 @@ def test_image_gaussian_prior_reports_actual_detached_cfm_statistics():
         float(x0.abs().mean())
     )
     assert float(stats["target_x1_abs"]) == pytest.approx(
-        float(target.abs().mean())
+        float(target_state.abs().mean())
     )
     assert all(not value.requires_grad for value in stats.values())

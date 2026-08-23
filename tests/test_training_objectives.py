@@ -96,8 +96,7 @@ def _config(loss_type: str, stage: str = "joint_training"):
 def _batch(classes=4):
     image = torch.randn(2, 3, 4, 5)
     target = torch.randint(0, classes, (2, 4, 5))
-    one_hot = torch.nn.functional.one_hot(target, classes).permute(0, 3, 1, 2).float()
-    return image, one_hot, target
+    return image, target
 
 
 def test_stage1_composite_forward_never_calls_consistency(monkeypatch):
@@ -107,10 +106,10 @@ def test_stage1_composite_forward_never_calls_consistency(monkeypatch):
     monkeypatch.setattr(losses, "compute_consistency_loss", forbidden)
     config = _config("esd", "diagonal_pretrain")
     adapter = DDPCompatibleTrainingModel(TinyEndpoint(), None, config)
-    image, one_hot, target = _batch()
+    image, target = _batch()
     result = compute_model_training_objectives(
-        adapter, operation="stage1_objectives", image=image, one_hot=one_hot,
-        target=target, epoch_index=0, progress_in_epoch=0.0,
+        adapter, operation="stage1_objectives", image=image, target=target,
+        epoch_index=0, progress_in_epoch=0.0,
     )
     assert float(result["stats"]["loss_consistency"]) == 0.0
     result["loss"].backward()
@@ -122,10 +121,10 @@ def test_stage2_and_joint_select_each_consistency_loss(loss_type):
     for operation in ("stage2_objectives", "joint_objectives"):
         config = _config(loss_type)
         adapter = DDPCompatibleTrainingModel(TinyEndpoint(), None, config)
-        image, one_hot, target = _batch()
+        image, target = _batch()
         result = compute_model_training_objectives(
-            adapter, operation=operation, image=image, one_hot=one_hot,
-            target=target, epoch_index=0, progress_in_epoch=0.5,
+            adapter, operation=operation, image=image, target=target,
+            epoch_index=0, progress_in_epoch=0.5,
         )
         assert result["consistency_type"] == loss_type
         assert torch.isfinite(result["loss"])
@@ -150,10 +149,10 @@ def test_joint_samples_diagonal_and_consistency_times_independently(monkeypatch)
     )
     config = _config("csd")
     adapter = DDPCompatibleTrainingModel(TinyEndpoint(), None, config)
-    image, one_hot, target = _batch()
+    image, target = _batch()
     result = compute_model_training_objectives(
-        adapter, operation="joint_objectives", image=image, one_hot=one_hot,
-        target=target, epoch_index=0, progress_in_epoch=0.0,
+        adapter, operation="joint_objectives", image=image, target=target,
+        epoch_index=0, progress_in_epoch=0.0,
     )
     assert float(result["stats"]["diagonal_time_mean"]) == pytest.approx(0.8)
     assert float(result["stats"]["consistency_s_mean"]) == pytest.approx(0.1)

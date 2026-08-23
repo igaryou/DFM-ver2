@@ -243,7 +243,6 @@ def test_training_logs_only_one_epoch_record_and_one_epoch_wandb_call(
     batches = [
         (
             torch.full((2, 1), float(index)),
-            torch.zeros(2, 1),
             torch.zeros(2, dtype=torch.long),
         )
         for index in range(1, 5)

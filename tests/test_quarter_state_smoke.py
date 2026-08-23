@@ -5,7 +5,6 @@ from pathlib import Path
 
 import pytest
 import torch
-import torch.nn.functional as F
 
 from checkpoint import (
     checkpoint_payload,
@@ -84,12 +83,10 @@ def test_forward_backward_optimizer_evaluation_and_checkpoint_smoke(
     target = torch.randint(0, classes, (1, *image_size))
     if config["dataset"]["name"] == "ade20k":
         target[:, :4, :4] = 0
-    one_hot = F.one_hot(target, classes).permute(0, 3, 1, 2).float()
     result = compute_model_training_objectives(
         adapter,
         operation="stage1_objectives",
         image=image,
-        one_hot=one_hot,
         target=target,
         epoch_index=0,
         progress_in_epoch=0.0,

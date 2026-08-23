@@ -650,7 +650,7 @@ def validate(
                 metrics.update(prediction, target)
                 visualization_items.append((image, target, prediction))
         else:
-            image, _, target = batch
+            image, target = batch
             image = image.to(context.device, non_blocking=True)
             target = target.to(context.device, non_blocking=True)
             with autocast_context(config, context.device):
@@ -958,11 +958,10 @@ def run_training(config: dict, *, joint_entrypoint: bool = False) -> dict:
                 is_main_process=context.is_main_process,
             )
             try:
-                for batch_index, (image, one_hot, target) in enumerate(train_loader):
+                for batch_index, (image, target) in enumerate(train_loader):
                     if batch_index >= epoch_total_iterations:
                         break
                     image = image.to(context.device, non_blocking=True)
-                    one_hot = one_hot.to(context.device, non_blocking=True)
                     target = target.to(context.device, non_blocking=True)
                     reaches_limit = (
                         max_iterations is not None
@@ -984,7 +983,6 @@ def run_training(config: dict, *, joint_entrypoint: bool = False) -> dict:
                                 training_model,
                                 operation=operation,
                                 image=image,
-                                one_hot=one_hot,
                                 target=target,
                                 epoch_index=epoch_index,
                                 progress_in_epoch=(

@@ -203,7 +203,6 @@ def test_bf16_objectives_encode_endpoint_image_exactly_once(operation, loss_type
                 adapter,
                 operation=operation,
                 image=image,
-                one_hot=one_hot,
                 target=target,
                 epoch_index=0,
                 progress_in_epoch=0.5,
@@ -237,7 +236,6 @@ def test_amp_bf16_with_fp32_jvp_uses_one_feature_per_precision():
                 adapter,
                 operation="joint_objectives",
                 image=image,
-                one_hot=one_hot,
                 target=target,
                 epoch_index=0,
                 progress_in_epoch=0.5,
@@ -396,7 +394,9 @@ def _reference_joint_objective(
 ):
     config = adapter.config
     endpoint = adapter.endpoint_model
-    x0, source_stats = sample_prior(config, image, one_hot, adapter.source_model)
+    x0, source_stats = sample_prior(
+        config, image, one_hot, adapter.source_model, target_full=target
+    )
     batch_size = image.shape[0]
     s, u, t = _fixed_consistency_times(
         "ecld", batch_size, image.device
@@ -467,7 +467,6 @@ def test_joint_ecld_total_and_all_parameter_group_gradients_match_reference(
         shared_adapter,
         operation="joint_objectives",
         image=image,
-        one_hot=one_hot,
         target=target,
         epoch_index=0,
         progress_in_epoch=0.5,
