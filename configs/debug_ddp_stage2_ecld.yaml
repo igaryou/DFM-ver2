@@ -1,0 +1,15 @@
+extends: debug_esd_cityscapes.yaml
+experiment:
+  name: dfm_debug_ddp_stage2_ecld
+  output_dir: /home/igarashi_25/DFM/results/debug_ddp_stage2_ecld
+training:
+  batch_size: 4
+evaluation:
+  batch_size: 4
+loss:
+  consistency:
+    type: ecld
+    weight: 0.1
+wandb:
+  name: debug-ddp-stage2-ecld
+  tags: [debug, ddp, stage2, ecld]

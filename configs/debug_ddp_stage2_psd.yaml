@@ -1,0 +1,18 @@
+extends: debug_esd_cityscapes.yaml
+experiment:
+  name: dfm_debug_ddp_stage2_psd
+  output_dir: /home/igarashi_25/DFM/results/debug_ddp_stage2_psd
+training:
+  batch_size: 4
+evaluation:
+  batch_size: 4
+loss:
+  consistency:
+    type: psd
+    precision:
+      jvp_dtype: null
+      numerical_dtype: fp32
+      debug_assertions: true
+wandb:
+  name: debug-ddp-stage2-psd
+  tags: [debug, ddp, stage2, psd]

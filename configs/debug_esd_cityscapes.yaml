@@ -1,0 +1,145 @@
+experiment:
+  name: dfm_debug_stage2
+  seed: 42
+  output_dir: /home/igarashi_25/DFM/results/debug_stage2
+  stage: consistency_distillation
+runtime:
+  device: auto
+  amp: true
+  amp_dtype: bf16
+  compile: false
+  deterministic: false
+distributed:
+  enabled: auto
+  backend: nccl
+  init_method: env://
+  find_unused_parameters: false
+  broadcast_buffers: false
+  gradient_as_bucket_view: true
+dataset:
+  name: cityscapes
+  root: /home/igarashi_25/datasets/cityscapes
+  num_classes: 20
+  eval_num_classes: 19
+  void_class_index: 19
+  image_size: [48, 96]
+  crop_size: null
+  num_workers: 0
+  pin_memory: true
+  persistent_workers: false
+augmentation:
+  enabled: false
+  horizontal_flip: {enabled: false, probability: 0.0}
+  color_jitter:
+    enabled: false
+    brightness: 0.0
+    contrast: 0.0
+    saturation: 0.0
+    hue: 0.0
+  imagenet_normalize: false
+model:
+  backbone: unet
+  num_classes: 20
+  fusion_channels: 16
+  rrdb_blocks: 1
+  rrdb_growth_channels: 8
+  unet:
+    base_channels: 16
+    channel_mults: [1, 2, 2]
+    num_res_blocks: 1
+    attention_levels: []
+    num_heads: 1
+    dropout: 0.0
+    time_embedding_dim: 64
+source:
+  prior_type: gaussian
+  prior_noise_std: 1.0
+  backbone: unet
+  segformer_variant: b0
+  pretrained: false
+  checkpoint: null
+  freeze: false
+  freeze_encoder: false
+  decoder_channels: 16
+  learned_logvar: false
+  fixed_std: 1.0
+  mu_tanh_scale: 0.0
+  use_loss_align: false
+  align_weight: 0.0
+  var_weight: 0.0
+  align_eps: 1.0e-8
+flow: {time_eps: 1.0e-5, probability_eps: 1.0e-8, start_time: 0.0}
+time_sampling:
+  distribution: uniform_sorted
+  min_time: 0.0
+  max_time: 1.0
+  min_gap: 1.0e-5
+training:
+  epochs: 1
+  max_iterations: 2
+  batch_size: 1
+  grad_accum_steps: 1
+  optimizer:
+    name: adamw
+    lr: 1.0e-4
+    weight_decay: 0.0
+    betas: [0.9, 0.999]
+    parameter_groups:
+      model: {lr: 1.0e-4}
+      source: {lr: null}
+  scheduler: {name: cosine, warmup_epochs: 0, eta_min: 1.0e-6}
+  grad_clip: 1.0
+  label_smoothing: 0.0
+  log_interval: 1
+  checkpoint_interval_epochs: 1
+  validation_epochs: [1]
+loss:
+  primary: {type: diagonal_ce, weight: 0.5}
+  consistency:
+    enabled: true
+    type: esd
+    weight: 0.1
+    start_epoch: 0
+    warmup_epochs: 0
+    schedule: linear
+    max_weight: 1.0
+    precision: {jvp_dtype: bf16, numerical_dtype: fp32, debug_assertions: true}
+    psd: {}
+    csd: {}
+    ecld: {ec_weight: 4.0, td_weight: 2.0, time_weighting: none}
+    esd:
+      formulation: stabilized_logit_space
+      source: discrete_flow_maps
+      additional_numerical_safeguards: true
+    adaptive_kl:
+      enabled: true
+      c: 1.0e-6
+      r: 0.5
+      normalize_mean: true
+      max_weight: 100.0
+    invalid_teacher:
+      strategy: mask_pixel
+      log_eps: 1.0e-6
+      skip_batch_threshold: 0.5
+checkpoint:
+  init_from: /home/igarashi_25/DFM/results/debug_stage1/best.pt
+  resume: null
+  load_optimizer: false
+  load_scheduler: false
+  strict_model: true
+evaluation:
+  split: val
+  batch_size: 1
+  num_steps: 1
+  sampler: flow_map
+  save_predictions: true
+  max_visualizations: 1
+  max_batches: 1
+  checkpoint: null
+wandb:
+  enabled: false
+  project: DFM
+  name: debug-stage2
+  entity: null
+  mode: disabled
+  tags: [debug, stage2, esd]

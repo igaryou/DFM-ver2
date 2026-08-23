@@ -1,0 +1,208 @@
+experiment:
+  name: dfm_joint_psd_ade20k_151state
+  seed: 42
+  output_dir: /home/igarashi_25/DFM/results/joint_psd_ade20k_ver2
+  stage: joint_training
+runtime:
+  device: auto
+  amp: true
+  amp_dtype: bf16
+  compile: false
+  deterministic: false
+distributed:
+  enabled: auto
+  backend: nccl
+  init_method: env://
+  find_unused_parameters: false
+  broadcast_buffers: false
+  gradient_as_bucket_view: true
+dataset:
+  name: ade20k
+  root: /home/igarashi_25/datasets/ADEChallengeData2016
+  num_classes: 151
+  eval_num_classes: 150
+  void_class_index: 0
+  background_index: 0
+  ignore_index: 0
+  reduce_zero_label: false
+  train_split: training
+  val_split: validation
+  image_size: [512, 512]
+  crop_size: null
+  num_workers: 8
+  pin_memory: true
+  persistent_workers: true
+augmentation:
+  enabled: true
+  horizontal_flip: {enabled: true, probability: 0.5}
+  color_jitter:
+    enabled: false
+    brightness: 0.2
+    contrast: 0.2
+    saturation: 0.2
+    hue: 0.1
+  imagenet_normalize: false
+  random_resize:
+    enabled: true
+    base_scale: {width: 2048, height: 512}
+    ratio_range: [0.5, 2.0]
+    keep_ratio: true
+  random_crop:
+    enabled: true
+    size: [512, 512]
+    cat_max_ratio: 0.75
+    ignore_index: 0
+    max_attempts: 10
+  photometric_distortion:
+    enabled: true
+    brightness_delta: 32
+    contrast_range: [0.5, 1.5]
+    saturation_range: [0.5, 1.5]
+    hue_delta: 18
+  normalize:
+    enabled: true
+    mean: [0.485, 0.456, 0.406]
+    std: [0.229, 0.224, 0.225]
+  pad:
+    enabled: true
+    size: [512, 512]
+    image_value: 0.0
+    mask_value: 0
+model:
+  backbone: unet
+  num_classes: 151
+  state_downsample_factor: 4
+  fusion_channels: 128
+  rrdb_blocks: 3
+  rrdb_growth_channels: 32
+  unet:
+    base_channels: 45
+    channel_mults: [1, 2, 4, 4, 8]
+    num_res_blocks: 2
+    attention_levels: [3, 4]
+    num_heads: 4
+    dropout: 0.0
+    time_embedding_dim: 512
+source:
+  prior_type: image_gaussian
+  prior_noise_std: 1.0
+  backbone: segformer
+  segformer_variant: b1
+  pretrained: true
+  checkpoint: null
+  freeze: false
+  freeze_encoder: false
+  decoder_channels: 256
+  learned_logvar: false
+  fixed_std: 1.0
+  mu_tanh_scale: 0.0
+  use_loss_align: true
+  align_weight: 0.15
+  var_weight: 0.0
+  align_eps: 1.0e-8
+  input_already_normalized: true
+  supervision: {type: align, weight: 0.15}
+flow:
+  time_eps: 1.0e-5
+  probability_eps: 1.0e-8
+  start_time: 0.0
+time_sampling:
+  distribution: uniform_sorted
+  min_time: 0.0
+  max_time: 1.0
+  min_gap: 1.0e-5
+training:
+  epochs: 1000
+  max_iterations: null
+  max_optimizer_steps: 160000
+  max_batches_per_epoch: null
+  batch_size: 4  # global physical batch: 2 per GPU x 2 GPUs
+  grad_accum_steps: 4
+  optimizer:
+    name: adamw
+    lr: 1.0e-4
+    weight_decay: 1.0e-3
+    betas: [0.9, 0.999]
+    parameter_groups:
+      model: {lr: 1.0e-4}
+      source: {lr: 5.0e-5}
+  scheduler:
+    name: poly
+    step_unit: optimizer_step
+    warmup_epochs: 0
+    warmup_steps: 1500
+    warmup_start_factor: 1.0e-6
+    power: 1.0
+    min_lr: 0.0
+    eta_min: 0.0
+  grad_clip: 1.0
+  label_smoothing: 0.0
+  log_interval: 50
+  checkpoint_interval_epochs: 10
+  validation_epochs: []
+loss:
+  ignore_index: 0
+  mask_pixel_losses: true
+  primary: {type: diagonal_ce, weight: 1.0}
+  consistency:
+    enabled: true
+    type: psd
+    weight: 0.5
+    start_epoch: 0
+    start: {unit: optimizer_step, value: 96000}
+    warmup_epochs: 0
+    schedule: linear
+    max_weight: 1.0
+    precision:
+      jvp_dtype: null
+      numerical_dtype: fp32
+      debug_assertions: false
+    psd: {}
+    csd: {}
+    ecld: {ec_weight: 4.0, td_weight: 2.0, time_weighting: none}
+    esd:
+      formulation: stabilized_logit_space
+      source: discrete_flow_maps
+      additional_numerical_safeguards: true
+    adaptive_kl:
+      enabled: false
+      c: 1.0e-6
+      r: 0.5
+      normalize_mean: true
+      max_weight: 100.0
+    invalid_teacher:
+      strategy: mask_pixel
+      log_eps: 1.0e-6
+      skip_batch_threshold: null
+checkpoint:
+  resume: null
+  init_from: null
+  load_optimizer: true
+  load_scheduler: true
+  strict_model: true
+evaluation:
+  split: validation
+  batch_size: 2  # global: local batch 1 on each of 2 GPUs
+  num_steps: 1
+  sampler: flow_map
+  save_predictions: true
+  max_visualizations: 16
+  max_batches: null
+  checkpoint: null
+  resize: {width: 2048, height: 512, keep_ratio: true}
+  size_divisor: 16
+  original_resolution: true
+  interpolation: bilinear
+  align_corners: false
+  eval_class_indices: [1, 150]
+  ignore_index: 0
+  nanmean: true
+  interval: {unit: optimizer_step, value: 16000}
+  test_time_augmentation: {enabled: false, flip: false}
+wandb:
+  enabled: true
+  project: DFM
+  name: dfm-joint-psd-ade20k
+  entity: null
+  mode: online
+  tags: [ade20k, 151-state, joint, psd, 160k]

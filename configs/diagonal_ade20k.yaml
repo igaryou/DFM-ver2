@@ -1,0 +1,16 @@
+extends: joint_psd_ade20k.yaml
+
+experiment:
+  name: dfm_quarter_state_diagonal_ade20k_151state
+  output_dir: /home/igarashi_25/DFM/results/diagonal_ade20k
+  stage: diagonal_pretrain
+
+loss:
+  primary: {type: diagonal_ce, weight: 1.0}
+  consistency:
+    enabled: false
+    weight: 0.0
+
+checkpoint:
+  resume: null
+  init_from: null

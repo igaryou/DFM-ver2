@@ -1,0 +1,6 @@
+extends: stage1_diagonal_cityscapes.yaml
+
+experiment:
+  name: dfm_quarter_state_diagonal_cityscapes
+  output_dir: /home/igarashi_25/DFM/results/diagonal_cityscapes
+

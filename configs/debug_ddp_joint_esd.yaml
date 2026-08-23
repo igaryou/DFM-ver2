@@ -1,0 +1,17 @@
+extends: debug_ddp_stage2_esd.yaml
+experiment:
+  name: dfm_debug_ddp_joint_esd
+  output_dir: /home/igarashi_25/DFM/results/debug_ddp_joint_esd
+  stage: joint_training
+checkpoint:
+  init_from: null
+  resume: null
+loss:
+  consistency:
+    esd:
+      formulation: stabilized_logit_space
+      source: discrete_flow_maps
+      additional_numerical_safeguards: true
+wandb:
+  name: debug-ddp-joint-esd
+  tags: [debug, ddp, joint, esd]

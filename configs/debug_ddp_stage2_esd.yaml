@@ -1,0 +1,18 @@
+extends: debug_esd_cityscapes.yaml
+experiment:
+  name: dfm_debug_ddp_stage2_esd
+  output_dir: /home/igarashi_25/DFM/results/debug_ddp_stage2_esd
+training:
+  batch_size: 4
+evaluation:
+  batch_size: 4
+loss:
+  consistency:
+    type: esd
+    esd:
+      formulation: stabilized_logit_space
+      source: discrete_flow_maps
+      additional_numerical_safeguards: true
+wandb:
+  name: debug-ddp-stage2-esd
+  tags: [debug, ddp, stage2, esd]

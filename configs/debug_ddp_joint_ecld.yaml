@@ -1,0 +1,11 @@
+extends: debug_ddp_stage2_ecld.yaml
+experiment:
+  name: dfm_debug_ddp_joint_ecld
+  output_dir: /home/igarashi_25/DFM/results/debug_ddp_joint_ecld
+  stage: joint_training
+checkpoint:
+  init_from: null
+  resume: null
+wandb:
+  name: debug-ddp-joint-ecld
+  tags: [debug, ddp, joint, ecld]

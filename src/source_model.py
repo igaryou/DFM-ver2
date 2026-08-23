@@ -1,0 +1,179 @@
+from __future__ import annotations
+
+import math
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+from model import group_norm
+from state_space import state_spatial_size
+
+
+class UNetSourceGenerator(nn.Module):
+    """Small source option for offline/debug use."""
+
+    def __init__(
+        self,
+        num_classes: int,
+        channels: int,
+        learned_logvar: bool,
+        fixed_std,
+        state_downsample_factor: int = 4,
+    ):
+        super().__init__()
+        self.num_classes = num_classes
+        self.fixed_std = None if learned_logvar else fixed_std
+        output_channels = num_classes * 2 if self.fixed_std is None else num_classes
+        stages = int(math.log2(state_downsample_factor))
+        if 2**stages != state_downsample_factor:
+            raise ValueError("source state_downsample_factor must be a power of two")
+        self.state_downsample_factor = state_downsample_factor
+        layers: list[nn.Module] = []
+        in_channels = 3
+        for _ in range(stages):
+            layers.extend((
+                nn.Conv2d(in_channels, channels, 3, stride=2, padding=1),
+                nn.SiLU(),
+            ))
+            in_channels = channels
+        if not stages:
+            layers.extend((nn.Conv2d(3, channels, 3, padding=1), nn.SiLU()))
+        layers.extend((
+            nn.Conv2d(channels, channels, 3, padding=1), nn.SiLU(),
+            nn.Conv2d(channels, output_channels, 1),
+        ))
+        self.network = nn.Sequential(*layers)
+
+    def forward(self, image: torch.Tensor):
+        output = self.network(image)
+        assert output.shape[-2:] == state_spatial_size(
+            image, self.state_downsample_factor
+        )
+        if self.fixed_std is None:
+            mu, logvar = output.chunk(2, dim=1)
+        else:
+            mu = output
+            logvar = torch.full_like(mu, math.log(float(self.fixed_std) ** 2))
+        return mu + torch.exp(0.5 * logvar) * torch.randn_like(mu), mu, logvar
+
+
+class SegFormerSourceGenerator(nn.Module):
+    """SegFormer image-conditioned Gaussian source ported from CFM/segv4."""
+
+    MODEL_NAMES = {f"b{i}": f"nvidia/mit-b{i}" for i in range(6)}
+    DEPTHS = {
+        "b0": [2, 2, 2, 2], "b1": [2, 2, 2, 2], "b2": [3, 4, 6, 3],
+        "b3": [3, 4, 18, 3], "b4": [3, 8, 27, 3], "b5": [3, 6, 40, 3],
+    }
+    HIDDEN = {
+        "b0": [32, 64, 160, 256], "b1": [64, 128, 320, 512],
+        "b2": [64, 128, 320, 512], "b3": [64, 128, 320, 512],
+        "b4": [64, 128, 320, 512], "b5": [64, 128, 320, 512],
+    }
+
+    def __init__(
+        self, num_classes: int, variant: str, pretrained: bool, decoder_channels: int,
+        freeze_encoder: bool, learned_logvar: bool, fixed_std, mu_tanh_scale: float,
+        input_already_normalized: bool = False,
+        state_downsample_factor: int = 4,
+    ) -> None:
+        super().__init__()
+        if variant not in self.MODEL_NAMES:
+            raise ValueError(f"Unknown SegFormer variant: {variant}")
+        try:
+            from transformers import SegformerConfig, SegformerModel
+        except ImportError as exc:
+            raise RuntimeError("source.backbone=segformer requires transformers") from exc
+        if pretrained:
+            self.encoder = SegformerModel.from_pretrained(self.MODEL_NAMES[variant])
+        else:
+            heads = [1, 2, 5, 8]
+            self.encoder = SegformerModel(SegformerConfig(
+                num_channels=3, num_encoder_blocks=4, depths=self.DEPTHS[variant],
+                sr_ratios=[8, 4, 2, 1], hidden_sizes=self.HIDDEN[variant],
+                patch_sizes=[7, 3, 3, 3], strides=[4, 2, 2, 2],
+                num_attention_heads=heads, mlp_ratios=[4, 4, 4, 4],
+                hidden_dropout_prob=0.0, attention_probs_dropout_prob=0.0,
+                drop_path_rate=0.1,
+            ))
+        self.num_classes = num_classes
+        self.fixed_std = None if learned_logvar else fixed_std
+        self.mu_tanh_scale = mu_tanh_scale
+        self.input_already_normalized = input_already_normalized
+        self.state_downsample_factor = state_downsample_factor
+        hidden_sizes = list(self.encoder.config.hidden_sizes)
+        self.projections = nn.ModuleList(
+            nn.Conv2d(size, decoder_channels, 1) for size in hidden_sizes
+        )
+        output_channels = num_classes * 2 if self.fixed_std is None else num_classes
+        self.decoder = nn.Sequential(
+            nn.Conv2d(decoder_channels * 4, decoder_channels, 3, padding=1),
+            group_norm(decoder_channels), nn.SiLU(),
+            nn.Conv2d(decoder_channels, decoder_channels, 3, padding=1),
+            group_norm(decoder_channels), nn.SiLU(),
+            nn.Conv2d(decoder_channels, output_channels, 1),
+        )
+        self.register_buffer(
+            "mean", torch.tensor([0.485, 0.456, 0.406])[None, :, None, None],
+            persistent=False,
+        )
+        self.register_buffer(
+            "std", torch.tensor([0.229, 0.224, 0.225])[None, :, None, None],
+            persistent=False,
+        )
+        if freeze_encoder:
+            for parameter in self.encoder.parameters():
+                parameter.requires_grad = False
+
+    def forward(self, image: torch.Tensor):
+        normalized = image if self.input_already_normalized else (
+            image - self.mean.to(image)
+        ) / self.std.to(image)
+        hidden_states = self.encoder(
+            pixel_values=normalized, output_hidden_states=True, return_dict=True
+        ).hidden_states[-4:]
+        target_size = state_spatial_size(image, self.state_downsample_factor)
+        features = [
+            F.interpolate(projection(hidden), target_size, mode="bilinear", align_corners=False)
+            for hidden, projection in zip(hidden_states, self.projections)
+        ]
+        output = self.decoder(torch.cat(features, dim=1))
+        if self.fixed_std is None:
+            mu, logvar = output.chunk(2, dim=1)
+        else:
+            mu = output
+            logvar = torch.full_like(mu, math.log(float(self.fixed_std) ** 2))
+        if self.mu_tanh_scale > 0:
+            mu = torch.tanh(mu) * self.mu_tanh_scale
+        return mu + torch.exp(0.5 * logvar) * torch.randn_like(mu), mu, logvar
+
+
+def build_source_model(config: dict):
+    source = config["source"]
+    if source["prior_type"] != "image_gaussian":
+        return None
+    fixed_std = source["fixed_std"]
+    if not source["learned_logvar"] and fixed_std is None:
+        fixed_std = 1.0
+    if source["backbone"] == "unet":
+        model = UNetSourceGenerator(
+            config["dataset"]["num_classes"], source["decoder_channels"],
+            source["learned_logvar"], fixed_std,
+            config["model"].get("state_downsample_factor", 4),
+        )
+    else:
+        model = SegFormerSourceGenerator(
+            config["dataset"]["num_classes"], source["segformer_variant"],
+            source["pretrained"], source["decoder_channels"], source["freeze_encoder"],
+            source["learned_logvar"], fixed_std, source["mu_tanh_scale"],
+            source["input_already_normalized"],
+            config["model"].get("state_downsample_factor", 4),
+        )
+    if source["checkpoint"]:
+        checkpoint = torch.load(source["checkpoint"], map_location="cpu", weights_only=False)
+        state = checkpoint.get("source_model", checkpoint.get("model", checkpoint))
+        model.load_state_dict(state, strict=True)
+    if source["freeze"]:
+        model.requires_grad_(False)
+    return model

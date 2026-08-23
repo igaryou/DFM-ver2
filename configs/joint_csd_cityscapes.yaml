@@ -1,0 +1,151 @@
+experiment:
+  name: dfm_joint_csd_cityscapes
+  seed: 42
+  output_dir: /home/igarashi_25/DFM/results/joint_csd
+  stage: joint_training
+runtime:
+  device: auto
+  amp: true
+  amp_dtype: bf16
+  compile: false
+  deterministic: false
+distributed:
+  enabled: auto
+  backend: nccl
+  init_method: env://
+  find_unused_parameters: false
+  broadcast_buffers: false
+  gradient_as_bucket_view: true
+dataset:
+  name: cityscapes
+  root: /home/igarashi_25/datasets/cityscapes
+  num_classes: 20
+  eval_num_classes: 19
+  void_class_index: 19
+  image_size: [256, 512]
+  crop_size: null
+  num_workers: 8
+  pin_memory: true
+  persistent_workers: true
+augmentation:
+  enabled: true
+  horizontal_flip: {enabled: true, probability: 0.5}
+  color_jitter:
+    enabled: true
+    brightness: 0.2
+    contrast: 0.2
+    saturation: 0.2
+    hue: 0.1
+  imagenet_normalize: false
+model:
+  backbone: unet
+  num_classes: 20
+  fusion_channels: 128
+  rrdb_blocks: 3
+  rrdb_growth_channels: 32
+  unet:
+    base_channels: 45
+    channel_mults: [1, 2, 4, 4, 8]
+    num_res_blocks: 2
+    attention_levels: [3, 4]
+    num_heads: 4
+    dropout: 0.0
+    time_embedding_dim: 512
+source:
+  prior_type: image_gaussian
+  prior_noise_std: 1.0
+  backbone: segformer
+  segformer_variant: b1
+  pretrained: true
+  checkpoint: null
+  freeze: false
+  freeze_encoder: false
+  decoder_channels: 256
+  learned_logvar: false
+  fixed_std: 1.0
+  mu_tanh_scale: 0.0
+  use_loss_align: true
+  align_weight: 0.15
+  var_weight: 0.0
+  align_eps: 1.0e-8
+flow:
+  time_eps: 1.0e-5
+  probability_eps: 1.0e-8
+  start_time: 0.0
+time_sampling:
+  distribution: uniform_sorted
+  min_time: 0.0
+  max_time: 1.0
+  min_gap: 1.0e-5
+training:
+  epochs: 800
+  max_iterations: null
+  batch_size: 4
+  grad_accum_steps: 1
+  optimizer:
+    name: adamw
+    lr: 1.0e-4
+    weight_decay: 1.0e-3
+    betas: [0.9, 0.999]
+    parameter_groups:
+      model: {lr: 5.0e-5}
+      source: {lr: 1.0e-5}
+  scheduler:
+    name: cosine
+    warmup_epochs: 10
+    eta_min: 5.0e-7
+  grad_clip: 1.0
+  label_smoothing: 0.0
+  log_interval: 50
+  checkpoint_interval_epochs: 200
+  validation_epochs: [75, 150, 200, 300, 500, 600, 800]
+loss:
+  primary: {type: diagonal_ce, weight: 0.5}
+  consistency:
+    enabled: true
+    type: csd
+    weight: 0.5
+    start_epoch: 0
+    warmup_epochs: 30
+    schedule: linear
+    max_weight: 1.0
+    precision: {jvp_dtype: bf16, numerical_dtype: fp32, debug_assertions: false}
+    psd: {}
+    csd: {}
+    ecld: {ec_weight: 4.0, td_weight: 2.0, time_weighting: none}
+    esd:
+      formulation: stabilized_logit_space
+      source: discrete_flow_maps
+      additional_numerical_safeguards: true
+    adaptive_kl:
+      enabled: true
+      c: 1.0e-6
+      r: 0.5
+      normalize_mean: true
+      max_weight: 100.0
+    invalid_teacher:
+      strategy: mask_pixel
+      log_eps: 1.0e-6
+      skip_batch_threshold: 0.5
+checkpoint:
+  init_from: null
+  resume: null
+  load_optimizer: false
+  load_scheduler: false
+  strict_model: true
+evaluation:
+  split: val
+  batch_size: 4
+  num_steps: 3
+  sampler: flow_map
+  save_predictions: true
+  max_visualizations: 16
+  max_batches: null
+  checkpoint: null
+wandb:
+  enabled: true
+  project: DFM
+  name: dfm-joint-csd-256x512
+  entity: null
+  mode: online
+  tags: [cityscapes, joint, csd]

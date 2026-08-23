@@ -1,0 +1,11 @@
+extends: debug_ddp_stage2_csd.yaml
+experiment:
+  name: dfm_debug_ddp_joint_csd
+  output_dir: /home/igarashi_25/DFM/results/debug_ddp_joint_csd
+  stage: joint_training
+checkpoint:
+  init_from: null
+  resume: null
+wandb:
+  name: debug-ddp-joint-csd
+  tags: [debug, ddp, joint, csd]
