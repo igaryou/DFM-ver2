@@ -173,6 +173,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "label_smoothing": 0.1,
         "log_interval": 50,
         "checkpoint_interval_epochs": 10,
+        "checkpoint_interval_steps": None,
         "validation_epochs": [50, 100, 150],
     },
     "loss": {
@@ -186,6 +187,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "start_epoch": 0,
             "start": {"unit": "epoch", "value": 0},
             "warmup_epochs": 0,
+            "warmup_steps": 0,
             "schedule": "linear",
             "max_weight": 1.0,
             "precision": {
@@ -387,6 +389,15 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("training.max_batches_per_epoch must be null or positive")
     if training["max_optimizer_steps"] is not None and training["max_optimizer_steps"] <= 0:
         raise ValueError("training.max_optimizer_steps must be null or positive")
+    checkpoint_interval_steps = training["checkpoint_interval_steps"]
+    if checkpoint_interval_steps is not None and (
+        isinstance(checkpoint_interval_steps, bool)
+        or not isinstance(checkpoint_interval_steps, int)
+        or checkpoint_interval_steps <= 0
+    ):
+        raise ValueError(
+            "training.checkpoint_interval_steps must be null or a positive integer"
+        )
     scheduler = training["scheduler"]
     if scheduler["step_unit"] not in {"epoch", "optimizer_step"}:
         raise ValueError("training.scheduler.step_unit must be epoch or optimizer_step")
@@ -399,6 +410,17 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
             raise ValueError("poly scheduler requires training.max_optimizer_steps")
         if scheduler["warmup_steps"] < 0 or scheduler["power"] <= 0:
             raise ValueError("poly warmup_steps must be non-negative and power positive")
+    if scheduler["name"] == "cosine" and scheduler["step_unit"] == "optimizer_step":
+        maximum = training["max_optimizer_steps"]
+        if maximum is None:
+            raise ValueError(
+                "optimizer-step cosine scheduler requires training.max_optimizer_steps"
+            )
+        if scheduler["warmup_steps"] < 0 or scheduler["warmup_steps"] >= maximum:
+            raise ValueError(
+                "optimizer-step cosine warmup_steps must satisfy "
+                "0 <= warmup_steps < max_optimizer_steps"
+            )
     if not (0.0 < scheduler["warmup_start_factor"] <= 1.0):
         raise ValueError(
             "training.scheduler.warmup_start_factor must satisfy 0 < factor <= 1"
@@ -461,6 +483,10 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("loss.consistency.start.unit must be epoch or optimizer_step")
     if start["value"] < 0:
         raise ValueError("loss.consistency.start.value must be non-negative")
+    if consistency["warmup_epochs"] < 0:
+        raise ValueError("loss.consistency.warmup_epochs must be non-negative")
+    if consistency["warmup_steps"] < 0:
+        raise ValueError("loss.consistency.warmup_steps must be non-negative")
     if consistency["type"] not in {"psd", "csd", "ecld", "esd"}:
         raise ValueError("loss.consistency.type must be psd, csd, ecld, or esd")
     if consistency["schedule"] != "linear":

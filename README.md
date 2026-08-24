@@ -470,6 +470,36 @@ ESD 46.7%減りました。さらにbf16 JVPはDDP FP32比でECLD 38.1%、ESD 8.
 が減ります。時間は2 iterationだけのdebug測定であり、性能benchmarkでは
 ありません。
 
+## ADE20K source診断
+
+学習済みcheckpointのparameterを変更せず、source meanのsemantic情報、sigma、
+mu=0、Flow Map step数、1/4-state oracle align floorを一括診断できます。
+
+```bash
+CUDA_VISIBLE_DEVICES=2 PYTHONPATH=src \
+uv run python scripts/diagnose_source_ade20k.py \
+  --config configs/joint_psd_ade20k.yaml \
+  --checkpoint results/joint_psd_ade20k_ver2/latest.pt \
+  --output_dir results/source_diagnostics_final \
+  --sigma_values 1.0 0.75 0.5 0.25 0.1 0.0 \
+  --step_values 1 2 3 5 \
+  --num_visualize 20 --seed 42 --amp --amp_dtype bf16
+```
+
+短いsmokeは`--max_batches 2 --num_visualize 2`を追加します。`--full_grid`を
+指定するとsigma×stepの全組合せも評価します。各imageのepsilonは
+`seed + dataset index`の専用Generatorで一度だけ生成され、全条件で共有されます。
+`diagnostics.json`にはclass-wise IoUを含む全metric、`diagnostics.csv`には比較用の
+long-format値、`visualizations/image_NNN/`には個別画像とsummary panelを保存します。
+診断時はdeterministic algorithmとcuBLAS workspaceを固定します。`--checkpoint`を
+省略した場合は`evaluation.checkpoint`、次にconfig outputの`latest.pt`だけを安全に
+探索し、候補が曖昧ならエラーにします。
+
+`mu_confidence.png`のsoftmaxは可視化専用で、学習・推論には使用しません。
+`snr_heatmap_sigma1.png`は各pixelで`||mu||2 / sqrt(C)`、一般のsigmaでは
+`||mu||2 / (sigma * sqrt(C))`です。full-resolution target one-hotは作らず、
+GT class方向のcosineとalignはclass indexの`gather`で計算します。
+
 ## テスト
 
 ```bash

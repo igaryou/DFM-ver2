@@ -19,6 +19,29 @@ def _zero(reference: torch.Tensor) -> torch.Tensor:
     return reference.float().sum() * 0.0
 
 
+def consistency_schedule_weight(
+    consistency_config: dict, *, epoch_index: int,
+    progress_in_epoch: float, optimizer_step: int,
+) -> float:
+    start = consistency_config.get("start", {
+        "unit": "epoch", "value": consistency_config["start_epoch"]
+    })
+    if start["unit"] == "optimizer_step":
+        warmup_steps = consistency_config.get("warmup_steps", 0)
+        if optimizer_step < start["value"]:
+            weight = 0.0
+        elif warmup_steps <= 0:
+            weight = 1.0
+        else:
+            weight = (optimizer_step - start["value"]) / warmup_steps
+    else:
+        weight = losses.esd_schedule_weight(
+            epoch_index, progress_in_epoch,
+            start["value"], consistency_config["warmup_epochs"],
+        )
+    return min(max(float(weight), 0.0), 1.0)
+
+
 def compute_model_training_objectives(
     adapter: "DDPCompatibleTrainingModel",
     *,
@@ -96,16 +119,12 @@ def compute_model_training_objectives(
             # Preserve the original Stage 2 diagonal-at-s behavior.
             diagonal_time = consistency_s
             diagonal_state = consistency_state
-        start = consistency_config.get("start", {
-            "unit": "epoch", "value": consistency_config["start_epoch"]
-        })
-        if start["unit"] == "optimizer_step":
-            schedule_weight = float(optimizer_step >= start["value"])
-        else:
-            schedule_weight = losses.esd_schedule_weight(
-                epoch_index, progress_in_epoch,
-                start["value"], consistency_config["warmup_epochs"],
-            )
+        schedule_weight = consistency_schedule_weight(
+            consistency_config,
+            epoch_index=epoch_index,
+            progress_in_epoch=progress_in_epoch,
+            optimizer_step=optimizer_step,
+        )
         effective_weight = (
             consistency_config["weight"]
             * consistency_config["max_weight"]

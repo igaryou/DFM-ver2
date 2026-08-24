@@ -21,7 +21,11 @@ from discrete_flow_maps import sample_prior
 from inference import terminal_state_to_original_prediction
 from losses import compute_consistency_loss, diagonal_cross_entropy, masked_mean
 from metrics import SegmentationMetrics
-from trainer import _optimizer_step_validation_trigger, build_scheduler
+from trainer import (
+    _optimizer_step_checkpoint_due,
+    _optimizer_step_validation_trigger,
+    build_scheduler,
+)
 
 
 ROOT = Path(__file__).parents[1]
@@ -292,6 +296,7 @@ def test_optimizer_step_budget_counts_accumulation_scheduler_and_final_validatio
     config["training"].update({
         "epochs": 1, "max_optimizer_steps": max_steps, "grad_accum_steps": 4,
         "validation_epochs": validation_epochs, "checkpoint_interval_epochs": 0,
+        "checkpoint_interval_steps": 10,
     })
     config["evaluation"]["interval"]["value"] = interval_steps
     config["wandb"]["enabled"] = False
@@ -391,6 +396,24 @@ def test_optimizer_step_budget_counts_accumulation_scheduler_and_final_validatio
     assert saved[-1]["micro_step"] == expected_updates * 4
     assert result["optimizer_step"] == max_steps
     assert len(validation_calls) == len(validation_mious)
+    expected_numbered_steps = [
+        step for step in range(start_step + 1, max_steps + 1) if step % 10 == 0
+    ]
+    numbered_saves = [
+        checkpoint for checkpoint in saved
+        if any(name.startswith("step_") for name in checkpoint["filenames"])
+    ]
+    assert [checkpoint["global_step"] for checkpoint in numbered_saves] == (
+        expected_numbered_steps
+    )
+    assert [checkpoint["micro_step"] for checkpoint in numbered_saves] == [
+        (step - start_step) * 4 for step in expected_numbered_steps
+    ]
+    assert all("latest.pt" in checkpoint["filenames"] for checkpoint in numbered_saves)
+    assert not any(
+        name.startswith("epoch_")
+        for checkpoint in saved for name in checkpoint["filenames"]
+    )
 
 
 def test_optimizer_step_validation_interval_and_final_trigger():
@@ -398,6 +421,23 @@ def test_optimizer_step_validation_interval_and_final_trigger():
     assert _optimizer_step_validation_trigger(config, 15999) is None
     assert _optimizer_step_validation_trigger(config, 16000) == "optimizer_step_interval"
     assert _optimizer_step_validation_trigger(config, 32000) == "optimizer_step_interval"
+    assert _optimizer_step_validation_trigger(config, 160000) == "final_optimizer_step"
+
+
+def test_160k_validation_and_checkpoint_triggers_are_optimizer_steps_only():
+    config = _config()
+    config["training"]["checkpoint_interval_steps"] = 16000
+    validation_steps = [
+        step for step in range(1, 160001)
+        if _optimizer_step_validation_trigger(config, step) is not None
+    ]
+    checkpoint_steps = [
+        step for step in range(1, 160001)
+        if _optimizer_step_checkpoint_due(config, step)
+    ]
+    expected = list(range(16000, 160001, 16000))
+    assert validation_steps == expected
+    assert checkpoint_steps == expected
     assert _optimizer_step_validation_trigger(config, 160000) == "final_optimizer_step"
 
 

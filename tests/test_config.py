@@ -14,6 +14,9 @@ PSD_FROM_JOINT_CONFIG = (
     / "configs"
     / "stage2_psd_from_joint500_cityscapes.yaml"
 )
+JOINT_PSD_CITYSCAPES_CONFIG = (
+    Path(__file__).parents[1] / "configs" / "joint_psd_cityscapes.yaml"
+)
 EXPECTED_ESD_METADATA = {
     "formulation": "stabilized_logit_space",
     "source": "discrete_flow_maps",
@@ -86,6 +89,37 @@ def test_yaml_load_and_cli_override():
     assert config["training"]["scheduler"]["warmup_start_factor"] == 0.1
     assert config["training"]["max_batches_per_epoch"] is None
     assert config["evaluation"]["interval"] == {"unit": "epoch", "value": None}
+    assert config["training"]["checkpoint_interval_steps"] is None
+    assert config["loss"]["consistency"]["warmup_steps"] == 0
+
+
+def test_joint_psd_cityscapes_main_protocol_is_optimizer_step_based():
+    config = load_config(JOINT_PSD_CITYSCAPES_CONFIG)
+    assert config["experiment"]["name"] == "dfm_joint_psd_cityscapes_160k"
+    assert config["training"]["epochs"] == 1000
+    assert config["training"]["max_optimizer_steps"] == 160000
+    assert config["training"]["batch_size"] == 4
+    assert config["training"]["grad_accum_steps"] == 1
+    assert config["training"]["scheduler"] == {
+        "name": "poly",
+        "warmup_epochs": 0,
+        "warmup_start_factor": 1.0e-6,
+        "eta_min": 0.0,
+        "warmup_steps": 1500,
+        "power": 1.0,
+        "min_lr": 0.0,
+        "step_unit": "optimizer_step",
+    }
+    assert config["training"]["checkpoint_interval_epochs"] == 0
+    assert config["training"]["checkpoint_interval_steps"] == 16000
+    assert config["training"]["validation_epochs"] == []
+    assert config["loss"]["consistency"]["start"] == {
+        "unit": "optimizer_step", "value": 96000,
+    }
+    assert config["loss"]["consistency"]["warmup_steps"] == 0
+    assert config["evaluation"]["interval"] == {
+        "unit": "optimizer_step", "value": 16000,
+    }
 
 
 def test_scheduler_unit_and_debug_epoch_limit_are_validated():

@@ -149,6 +149,15 @@ def _optimizer_step_validation_trigger(
     return None
 
 
+def _optimizer_step_checkpoint_due(config: dict, global_step: int) -> bool:
+    interval = config["training"]["checkpoint_interval_steps"]
+    return (
+        interval is not None
+        and global_step > 0
+        and global_step % interval == 0
+    )
+
+
 def _numbered_checkpoint_epochs(
     *,
     total_epochs: int,
@@ -507,29 +516,33 @@ def build_scheduler(config: dict, optimizer):
         return torch.optim.lr_scheduler.LambdaLR(optimizer, factor)
     if scheduler_config["name"] != "cosine":
         raise ValueError(f"Unknown scheduler: {scheduler_config['name']}")
-    epochs = config["training"]["epochs"]
-    warmup_epochs = scheduler_config["warmup_epochs"]
-    if warmup_epochs <= 0:
+    if scheduler_config["step_unit"] == "optimizer_step":
+        total_units = config["training"]["max_optimizer_steps"]
+        warmup_units = scheduler_config["warmup_steps"]
+    else:
+        total_units = config["training"]["epochs"]
+        warmup_units = scheduler_config["warmup_epochs"]
+    if warmup_units <= 0:
         return _RatioPreservingCosineAnnealingLR(
             optimizer,
-            T_max=max(epochs, 1),
+            T_max=max(total_units, 1),
             eta_min=scheduler_config["eta_min"],
         )
     linear = torch.optim.lr_scheduler.LinearLR(
         optimizer,
         start_factor=scheduler_config["warmup_start_factor"],
         end_factor=1.0,
-        total_iters=warmup_epochs,
+        total_iters=warmup_units,
     )
     cosine = _RatioPreservingCosineAnnealingLR(
         optimizer,
-        T_max=max(epochs - warmup_epochs, 1),
+        T_max=max(total_units - warmup_units, 1),
         eta_min=scheduler_config["eta_min"],
     )
     return torch.optim.lr_scheduler.SequentialLR(
         optimizer,
         schedulers=[linear, cosine],
-        milestones=[warmup_epochs],
+        milestones=[warmup_units],
     )
 
 
@@ -799,6 +812,22 @@ def run_training(config: dict, *, joint_entrypoint: bool = False) -> dict:
         logger.info("Global physical batch size: %d", global_batch_size)
         logger.info("Gradient accumulation: %d", config["training"]["grad_accum_steps"])
         logger.info("Effective batch size: %d", effective_global_batch_size)
+        logger.info(
+            "Training schedule: max_optimizer_steps=%s scheduler=%s/%s "
+            "lr_warmup_steps=%s validation_interval=%s/%s "
+            "checkpoint_interval_steps=%s consistency_start=%s/%s "
+            "consistency_warmup_steps=%s",
+            config["training"]["max_optimizer_steps"],
+            config["training"]["scheduler"]["name"],
+            config["training"]["scheduler"]["step_unit"],
+            config["training"]["scheduler"]["warmup_steps"],
+            config["evaluation"]["interval"]["unit"],
+            config["evaluation"]["interval"]["value"],
+            config["training"]["checkpoint_interval_steps"],
+            config["loss"]["consistency"]["start"]["unit"],
+            config["loss"]["consistency"]["start"]["value"],
+            config["loss"]["consistency"]["warmup_steps"],
+        )
         if (
             context.is_main_process
             and stage in {
@@ -853,6 +882,7 @@ def run_training(config: dict, *, joint_entrypoint: bool = False) -> dict:
         last_epoch_report: dict[str, float | int | str] = {}
         validated_optimizer_steps: set[int] = set()
         best_checkpoint_steps: set[int] = set()
+        latest_checkpoint_steps: set[int] = set()
 
         def run_validation(
             displayed_epoch: int,
@@ -1009,6 +1039,9 @@ def run_training(config: dict, *, joint_entrypoint: bool = False) -> dict:
                         optimizer_updates_in_epoch += 1
                         if training["scheduler"]["step_unit"] == "optimizer_step":
                             scheduler.step()
+                        numbered_step_due = _optimizer_step_checkpoint_due(
+                            config, state.global_step
+                        )
                         validation_trigger = _optimizer_step_validation_trigger(
                             config, state.global_step
                         )
@@ -1023,6 +1056,38 @@ def run_training(config: dict, *, joint_entrypoint: bool = False) -> dict:
                                 checkpoint_micro_step=total_iterations + 1,
                             )
                             validation_step = state.global_step
+                        if validation_trigger is not None or numbered_step_due:
+                            checkpoint_metrics = {
+                                **(
+                                    validation_metrics
+                                    if validation_step == state.global_step
+                                    else {}
+                                ),
+                                "best_mIoU": state.best_miou,
+                                "optimizer_step": state.global_step,
+                            }
+                            filenames = ["latest.pt"]
+                            if numbered_step_due:
+                                filenames.append(
+                                    f"step_{state.global_step:06d}.pt"
+                                )
+                            _save_training_checkpoint(
+                                config=config,
+                                training_model=training_model,
+                                optimizer=optimizer,
+                                scheduler=scheduler,
+                                scaler=scaler,
+                                epoch=epoch_index,
+                                global_step=state.global_step,
+                                micro_step=total_iterations + 1,
+                                metrics=checkpoint_metrics,
+                                context=context,
+                                output_dir=output_dir,
+                                filenames=filenames,
+                                global_batch_size=global_batch_size,
+                                local_batch_size=local_batch_size,
+                            )
+                            latest_checkpoint_steps.add(state.global_step)
                     total_iterations += 1
                     processed_batches += 1
                     batch_stats = dict(objectives["stats"])
@@ -1148,7 +1213,9 @@ def run_training(config: dict, *, joint_entrypoint: bool = False) -> dict:
                 **(validation_metrics or {}),
                 "best_mIoU": state.best_miou,
             }
-            filenames = ["latest.pt"]
+            filenames = []
+            if state.global_step not in latest_checkpoint_steps:
+                filenames.append("latest.pt")
             if displayed_epoch in numbered_checkpoint_epochs:
                 filenames.append(f"epoch_{epoch_index + 1:04d}.pt")
             if (
@@ -1158,22 +1225,25 @@ def run_training(config: dict, *, joint_entrypoint: bool = False) -> dict:
                 and validation_metrics["mIoU"] >= state.best_miou
             ):
                 filenames.append("best.pt")
-            _save_training_checkpoint(
-                config=config,
-                training_model=training_model,
-                optimizer=optimizer,
-                scheduler=scheduler,
-                scaler=scaler,
-                epoch=epoch_index + 1,
-                global_step=state.global_step,
-                micro_step=total_iterations,
-                metrics=last_metrics,
-                context=context,
-                output_dir=output_dir,
-                filenames=filenames,
-                global_batch_size=global_batch_size,
-                local_batch_size=local_batch_size,
-            )
+            if filenames:
+                _save_training_checkpoint(
+                    config=config,
+                    training_model=training_model,
+                    optimizer=optimizer,
+                    scheduler=scheduler,
+                    scaler=scaler,
+                    epoch=epoch_index + 1,
+                    global_step=state.global_step,
+                    micro_step=total_iterations,
+                    metrics=last_metrics,
+                    context=context,
+                    output_dir=output_dir,
+                    filenames=filenames,
+                    global_batch_size=global_batch_size,
+                    local_batch_size=local_batch_size,
+                )
+                if "latest.pt" in filenames:
+                    latest_checkpoint_steps.add(state.global_step)
             if max_iterations is not None and total_iterations >= max_iterations:
                 break
             if (

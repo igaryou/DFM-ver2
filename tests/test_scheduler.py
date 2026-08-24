@@ -147,3 +147,36 @@ def test_resume_lr_sequence_matches_continuous_sequence():
         resumed_scheduler.step()
 
     assert first + resumed == pytest.approx(continuous)
+
+
+def test_poly_optimizer_step_uses_160k_budget_and_1500_step_warmup():
+    config = _config()
+    config["training"]["max_optimizer_steps"] = 160000
+    config["training"]["scheduler"].update({
+        "name": "poly", "step_unit": "optimizer_step",
+        "warmup_steps": 1500, "warmup_start_factor": 1.0e-6,
+        "power": 1.0, "min_lr": 0.0,
+    })
+    optimizer = _optimizer()
+    scheduler = build_scheduler(config, optimizer)
+
+    assert scheduler.lr_lambdas[0](0) == pytest.approx(1.0e-6)
+    assert scheduler.lr_lambdas[0](1500) == pytest.approx(1.0)
+    assert scheduler.lr_lambdas[0](160000) == pytest.approx(0.0)
+
+
+def test_cosine_optimizer_step_uses_remaining_step_budget_for_t_max():
+    config = _config()
+    config["training"]["max_optimizer_steps"] = 160000
+    config["training"]["scheduler"].update({
+        "name": "cosine", "step_unit": "optimizer_step", "warmup_steps": 1500,
+    })
+    scheduler = build_scheduler(config, _optimizer())
+    assert scheduler._milestones == [1500]
+    assert scheduler._schedulers[1].T_max == 158500
+
+
+def test_cosine_epoch_keeps_epoch_budget_for_t_max():
+    scheduler = build_scheduler(_config(), _optimizer())
+    assert scheduler._milestones == [10]
+    assert scheduler._schedulers[1].T_max == 790

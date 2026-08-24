@@ -10,6 +10,7 @@ from config import load_config, validate_config
 from training_objectives import (
     DDPCompatibleTrainingModel,
     compute_model_training_objectives,
+    consistency_schedule_weight,
 )
 
 
@@ -170,3 +171,36 @@ def test_joint_config_forbids_init_from_and_stage2_requires_checkpoint():
     bad_stage2["checkpoint"]["resume"] = None
     with pytest.raises(ValueError, match="requires checkpoint"):
         validate_config(bad_stage2)
+
+
+@pytest.mark.parametrize(
+    ("warmup_steps", "optimizer_step", "expected"),
+    [
+        (0, 95999, 0.0),
+        (0, 96000, 1.0),
+        (0, 96001, 1.0),
+        (16000, 95999, 0.0),
+        (16000, 96000, 0.0),
+        (16000, 104000, 0.5),
+        (16000, 112000, 1.0),
+        (16000, 128000, 1.0),
+    ],
+)
+def test_optimizer_step_consistency_schedule_boundaries(
+    warmup_steps, optimizer_step, expected
+):
+    consistency = {
+        "start_epoch": 0,
+        "start": {"unit": "optimizer_step", "value": 96000},
+        "warmup_epochs": 0,
+        "warmup_steps": warmup_steps,
+    }
+    schedule_weight = consistency_schedule_weight(
+        consistency,
+        epoch_index=0,
+        progress_in_epoch=0.0,
+        optimizer_step=optimizer_step,
+    )
+    assert schedule_weight == pytest.approx(expected)
+    assert 0.0 <= schedule_weight <= 1.0
+    assert 0.5 * 1.0 * schedule_weight == pytest.approx(0.5 * expected)

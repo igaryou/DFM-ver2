@@ -1,7 +1,7 @@
 experiment:
-  name: dfm_joint_psd_cityscapes
+  name: dfm_joint_psd_cityscapes_160k
   seed: 42
-  output_dir: /home/igarashi_25/DFM/results/joint_psd
+  output_dir: /home/igarashi_25/DFM/results/joint_psd_cityscapes_160k
   stage: joint_training
 runtime:
   device: auto
@@ -80,8 +80,10 @@ time_sampling:
   max_time: 1.0
   min_gap: 1.0e-5
 training:
-  epochs: 800
+  epochs: 1000
   max_iterations: null
+  max_optimizer_steps: 160000
+  max_batches_per_epoch: null
   batch_size: 4
   grad_accum_steps: 1
   optimizer:
@@ -93,14 +95,20 @@ training:
       model: {lr: 5.0e-5}
       source: {lr: 1.0e-5}
   scheduler:
-    name: cosine
-    warmup_epochs: 10
-    eta_min: 5.0e-7
+    name: poly
+    step_unit: optimizer_step
+    warmup_epochs: 0
+    warmup_steps: 1500
+    warmup_start_factor: 1.0e-6
+    power: 1.0
+    min_lr: 0.0
+    eta_min: 0.0
   grad_clip: 1.0
   label_smoothing: 0.0
   log_interval: 50
-  checkpoint_interval_epochs: 200
-  validation_epochs: [75, 150, 200, 300, 500, 600, 800]
+  checkpoint_interval_epochs: 0
+  checkpoint_interval_steps: 16000
+  validation_epochs: []
 loss:
   primary: {type: diagonal_ce, weight: 0.5}
   consistency:
@@ -108,7 +116,9 @@ loss:
     type: psd
     weight: 0.5
     start_epoch: 0
-    warmup_epochs: 30
+    start: {unit: optimizer_step, value: 96000}
+    warmup_epochs: 0
+    warmup_steps: 0
     schedule: linear
     max_weight: 1.0
     precision:
@@ -147,6 +157,7 @@ evaluation:
   max_visualizations: 16
   max_batches: null
   checkpoint: null
+  interval: {unit: optimizer_step, value: 16000}
 wandb:
   enabled: true
   project: DFM
