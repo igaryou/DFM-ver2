@@ -60,6 +60,80 @@ def _pad_to(
     return image, mask
 
 
+def _random_resize_pair(
+    image: torch.Tensor, mask: torch.Tensor, config: dict
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if not config["enabled"]:
+        return image, mask
+    ratio = float(torch.empty(()).uniform_(*config["ratio_range"]))
+    target_width = config["base_scale"]["width"] * ratio
+    target_height = config["base_scale"]["height"] * ratio
+    if config["keep_ratio"]:
+        size = _resize_keep_ratio_size(
+            *mask.shape, target_width, target_height
+        )
+    else:
+        size = (round(target_height), round(target_width))
+    image = TF.resize(
+        image, size, TF.InterpolationMode.BILINEAR, antialias=True
+    )
+    mask = TF.resize(
+        mask[None], size, TF.InterpolationMode.NEAREST
+    )[0].long()
+    return image, mask
+
+
+def _crop_has_acceptable_class_ratio(
+    candidate: torch.Tensor, *, ignore_index: int, cat_max_ratio: float
+) -> bool:
+    valid = candidate[candidate != ignore_index]
+    if valid.numel() == 0:
+        return False
+    counts = torch.bincount(valid)
+    return float(counts.max()) / valid.numel() < cat_max_ratio
+
+
+def _random_crop_pair(
+    image: torch.Tensor,
+    mask: torch.Tensor,
+    config: dict,
+    *,
+    ensure_crop_size: bool = False,
+    image_pad_value: float = 0.0,
+    mask_pad_value: int = 0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if not config["enabled"]:
+        return image, mask
+    crop_h, crop_w = config["size"]
+    if ensure_crop_size:
+        # Safety padding precedes photometric distortion and normalization.
+        # The main Cityscapes scale range normally makes this a no-op.
+        image, padded_mask = _pad_to(
+            image, mask, crop_h, crop_w, image_pad_value, mask_pad_value
+        )
+        assert padded_mask is not None
+        mask = padded_mask
+    height, width = mask.shape
+    out_h, out_w = min(crop_h, height), min(crop_w, width)
+    selected = (0, 0)
+    for _ in range(config["max_attempts"]):
+        top = int(torch.randint(0, height - out_h + 1, ()))
+        left = int(torch.randint(0, width - out_w + 1, ()))
+        selected = top, left
+        candidate = mask[top:top + out_h, left:left + out_w]
+        if _crop_has_acceptable_class_ratio(
+            candidate,
+            ignore_index=config["ignore_index"],
+            cat_max_ratio=config["cat_max_ratio"],
+        ):
+            break
+    top, left = selected
+    return (
+        image[:, top:top + out_h, left:left + out_w],
+        mask[top:top + out_h, left:left + out_w],
+    )
+
+
 class PhotoMetricDistortion:
     """MMSeg-style random ordering, operating on an RGB tensor in [0, 1]."""
 
@@ -135,24 +209,21 @@ class Cityscapes20ClassDataset(Dataset):
         self,
         root: str,
         split: str = "train",
-        image_size: list[int] | tuple[int, int] | None = None,
-        crop_size: list[int] | tuple[int, int] | None = None,
+        config: dict | None = None,
         augment: bool = False,
-        hflip_prob: float = 0.5,
-        color_jitter: bool = False,
-        brightness: float = 0.2,
-        contrast: float = 0.2,
-        saturation: float = 0.2,
-        hue: float = 0.1,
-        imagenet_normalize: bool = False,
     ) -> None:
-        self.image_size = tuple(image_size) if image_size is not None else None
-        self.crop_size = tuple(crop_size) if crop_size is not None else None
-        self.augment = augment
-        self.hflip_prob = hflip_prob
-        self.color_jitter_enabled = color_jitter
-        self.imagenet_normalize = imagenet_normalize
-        self.jitter = transforms.ColorJitter(brightness, contrast, saturation, hue)
+        if config is None:
+            raise ValueError("Cityscapes20ClassDataset requires config")
+        self.config = config
+        self.split = split
+        self.augment = augment and split == config["dataset"]["train_split"]
+        photo_config = config["augmentation"]["photometric_distortion"]
+        self.photo_distortion = PhotoMetricDistortion(photo_config)
+        jitter = config["augmentation"]["color_jitter"]
+        self.jitter = transforms.ColorJitter(
+            jitter["brightness"], jitter["contrast"],
+            jitter["saturation"], jitter["hue"],
+        )
         self.dataset = Cityscapes(
             root=root, split=split, mode="fine", target_type="semantic"
         )
@@ -160,41 +231,168 @@ class Cityscapes20ClassDataset(Dataset):
     def __len__(self) -> int:
         return len(self.dataset)
 
-    def __getitem__(self, index: int):
-        image, target = self.dataset[index]
-        image = TF.pil_to_tensor(image).float() / 255.0
-        mask = torch.from_numpy(ID_TO_20CLASS[np.asarray(target, dtype=np.uint8)]).long()
+    @staticmethod
+    def _map_target(target) -> torch.Tensor:
+        return torch.from_numpy(
+            ID_TO_20CLASS[np.asarray(target, dtype=np.uint8)]
+        ).long()
 
-        if self.augment and torch.rand(()) < self.hflip_prob:
-            image = torch.flip(image, (2,))
-            mask = torch.flip(mask, (1,))
-        if self.image_size is not None:
+    def _legacy_train_item(
+        self, image: torch.Tensor, mask: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        augmentation = self.config["augmentation"]
+        flip = augmentation["horizontal_flip"]
+        if flip["enabled"] and torch.rand(()) < flip["probability"]:
+            image, mask = torch.flip(image, (2,)), torch.flip(mask, (1,))
+        image_size = self.config["dataset"]["image_size"]
+        if image_size is not None:
             image = TF.resize(
-                image, self.image_size, interpolation=TF.InterpolationMode.BILINEAR,
+                image, image_size, interpolation=TF.InterpolationMode.BILINEAR,
                 antialias=True,
             )
             mask = TF.resize(
-                mask[None], self.image_size, interpolation=TF.InterpolationMode.NEAREST
+                mask[None], image_size, interpolation=TF.InterpolationMode.NEAREST
             )[0].long()
-        if self.crop_size is not None:
-            crop_h, crop_w = self.crop_size
-            _, height, width = image.shape
-            if crop_h > height or crop_w > width:
+        crop_size = self.config["dataset"]["crop_size"]
+        if crop_size is not None:
+            if crop_size[0] > mask.shape[0] or crop_size[1] > mask.shape[1]:
                 raise ValueError("dataset.crop_size exceeds the resized image")
-            top = torch.randint(0, height - crop_h + 1, ()).item()
-            left = torch.randint(0, width - crop_w + 1, ()).item()
-            image = TF.crop(image, top, left, crop_h, crop_w)
-            mask = TF.crop(mask, top, left, crop_h, crop_w)
-        if self.augment and self.color_jitter_enabled:
+            image, mask = _random_crop_pair(image, mask, {
+                "enabled": True,
+                "size": crop_size,
+                "cat_max_ratio": 1.01,
+                "ignore_index": self.config["dataset"]["void_class_index"],
+                "max_attempts": 1,
+            })
+        if augmentation["color_jitter"]["enabled"]:
             image = self.jitter(image).clamp(0.0, 1.0)
-        if self.imagenet_normalize:
+        if augmentation["imagenet_normalize"]:
             image = _normalize(image, {
                 "enabled": True,
                 "mean": [0.485, 0.456, 0.406],
                 "std": [0.229, 0.224, 0.225],
             })
-
         return image, mask
+
+    def _train_item(
+        self, image: torch.Tensor, mask: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        augmentation = self.config["augmentation"]
+        modern_pipeline = any(
+            augmentation[name]["enabled"]
+            for name in (
+                "random_resize", "random_crop", "photometric_distortion",
+                "normalize", "pad",
+            )
+        )
+        if not modern_pipeline:
+            return self._legacy_train_item(image, mask)
+        image, mask = _random_resize_pair(
+            image, mask, augmentation["random_resize"]
+        )
+        image, mask = _random_crop_pair(
+            image,
+            mask,
+            augmentation["random_crop"],
+            ensure_crop_size=True,
+            image_pad_value=0.0,
+            mask_pad_value=self.config["dataset"]["void_class_index"],
+        )
+        flip = augmentation["horizontal_flip"]
+        if flip["enabled"] and torch.rand(()) < flip["probability"]:
+            image, mask = torch.flip(image, (2,)), torch.flip(mask, (1,))
+        photo = augmentation["photometric_distortion"]
+        if photo["enabled"]:
+            image = self.photo_distortion(image)
+        image = _normalize(image, augmentation["normalize"])
+        pad = augmentation["pad"]
+        if pad["enabled"]:
+            # Padding is intentionally after normalization, so image_value=0
+            # denotes zero in normalized space. The main crop normally means
+            # that no final padding is required.
+            image, padded_mask = _pad_to(
+                image, mask, *pad["size"], pad["image_value"], pad["mask_value"]
+            )
+            assert padded_mask is not None
+            mask = padded_mask
+        expected = tuple(self.config["dataset"]["image_size"])
+        enforce_expected = (
+            augmentation["random_crop"]["enabled"]
+            and tuple(augmentation["random_crop"]["size"]) == expected
+        )
+        if enforce_expected and (
+            image.shape[-2:] != expected or mask.shape != expected
+        ):
+            raise RuntimeError(
+                "Cityscapes train augmentation must produce dataset.image_size: "
+                f"image={tuple(image.shape[-2:])}, mask={tuple(mask.shape)}, "
+                f"expected={expected}"
+            )
+        return image, mask
+
+    def _validation_item(
+        self, image: torch.Tensor, mask: torch.Tensor, index: int
+    ):
+        evaluation = self.config["evaluation"]
+        if not evaluation["original_resolution"]:
+            size = self.config["dataset"]["image_size"]
+            image = TF.resize(
+                image, size, TF.InterpolationMode.BILINEAR, antialias=True
+            )
+            mask = TF.resize(
+                mask[None], size, TF.InterpolationMode.NEAREST
+            )[0].long()
+            if self.config["augmentation"]["imagenet_normalize"]:
+                image = _normalize(image, {
+                    "enabled": True,
+                    "mean": [0.485, 0.456, 0.406],
+                    "std": [0.229, 0.224, 0.225],
+                })
+            else:
+                image = _normalize(
+                    image, self.config["augmentation"]["normalize"]
+                )
+            return image, mask
+        original_shape = tuple(mask.shape)
+        resize = evaluation["resize"]
+        model_shape = (
+            _resize_keep_ratio_size(
+                *original_shape, resize["width"], resize["height"]
+            )
+            if resize["keep_ratio"]
+            else (resize["height"], resize["width"])
+        )
+        image = TF.resize(
+            image, model_shape, TF.InterpolationMode.BILINEAR, antialias=True
+        )
+        image = _normalize(image, self.config["augmentation"]["normalize"])
+        padded_shape = model_shape
+        divisor = evaluation["size_divisor"]
+        if divisor is not None:
+            padded_shape = (
+                math.ceil(model_shape[0] / divisor) * divisor,
+                math.ceil(model_shape[1] / divisor) * divisor,
+            )
+            image, _ = _pad_to(image, None, *padded_shape, 0.0, 19)
+        return {
+            "image": image,
+            "target": mask,
+            "original_shape": original_shape,
+            "model_shape": model_shape,
+            "padded_shape": padded_shape,
+            "sample_id": Path(self.dataset.images[index]).stem,
+        }
+
+    def __getitem__(self, index: int):
+        image, target = self.dataset[index]
+        image = TF.pil_to_tensor(image).float() / 255.0
+        mask = self._map_target(target)
+
+        return (
+            self._train_item(image, mask)
+            if self.augment
+            else self._validation_item(image, mask, index)
+        )
 
 
 class ADE20KDataset(Dataset):
@@ -245,43 +443,13 @@ class ADE20KDataset(Dataset):
         return image, mask
 
     def _random_resize(self, image: torch.Tensor, mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        resize = self.config["augmentation"]["random_resize"]
-        if not resize["enabled"]:
-            return image, mask
-        ratio = float(torch.empty(()).uniform_(*resize["ratio_range"]))
-        target_width = resize["base_scale"]["width"] * ratio
-        target_height = resize["base_scale"]["height"] * ratio
-        if resize["keep_ratio"]:
-            size = _resize_keep_ratio_size(*mask.shape, target_width, target_height)
-        else:
-            size = (round(target_height), round(target_width))
-        image = TF.resize(image, size, TF.InterpolationMode.BILINEAR, antialias=True)
-        mask = TF.resize(mask[None], size, TF.InterpolationMode.NEAREST)[0].long()
-        return image, mask
+        return _random_resize_pair(
+            image, mask, self.config["augmentation"]["random_resize"]
+        )
 
     def _random_crop(self, image: torch.Tensor, mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        crop = self.config["augmentation"]["random_crop"]
-        if not crop["enabled"]:
-            return image, mask
-        crop_h, crop_w = crop["size"]
-        height, width = mask.shape
-        out_h, out_w = min(crop_h, height), min(crop_w, width)
-        selected = (0, 0)
-        for _ in range(crop["max_attempts"]):
-            top = int(torch.randint(0, height - out_h + 1, ()))
-            left = int(torch.randint(0, width - out_w + 1, ()))
-            selected = top, left
-            candidate = mask[top:top + out_h, left:left + out_w]
-            valid = candidate[candidate != crop["ignore_index"]]
-            if valid.numel() == 0:
-                continue
-            counts = torch.bincount(valid, minlength=151)
-            if float(counts.max()) / valid.numel() < crop["cat_max_ratio"]:
-                break
-        top, left = selected
-        return (
-            image[:, top:top + out_h, left:left + out_w],
-            mask[top:top + out_h, left:left + out_w],
+        return _random_crop_pair(
+            image, mask, self.config["augmentation"]["random_crop"]
         )
 
     def _train_item(self, image: torch.Tensor, mask: torch.Tensor):
@@ -340,7 +508,7 @@ class ADE20KDataset(Dataset):
 
 
 def ade20k_eval_collate(batch: list[dict]) -> list[dict]:
-    """Keep variable-resolution ADE20K samples separate until evaluation."""
+    """Keep original-resolution evaluation samples separate until inference."""
     return batch
 
 
@@ -349,21 +517,10 @@ def build_dataset(config: dict, split: str, augment: bool | None = None):
         enabled = config["augmentation"]["enabled"] if augment is None else augment
         return ADE20KDataset(config["dataset"]["root"], split, config, enabled)
 
-    aug = config["augmentation"]
-    flip = aug["horizontal_flip"]
-    jitter = aug["color_jitter"]
-    enabled = aug["enabled"] if augment is None else augment
+    enabled = config["augmentation"]["enabled"] if augment is None else augment
     return Cityscapes20ClassDataset(
         root=config["dataset"]["root"],
         split=split,
-        image_size=config["dataset"]["image_size"],
-        crop_size=config["dataset"]["crop_size"] if split == "train" else None,
+        config=config,
         augment=enabled and split == "train",
-        hflip_prob=flip["probability"] if flip["enabled"] else 0.0,
-        color_jitter=enabled and jitter["enabled"],
-        brightness=jitter["brightness"],
-        contrast=jitter["contrast"],
-        saturation=jitter["saturation"],
-        hue=jitter["hue"],
-        imagenet_normalize=aug["imagenet_normalize"],
     )

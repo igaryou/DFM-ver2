@@ -1,0 +1,13 @@
+extends: joint_psd_ade20k.yaml
+
+source:
+  type: task_finetuned_segformer
+  model_id: nvidia/segformer-b1-finetuned-ade-512-512
+  representation: probability
+  void_channel_value: 0.0
+  freeze: true
+  learned_logvar: false
+  fixed_std: 1.0
+  supervision:
+    type: none
+    weight: 0.0

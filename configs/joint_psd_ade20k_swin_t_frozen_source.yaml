@@ -1,0 +1,24 @@
+extends: joint_psd_ade20k.yaml
+
+model:
+  image_encoder:
+    type: swin
+    variant: tiny
+    pretrained: true
+    freeze: false
+    input_already_normalized: true
+    neck:
+      type: ddp_fpn_merge
+      channels: 256
+
+source:
+  type: task_finetuned_segformer
+  model_id: nvidia/segformer-b1-finetuned-ade-512-512
+  representation: probability
+  void_channel_value: 0.0
+  freeze: true
+  learned_logvar: false
+  fixed_std: 1.0
+  supervision:
+    type: none
+    weight: 0.0

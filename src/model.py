@@ -90,6 +90,280 @@ class ImageEncoder(nn.Module):
         return self.out(F.leaky_relu(first + self.body_out(self.body(first)), 0.2))
 
 
+TRANSFORMER_IMAGE_ENCODER_MODEL_IDS = {
+    "swin": {
+        "tiny": "microsoft/swin-tiny-patch4-window7-224",
+        "small": "microsoft/swin-small-patch4-window7-224",
+        "base": "microsoft/swin-base-patch4-window7-224",
+        "large": "microsoft/swin-large-patch4-window7-224",
+    },
+    "convnext": {
+        "tiny": "facebook/convnext-tiny-224",
+        "small": "facebook/convnext-small-224",
+        "base": "facebook/convnext-base-224",
+        "large": "facebook/convnext-large-224",
+    },
+}
+
+_SWIN_SPECS = {
+    "tiny": ([96, 192, 384, 768], [2, 2, 6, 2], [3, 6, 12, 24]),
+    "small": ([96, 192, 384, 768], [2, 2, 18, 2], [3, 6, 12, 24]),
+    "base": ([128, 256, 512, 1024], [2, 2, 18, 2], [4, 8, 16, 32]),
+    "large": ([192, 384, 768, 1536], [2, 2, 18, 2], [6, 12, 24, 48]),
+}
+
+_CONVNEXT_SPECS = {
+    "tiny": ([96, 192, 384, 768], [3, 3, 9, 3]),
+    "small": ([96, 192, 384, 768], [3, 3, 27, 3]),
+    "base": ([128, 256, 512, 1024], [3, 3, 27, 3]),
+    "large": ([192, 384, 768, 1536], [3, 3, 27, 3]),
+}
+
+
+def load_transformer_image_backbone(
+    backbone_type: str, variant: str, pretrained: bool,
+) -> tuple[nn.Module, list[int]]:
+    """Build an HF backbone. Kept as a function so tests can replace the loader."""
+    try:
+        from transformers import ConvNextConfig, ConvNextModel, SwinConfig, SwinModel
+    except ImportError as exc:
+        raise RuntimeError(
+            f"model.image_encoder.type={backbone_type} requires transformers"
+        ) from exc
+
+    model_id = TRANSFORMER_IMAGE_ENCODER_MODEL_IDS[backbone_type][variant]
+    if backbone_type == "swin":
+        hidden_sizes, depths, heads = _SWIN_SPECS[variant]
+        if pretrained:
+            # Transformers 5 SDPA currently mis-shapes Swin's shifted-window
+            # mask for some rectangular inputs. Eager attention handles the
+            # same official weights and arbitrary ADE/Cityscapes sizes.
+            backbone = SwinModel.from_pretrained(
+                model_id, attn_implementation="eager"
+            )
+        else:
+            swin_config = SwinConfig(
+                num_channels=3,
+                patch_size=4,
+                window_size=7,
+                embed_dim=hidden_sizes[0],
+                depths=depths,
+                num_heads=heads,
+                output_hidden_states=True,
+            )
+            swin_config._attn_implementation = "eager"
+            backbone = SwinModel(swin_config)
+    else:
+        hidden_sizes, depths = _CONVNEXT_SPECS[variant]
+        if pretrained:
+            backbone = ConvNextModel.from_pretrained(model_id)
+        else:
+            backbone = ConvNextModel(ConvNextConfig(
+                num_channels=3,
+                hidden_sizes=hidden_sizes,
+                depths=depths,
+                output_hidden_states=True,
+            ))
+    configured_sizes = list(getattr(backbone.config, "hidden_sizes", hidden_sizes))
+    if len(configured_sizes) != 4:
+        raise ValueError(
+            f"{backbone_type} backbone must expose four hidden sizes, got "
+            f"{configured_sizes}"
+        )
+    return backbone, configured_sizes
+
+
+class DDPFPNMultiStageMerging(nn.Module):
+    """Lightweight FPN followed by DDP-style H/4 multi-stage merging."""
+
+    def __init__(self, input_channels: Iterable[int], channels: int) -> None:
+        super().__init__()
+        input_channels = tuple(input_channels)
+        if len(input_channels) != 4:
+            raise ValueError("DDP FPN requires exactly four backbone stages")
+        self.lateral = nn.ModuleList(
+            nn.Conv2d(input_channel, channels, 1)
+            for input_channel in input_channels
+        )
+        self.fpn_output = nn.ModuleList(
+            nn.Conv2d(channels, channels, 3, padding=1)
+            for _ in input_channels
+        )
+        self.merge = nn.Conv2d(channels * len(input_channels), channels, 1)
+
+    def forward(self, features: Iterable[torch.Tensor]) -> torch.Tensor:
+        features = tuple(features)
+        if len(features) != 4:
+            raise ValueError("DDP FPN requires exactly four feature tensors")
+        pyramid = [layer(feature) for layer, feature in zip(self.lateral, features)]
+        for index in range(len(pyramid) - 2, -1, -1):
+            pyramid[index] = pyramid[index] + F.interpolate(
+                pyramid[index + 1],
+                size=pyramid[index].shape[-2:],
+                mode="bilinear",
+                align_corners=False,
+            )
+        pyramid = [layer(feature) for layer, feature in zip(self.fpn_output, pyramid)]
+        target_size = pyramid[0].shape[-2:]
+        merged = torch.cat([
+            feature if feature.shape[-2:] == target_size else F.interpolate(
+                feature, size=target_size, mode="bilinear", align_corners=False
+            )
+            for feature in pyramid
+        ], dim=1)
+        return self.merge(merged)
+
+
+class TransformerImageEncoder(nn.Module):
+    """Swin/ConvNeXt multi-scale encoder with an optional DDP-style neck."""
+
+    def __init__(
+        self,
+        backbone_type: str,
+        variant: str,
+        pretrained: bool,
+        freeze_backbone: bool,
+        neck_type: str,
+        neck_channels: int,
+        fusion_channels: int,
+        state_downsample_factor: int,
+        input_already_normalized: bool = False,
+    ) -> None:
+        super().__init__()
+        self.backbone_type = backbone_type
+        self.variant = variant
+        self.freeze_backbone = freeze_backbone
+        self.state_downsample_factor = state_downsample_factor
+        self.input_already_normalized = input_already_normalized
+        self.backbone, hidden_sizes = load_transformer_image_backbone(
+            backbone_type, variant, pretrained
+        )
+        if neck_type == "ddp_fpn_merge":
+            self.neck = DDPFPNMultiStageMerging(hidden_sizes, neck_channels)
+            projection_input_channels = neck_channels
+        else:
+            self.neck = nn.Identity()
+            projection_input_channels = hidden_sizes[0]
+        self.projection = nn.Conv2d(projection_input_channels, fusion_channels, 1)
+        self.register_buffer(
+            "mean", torch.tensor([0.485, 0.456, 0.406])[None, :, None, None],
+            persistent=False,
+        )
+        self.register_buffer(
+            "std", torch.tensor([0.229, 0.224, 0.225])[None, :, None, None],
+            persistent=False,
+        )
+        self._hidden_sizes = hidden_sizes
+        if freeze_backbone:
+            self.backbone.requires_grad_(False)
+            self.backbone.eval()
+
+    @staticmethod
+    def _as_spatial_feature(
+        feature: torch.Tensor,
+        channels: int,
+        expected_size: tuple[int, int],
+    ) -> torch.Tensor:
+        if feature.ndim == 4:
+            if feature.shape[1] == channels:
+                return feature
+            if feature.shape[-1] == channels:
+                return feature.permute(0, 3, 1, 2).contiguous()
+        elif feature.ndim == 3 and feature.shape[-1] == channels:
+            if feature.shape[1] != expected_size[0] * expected_size[1]:
+                raise ValueError(
+                    f"Cannot reshape hidden state {tuple(feature.shape)} to "
+                    f"spatial size {expected_size}"
+                )
+            return feature.transpose(1, 2).reshape(
+                feature.shape[0], channels, *expected_size
+            )
+        raise ValueError(
+            f"Unsupported backbone hidden state shape {tuple(feature.shape)} "
+            f"for {channels} channels"
+        )
+
+    def train(self, mode: bool = True):
+        super().train(mode)
+        if self.freeze_backbone:
+            self.backbone.eval()
+        return self
+
+    def forward(self, image: torch.Tensor) -> torch.Tensor:
+        normalized = image if self.input_already_normalized else (
+            image - self.mean.to(image)
+        ) / self.std.to(image)
+        backbone_input = normalized
+        if self.backbone_type == "swin":
+            # Every Swin stage needs at least one complete 7x7 window in the
+            # current Transformers implementation. Production crops already
+            # satisfy this; padding keeps small debug/smoke images supported.
+            minimum = 4 * 2**3 * 7
+            pad_height = max(minimum - image.shape[-2], 0)
+            pad_width = max(minimum - image.shape[-1], 0)
+            if pad_height or pad_width:
+                backbone_input = F.pad(
+                    backbone_input, (0, pad_width, 0, pad_height)
+                )
+        outputs = self.backbone(
+            pixel_values=backbone_input, output_hidden_states=True, return_dict=True
+        )
+        if self.backbone_type == "swin" and hasattr(outputs, "reshaped_hidden_states"):
+            hidden_states = tuple(outputs.reshaped_hidden_states[:4])
+        elif self.backbone_type == "swin":
+            hidden_states = tuple(outputs.hidden_states[:4])
+        else:
+            hidden_states = tuple(outputs.hidden_states[-4:])
+        if len(hidden_states) != 4:
+            raise ValueError(
+                f"{self.backbone_type} must return four hidden states, got "
+                f"{len(hidden_states)}"
+            )
+        features = []
+        for index, (hidden, channels) in enumerate(
+            zip(hidden_states, self._hidden_sizes)
+        ):
+            divisor = 4 * 2**index
+            feature = self._as_spatial_feature(
+                hidden,
+                channels,
+                state_spatial_size(backbone_input, divisor),
+            )
+            original_size = state_spatial_size(image, divisor)
+            features.append(feature[..., :original_size[0], :original_size[1]])
+        merged = self.neck(features) if not isinstance(self.neck, nn.Identity) else features[0]
+        output = self.projection(merged)
+        target_size = state_spatial_size(image, self.state_downsample_factor)
+        if output.shape[-2:] != target_size:
+            output = F.interpolate(
+                output, size=target_size, mode="bilinear", align_corners=False
+            )
+        return output
+
+
+def build_image_encoder(config: dict) -> nn.Module:
+    encoder = config.get("image_encoder")
+    if encoder is None or encoder.get("type", "rrdb") == "rrdb":
+        return ImageEncoder(
+            config["fusion_channels"],
+            config["rrdb_blocks"],
+            config["rrdb_growth_channels"],
+            config.get("state_downsample_factor", 4),
+        )
+    neck = encoder["neck"]
+    return TransformerImageEncoder(
+        encoder["type"],
+        encoder["variant"],
+        encoder["pretrained"],
+        encoder["freeze"],
+        neck["type"],
+        neck["channels"],
+        config["fusion_channels"],
+        config.get("state_downsample_factor", 4),
+        encoder["input_already_normalized"],
+    )
+
+
 class ResidualBlock(nn.Module):
     def __init__(self, in_channels: int, out_channels: int, time_dim: int, dropout: float):
         super().__init__()
@@ -251,12 +525,7 @@ class DiscreteFlowMapModel(nn.Module):
         self.num_classes = num_classes
         self.state_downsample_factor = config.get("state_downsample_factor", 4)
         self.mask_encoder = nn.Conv2d(num_classes, channels, 3, padding=1)
-        self.image_encoder = ImageEncoder(
-            channels,
-            config["rrdb_blocks"],
-            config["rrdb_growth_channels"],
-            self.state_downsample_factor,
-        )
+        self.image_encoder = build_image_encoder(config)
         self.unet = DFMUNet(
             in_channels=channels,
             out_channels=num_classes,

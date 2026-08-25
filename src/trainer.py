@@ -603,7 +603,10 @@ def _build_loaders(
         drop_last=False,
         collate_fn=(
             ade20k_eval_collate
-            if config["dataset"]["name"] == "ade20k" else None
+            if (
+                config["dataset"]["name"] == "ade20k"
+                or config["evaluation"]["original_resolution"]
+            ) else None
         ),
         **common,
     )
@@ -640,7 +643,10 @@ def validate(
     for batch_index, batch in enumerate(loader):
         if maximum_batches is not None and batch_index >= maximum_batches:
             break
-        if config["dataset"]["name"] == "ade20k":
+        if (
+            config["dataset"]["name"] == "ade20k"
+            or config["evaluation"]["original_resolution"]
+        ):
             visualization_items = []
             for sample in batch:
                 image = sample["image"].unsqueeze(0).to(

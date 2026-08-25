@@ -98,7 +98,7 @@ def test_joint_psd_cityscapes_main_protocol_is_optimizer_step_based():
     assert config["experiment"]["name"] == "dfm_joint_psd_cityscapes_160k"
     assert config["training"]["epochs"] == 1000
     assert config["training"]["max_optimizer_steps"] == 160000
-    assert config["training"]["batch_size"] == 4
+    assert config["training"]["batch_size"] == 16
     assert config["training"]["grad_accum_steps"] == 1
     assert config["training"]["scheduler"] == {
         "name": "poly",
@@ -120,6 +120,9 @@ def test_joint_psd_cityscapes_main_protocol_is_optimizer_step_based():
     assert config["evaluation"]["interval"] == {
         "unit": "optimizer_step", "value": 16000,
     }
+    assert config["dataset"]["image_size"] == [512, 1024]
+    assert config["source"]["input_already_normalized"] is True
+    assert config["evaluation"]["original_resolution"] is True
 
 
 def test_scheduler_unit_and_debug_epoch_limit_are_validated():

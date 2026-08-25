@@ -24,17 +24,27 @@ class TrainingState:
 
 
 def model_signature(config: dict) -> dict[str, Any]:
+    model_config = copy.deepcopy(config["model"])
+    image_encoder = model_config.get("image_encoder")
+    # Old signatures predate the image_encoder block. The resolved legacy RRDB
+    # defaults are omitted so old Stage-1 checkpoints still compare identically.
+    if image_encoder is not None and image_encoder.get("type") == "rrdb":
+        model_config.pop("image_encoder")
+    source_keys = [
+        "prior_type", "prior_noise_std", "backbone", "segformer_variant",
+        "pretrained", "freeze_encoder", "decoder_channels",
+        "learned_logvar", "fixed_std", "mu_tanh_scale", "supervision",
+    ]
+    if config["source"].get("type") == "task_finetuned_segformer":
+        source_keys.extend((
+            "type", "model_id", "representation", "void_channel_value",
+        ))
     return {
         "num_classes": config["dataset"]["num_classes"],
-        "model": copy.deepcopy(config["model"]),
+        "model": model_config,
         "source": {
             key: copy.deepcopy(config["source"][key])
-            for key in (
-                "prior_type", "prior_noise_std", "backbone", "segformer_variant",
-                "pretrained", "freeze_encoder", "decoder_channels",
-                "learned_logvar", "fixed_std", "mu_tanh_scale",
-                "supervision",
-            )
+            for key in source_keys
         },
     }
 

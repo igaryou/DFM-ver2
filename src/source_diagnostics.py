@@ -379,7 +379,9 @@ def _load_models(config: dict, checkpoint_path: Path, device: torch.device):
     # remain those declared by the production config.
     build_config = copy.deepcopy(config)
     build_config["source"]["pretrained"] = False
+    build_config["source"]["_load_pretrained"] = False
     build_config["source"]["checkpoint"] = None
+    build_config["model"]["image_encoder"]["pretrained"] = False
     model, source_model = build_models(build_config, device)
     model.load_state_dict(
         _without_module_prefix(checkpoint["model"]),

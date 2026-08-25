@@ -1,7 +1,7 @@
 experiment:
   name: dfm_joint_psd_ade20k_151state
   seed: 42
-  output_dir: /home/igarashi_25/DFM/results/joint_psd_ade20k_ver2
+  output_dir: /home/igarashi_25/DFM/results/joint_psd_ade20k_ver3
   stage: joint_training
 runtime:
   device: auto
@@ -101,7 +101,7 @@ source:
   var_weight: 0.0
   align_eps: 1.0e-8
   input_already_normalized: true
-  supervision: {type: align, weight: 0.15}
+  supervision: {type: align, weight: 2.0}
 flow:
   time_eps: 1.0e-5
   probability_eps: 1.0e-8

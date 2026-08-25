@@ -1,0 +1,12 @@
+extends: joint_psd_ade20k.yaml
+
+model:
+  image_encoder:
+    type: swin
+    variant: tiny
+    pretrained: true
+    freeze: false
+    input_already_normalized: true
+    neck:
+      type: ddp_fpn_merge
+      channels: 256

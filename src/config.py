@@ -96,6 +96,17 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "num_classes": 20,
         "state_downsample_factor": 4,
         "fusion_channels": 128,
+        "image_encoder": {
+            "type": "rrdb",
+            "variant": "tiny",
+            "pretrained": False,
+            "freeze": False,
+            "input_already_normalized": False,
+            "neck": {
+                "type": "none",
+                "channels": 256,
+            },
+        },
         "rrdb_blocks": 5,
         "rrdb_growth_channels": 32,
         "unet": {
@@ -109,6 +120,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         },
     },
     "source": {
+        "type": "trainable_segformer",
         "prior_type": "image_gaussian",
         "prior_noise_std": 1.0,
         "backbone": "segformer",
@@ -126,6 +138,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "var_weight": 0.0,
         "align_eps": 1.0e-8,
         "input_already_normalized": False,
+        "model_id": None,
+        "representation": "probability",
+        "void_channel_value": 0.0,
         "supervision": {
             "type": None,
             "weight": None,
@@ -344,6 +359,35 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
             raise ValueError("DFM Cityscapes training requires exactly 20 classes")
         if dataset["eval_num_classes"] != 19 or dataset["void_class_index"] != 19:
             raise ValueError("Cityscapes requires 19 eval classes and void index 19")
+        augmentation = config["augmentation"]
+        if (
+            augmentation["random_crop"]["enabled"]
+            and augmentation["random_crop"]["ignore_index"] != 19
+        ):
+            raise ValueError(
+                "Cityscapes random_crop.ignore_index must be void index 19"
+            )
+        if (
+            augmentation["pad"]["enabled"]
+            and augmentation["pad"]["mask_value"] != 19
+        ):
+            raise ValueError("Cityscapes pad.mask_value must be void index 19")
+        if (
+            augmentation["normalize"]["enabled"]
+            and augmentation["imagenet_normalize"]
+        ):
+            raise ValueError(
+                "Cityscapes normalize and legacy imagenet_normalize must not both be enabled"
+            )
+        if (
+            augmentation["normalize"]["enabled"]
+            and config["source"]["backbone"] == "segformer"
+            and not config["source"]["input_already_normalized"]
+        ):
+            raise ValueError(
+                "Normalized Cityscapes input requires "
+                "source.input_already_normalized=true for SegFormer"
+            )
     else:
         if dataset["num_classes"] != 151 or dataset["eval_num_classes"] != 150:
             raise ValueError("ADE20K 151-state protocol requires 151 model and 150 eval classes")
@@ -444,6 +488,27 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("distributed.init_method currently supports only env://")
     if config["model"]["backbone"] != "unet":
         raise ValueError("This DFM implementation currently supports model.backbone=unet")
+    image_encoder = config["model"]["image_encoder"]
+    if image_encoder["type"] not in {"rrdb", "swin", "convnext"}:
+        raise ValueError("model.image_encoder.type must be rrdb, swin, or convnext")
+    if image_encoder["variant"] not in {"tiny", "small", "base", "large"}:
+        raise ValueError(
+            "model.image_encoder.variant must be tiny, small, base, or large"
+        )
+    if image_encoder["neck"]["type"] not in {"none", "ddp_fpn_merge"}:
+        raise ValueError(
+            "model.image_encoder.neck.type must be none or ddp_fpn_merge"
+        )
+    if (
+        isinstance(image_encoder["neck"]["channels"], bool)
+        or not isinstance(image_encoder["neck"]["channels"], int)
+        or image_encoder["neck"]["channels"] <= 0
+    ):
+        raise ValueError("model.image_encoder.neck.channels must be a positive integer")
+    if image_encoder["type"] == "rrdb" and image_encoder["pretrained"]:
+        raise ValueError("RRDB does not provide pretrained weights")
+    if image_encoder["type"] == "rrdb" and image_encoder["freeze"]:
+        raise ValueError("RRDB has no separate pretrained backbone to freeze")
     state_factor = config["model"]["state_downsample_factor"]
     if (
         isinstance(state_factor, bool)
@@ -454,8 +519,16 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("model.state_downsample_factor must be a positive power of two")
     if config["source"]["prior_type"] not in {"gaussian", "dirichlet", "image_gaussian"}:
         raise ValueError("source.prior_type must be gaussian, dirichlet, or image_gaussian")
+    if config["source"]["type"] not in {
+        "trainable_segformer", "task_finetuned_segformer"
+    }:
+        raise ValueError(
+            "source.type must be trainable_segformer or task_finetuned_segformer"
+        )
     if config["source"]["backbone"] not in {"segformer", "unet"}:
         raise ValueError("source.backbone must be segformer or unet")
+    if config["source"]["representation"] not in {"probability", "logits"}:
+        raise ValueError("source.representation must be probability or logits")
     supervision = config["source"]["supervision"]
     if supervision["type"] not in {None, "none", "align", "cross_entropy"}:
         raise ValueError(
@@ -463,6 +536,25 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
         )
     if supervision["weight"] is not None and supervision["weight"] < 0:
         raise ValueError("source.supervision.weight must be non-negative")
+    if config["source"]["type"] == "task_finetuned_segformer":
+        if config["source"]["prior_type"] != "image_gaussian":
+            raise ValueError(
+                "task_finetuned_segformer requires source.prior_type=image_gaussian"
+            )
+        if config["source"]["backbone"] != "segformer":
+            raise ValueError(
+                "task_finetuned_segformer requires source.backbone=segformer"
+            )
+        if not config["source"]["model_id"]:
+            raise ValueError("task_finetuned_segformer requires source.model_id")
+        if config["source"]["learned_logvar"]:
+            raise ValueError(
+                "task_finetuned_segformer does not support learned_logvar=true"
+            )
+        if config["source"]["freeze"] and supervision["type"] not in {None, "none"}:
+            raise ValueError(
+                "Frozen task_finetuned_segformer requires source.supervision.type=none"
+            )
     if config["flow"]["time_eps"] <= 0:
         raise ValueError("flow.time_eps must be positive")
     ts = config["time_sampling"]
@@ -572,6 +664,20 @@ def apply_overrides(config: dict[str, Any], overrides: Iterable[str]) -> dict[st
             "type": "align" if result["source"]["use_loss_align"] else "none",
             "weight": result["source"]["align_weight"],
         }
+    if {
+        "model.image_encoder.type", "model.image_encoder.variant"
+    } & override_keys:
+        aliases = {"t": "tiny", "s": "small", "b": "base", "l": "large"}
+        result["model"]["image_encoder"]["variant"] = aliases.get(
+            result["model"]["image_encoder"]["variant"],
+            result["model"]["image_encoder"]["variant"],
+        )
+        if (
+            "model.image_encoder.type" in override_keys
+            and result["model"]["image_encoder"]["type"] in {"swin", "convnext"}
+            and "model.image_encoder.pretrained" not in override_keys
+        ):
+            result["model"]["image_encoder"]["pretrained"] = True
     return validate_config(result)
 
 
@@ -601,6 +707,18 @@ def load_config(path: str | Path, overrides: Iterable[str] = ()) -> dict[str, An
     _validate_required(raw)
     _check_unknown(raw, DEFAULT_CONFIG)
     config = _merge(DEFAULT_CONFIG, _expand(raw))
+    raw_image_encoder = select(raw, "model.image_encoder", None)
+    if raw_image_encoder is not None:
+        aliases = {"t": "tiny", "s": "small", "b": "base", "l": "large"}
+        config["model"]["image_encoder"]["variant"] = aliases.get(
+            config["model"]["image_encoder"]["variant"],
+            config["model"]["image_encoder"]["variant"],
+        )
+        if (
+            config["model"]["image_encoder"]["type"] in {"swin", "convnext"}
+            and "pretrained" not in raw_image_encoder
+        ):
+            config["model"]["image_encoder"]["pretrained"] = True
     # Translate legacy source flags only when the new block is absent.
     if select(raw, "source.supervision", None) is None:
         config["source"]["supervision"] = {

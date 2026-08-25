@@ -149,6 +149,118 @@ class SegFormerSourceGenerator(nn.Module):
         return mu + torch.exp(0.5 * logvar) * torch.randn_like(mu), mu, logvar
 
 
+class TaskFinetunedSegFormerSourceGenerator(nn.Module):
+    """Frozen/trainable semantic SegFormer decode head used as Gaussian mean."""
+
+    def __init__(
+        self,
+        num_classes: int,
+        void_class_index: int,
+        model_id: str,
+        representation: str,
+        freeze: bool,
+        fixed_std: float,
+        void_channel_value: float = 0.0,
+        input_already_normalized: bool = False,
+        state_downsample_factor: int = 4,
+        segmentation_model: nn.Module | None = None,
+        load_pretrained: bool = True,
+    ) -> None:
+        super().__init__()
+        if representation not in {"probability", "logits"}:
+            raise ValueError("representation must be probability or logits")
+        if not 0 <= void_class_index < num_classes:
+            raise ValueError("void_class_index must identify a DFM state channel")
+        if segmentation_model is None:
+            try:
+                from transformers import (
+                    SegformerConfig,
+                    SegformerForSemanticSegmentation,
+                )
+            except ImportError as exc:
+                raise RuntimeError(
+                    "task_finetuned_segformer requires transformers"
+                ) from exc
+            if load_pretrained:
+                segmentation_model = (
+                    SegformerForSemanticSegmentation.from_pretrained(model_id)
+                )
+            else:
+                segmentation_model = SegformerForSemanticSegmentation(
+                    SegformerConfig.from_pretrained(model_id)
+                )
+        semantic_classes = int(segmentation_model.config.num_labels)
+        if semantic_classes != num_classes - 1:
+            raise ValueError(
+                f"Task SegFormer has {semantic_classes} semantic channels, but the "
+                f"{num_classes}-state protocol requires {num_classes - 1}"
+            )
+        self.segmentation_model = segmentation_model
+        self.num_classes = num_classes
+        self.void_class_index = void_class_index
+        self.representation = representation
+        self.freeze_source = freeze
+        self.fixed_std = float(fixed_std)
+        self.void_channel_value = float(void_channel_value)
+        self.input_already_normalized = input_already_normalized
+        self.state_downsample_factor = state_downsample_factor
+        self.register_buffer(
+            "semantic_indices",
+            torch.tensor([
+                index for index in range(num_classes)
+                if index != void_class_index
+            ], dtype=torch.long),
+            persistent=False,
+        )
+        self.register_buffer(
+            "mean", torch.tensor([0.485, 0.456, 0.406])[None, :, None, None],
+            persistent=False,
+        )
+        self.register_buffer(
+            "std", torch.tensor([0.229, 0.224, 0.225])[None, :, None, None],
+            persistent=False,
+        )
+        if freeze:
+            self.requires_grad_(False)
+            self.train(False)
+
+    def train(self, mode: bool = True):
+        if self.freeze_source:
+            return super().train(False)
+        return super().train(mode)
+
+    def forward(self, image: torch.Tensor):
+        normalized = image if self.input_already_normalized else (
+            image - self.mean.to(image)
+        ) / self.std.to(image)
+        logits = self.segmentation_model(
+            pixel_values=normalized, return_dict=True
+        ).logits
+        if logits.ndim != 4 or logits.shape[1] != self.num_classes - 1:
+            raise AssertionError(
+                f"Task SegFormer logits must have shape [B,{self.num_classes - 1},H,W], "
+                f"got {tuple(logits.shape)}"
+            )
+        semantic = (
+            torch.softmax(logits.float(), dim=1).to(logits.dtype)
+            if self.representation == "probability"
+            else logits
+        )
+        target_size = state_spatial_size(image, self.state_downsample_factor)
+        semantic = F.interpolate(
+            semantic, size=target_size, mode="bilinear", align_corners=False
+        )
+        mu = semantic.new_full(
+            (semantic.shape[0], self.num_classes, *target_size),
+            self.void_channel_value,
+        ).index_copy(1, self.semantic_indices, semantic)
+        logvar = torch.full_like(mu, math.log(self.fixed_std**2))
+        x0 = mu + torch.exp(0.5 * logvar) * torch.randn_like(mu)
+        assert x0.shape == mu.shape == logvar.shape
+        assert mu.shape[1:] == (self.num_classes, *target_size)
+        return x0, mu, logvar
+
+
 def build_source_model(config: dict):
     source = config["source"]
     if source["prior_type"] != "image_gaussian":
@@ -156,7 +268,20 @@ def build_source_model(config: dict):
     fixed_std = source["fixed_std"]
     if not source["learned_logvar"] and fixed_std is None:
         fixed_std = 1.0
-    if source["backbone"] == "unet":
+    if source.get("type", "trainable_segformer") == "task_finetuned_segformer":
+        model = TaskFinetunedSegFormerSourceGenerator(
+            config["dataset"]["num_classes"],
+            config["dataset"]["void_class_index"],
+            source["model_id"],
+            source["representation"],
+            source["freeze"],
+            fixed_std,
+            source["void_channel_value"],
+            source["input_already_normalized"],
+            config["model"].get("state_downsample_factor", 4),
+            load_pretrained=source.get("_load_pretrained", True),
+        )
+    elif source["backbone"] == "unet":
         model = UNetSourceGenerator(
             config["dataset"]["num_classes"], source["decoder_channels"],
             source["learned_logvar"], fixed_std,

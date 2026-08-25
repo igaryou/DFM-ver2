@@ -232,8 +232,14 @@ def sample_prior(
         f"source state {x0.shape[-2:]} != target state {(height, width)}"
     )
     fixed_std = getattr(source_model, "fixed_std", None)
+    frozen_task_without_supervision = (
+        source.get("type") == "task_finetuned_segformer"
+        and source.get("freeze", False)
+        and source.get("supervision", {}).get("type") in {None, "none"}
+    )
+    source_zero = image.new_zeros(()) if frozen_task_without_supervision else zero
     loss_var = (
-        zero if fixed_std is not None
+        source_zero if fixed_std is not None
         else 0.5 * torch.mean(torch.exp(logvar) - logvar - 1.0)
     )
     supervision = source.get("supervision")
@@ -256,8 +262,8 @@ def sample_prior(
             f"source supervision {supervision_type!r} requires integer target_full"
         )
 
-    loss_align = zero
-    loss_ce = zero
+    loss_align = source_zero
+    loss_ce = source_zero
     if supervision_type == "align" and target_full is not None:
         mu_full = resize_continuous(mu, target_full.shape[-2:])
         alignment_map = source_alignment_map_from_indices(

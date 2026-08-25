@@ -74,7 +74,10 @@ def evaluate(config: dict, checkpoint_path: str | Path) -> dict:
             worker_init_fn=seed_data_loader_worker,
             collate_fn=(
                 ade20k_eval_collate
-                if config["dataset"]["name"] == "ade20k" else None
+                if (
+                    config["dataset"]["name"] == "ade20k"
+                    or config["evaluation"]["original_resolution"]
+                ) else None
             ),
         )
         eval_range = config["evaluation"]["eval_class_indices"]
@@ -101,7 +104,10 @@ def evaluate(config: dict, checkpoint_path: str | Path) -> dict:
             maximum_batches = config["evaluation"]["max_batches"]
             if maximum_batches is not None and batch_index >= maximum_batches:
                 break
-            if config["dataset"]["name"] == "ade20k":
+            if (
+                config["dataset"]["name"] == "ade20k"
+                or config["evaluation"]["original_resolution"]
+            ):
                 items = []
                 for sample in batch:
                     image = sample["image"].unsqueeze(0).to(device, non_blocking=True)
