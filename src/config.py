@@ -509,6 +509,24 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("RRDB does not provide pretrained weights")
     if image_encoder["type"] == "rrdb" and image_encoder["freeze"]:
         raise ValueError("RRDB has no separate pretrained backbone to freeze")
+    if image_encoder["type"] in {"swin", "convnext"}:
+        dataset_input_normalized = bool(
+            config["augmentation"]["normalize"]["enabled"]
+            or config["augmentation"]["imagenet_normalize"]
+        )
+        encoder_expects_normalized = image_encoder["input_already_normalized"]
+        if dataset_input_normalized and not encoder_expects_normalized:
+            raise ValueError(
+                "Normalized dataset input requires "
+                "model.image_encoder.input_already_normalized=true "
+                "for swin/convnext"
+            )
+        if not dataset_input_normalized and encoder_expects_normalized:
+            raise ValueError(
+                "Unnormalized dataset input requires "
+                "model.image_encoder.input_already_normalized=false "
+                "for swin/convnext"
+            )
     state_factor = config["model"]["state_downsample_factor"]
     if (
         isinstance(state_factor, bool)
@@ -678,6 +696,20 @@ def apply_overrides(config: dict[str, Any], overrides: Iterable[str]) -> dict[st
             and "model.image_encoder.pretrained" not in override_keys
         ):
             result["model"]["image_encoder"]["pretrained"] = True
+    normalization_context_changed = bool({
+        "model.image_encoder.type",
+        "augmentation.normalize.enabled",
+        "augmentation.imagenet_normalize",
+    } & override_keys)
+    if (
+        normalization_context_changed
+        and "model.image_encoder.input_already_normalized" not in override_keys
+        and result["model"]["image_encoder"]["type"] in {"swin", "convnext"}
+    ):
+        result["model"]["image_encoder"]["input_already_normalized"] = bool(
+            result["augmentation"]["normalize"]["enabled"]
+            or result["augmentation"]["imagenet_normalize"]
+        )
     return validate_config(result)
 
 

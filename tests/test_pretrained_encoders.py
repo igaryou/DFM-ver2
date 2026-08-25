@@ -33,6 +33,7 @@ from training_objectives import compute_model_training_objectives
 
 ROOT = Path(__file__).parents[1]
 ADE_CONFIG = ROOT / "configs" / "joint_psd_ade20k.yaml"
+CITY_CONFIG = ROOT / "configs" / "debug_diagonal_cityscapes.yaml"
 
 
 class FakeBackbone(nn.Module):
@@ -134,6 +135,64 @@ def test_transformer_encoder_variants_validate_without_download(encoder_type, va
     ])
     assert config["model"]["image_encoder"]["type"] == encoder_type
     assert config["model"]["image_encoder"]["variant"] == variant
+    assert config["model"]["image_encoder"]["input_already_normalized"] is True
+
+
+@pytest.mark.parametrize("encoder_type", ["swin", "convnext"])
+def test_normalized_ade_input_requires_transformer_normalized_flag(encoder_type):
+    valid = load_config(ADE_CONFIG, [
+        f"model.image_encoder.type={encoder_type}",
+        "model.image_encoder.pretrained=false",
+        "model.image_encoder.input_already_normalized=true",
+    ])
+    assert valid["augmentation"]["normalize"]["enabled"] is True
+    assert valid["model"]["image_encoder"]["input_already_normalized"] is True
+
+    with pytest.raises(
+        ValueError, match="Normalized dataset input requires"
+    ):
+        load_config(ADE_CONFIG, [
+            f"model.image_encoder.type={encoder_type}",
+            "model.image_encoder.pretrained=false",
+            "model.image_encoder.input_already_normalized=false",
+        ])
+
+
+def test_transformer_cli_type_override_auto_matches_dataset_normalization():
+    config = load_config(ADE_CONFIG, [
+        "model.image_encoder.type=swin",
+        "model.image_encoder.pretrained=false",
+    ])
+    assert config["model"]["image_encoder"]["input_already_normalized"] is True
+
+
+def test_legacy_imagenet_normalize_is_treated_as_dataset_normalization():
+    config = load_config(CITY_CONFIG, [
+        "model.image_encoder.type=convnext",
+        "model.image_encoder.pretrained=false",
+        "augmentation.imagenet_normalize=true",
+    ])
+    assert config["augmentation"]["normalize"]["enabled"] is False
+    assert config["augmentation"]["imagenet_normalize"] is True
+    assert config["model"]["image_encoder"]["input_already_normalized"] is True
+
+
+def test_unnormalized_dataset_rejects_transformer_normalized_flag():
+    with pytest.raises(ValueError, match="Unnormalized dataset input requires"):
+        load_config(CITY_CONFIG, [
+            "model.image_encoder.type=swin",
+            "model.image_encoder.pretrained=false",
+            "model.image_encoder.input_already_normalized=true",
+        ])
+
+
+def test_rrdb_is_exempt_from_transformer_normalization_validation():
+    config = load_config(ADE_CONFIG, [
+        "model.image_encoder.input_already_normalized=false",
+    ])
+    assert config["model"]["image_encoder"]["type"] == "rrdb"
+    assert config["augmentation"]["normalize"]["enabled"] is True
+    assert config["model"]["image_encoder"]["input_already_normalized"] is False
 
 
 @pytest.mark.parametrize("encoder_type", ["swin", "convnext"])
@@ -171,6 +230,31 @@ def test_ddp_fpn_merge_uses_highest_resolution():
         torch.randn(2, 32, 2, 2),
     ])
     assert result.shape == (2, 5, 9, 13)
+
+
+def test_ddp_fpn_merge_uses_adaptive_group_norm_without_activation():
+    neck = DDPFPNMultiStageMerging([8, 16, 32, 64], channels=256)
+    normalized_blocks = [*neck.lateral, *neck.fpn_output, neck.merge]
+    for block in normalized_blocks:
+        assert isinstance(block, nn.Sequential)
+        assert len(block) == 2
+        assert isinstance(block[0], nn.Conv2d)
+        assert isinstance(block[1], nn.GroupNorm)
+        assert block[1].num_groups == 32
+
+    small = DDPFPNMultiStageMerging([4, 8, 16, 32], channels=6)
+    small_norms = [
+        module for module in small.modules() if isinstance(module, nn.GroupNorm)
+    ]
+    assert len(small_norms) == 9
+    assert all(norm.num_groups == 6 for norm in small_norms)
+    result = small([
+        torch.randn(1, 4, 9, 13),
+        torch.randn(1, 8, 5, 7),
+        torch.randn(1, 16, 3, 4),
+        torch.randn(1, 32, 2, 2),
+    ])
+    assert result.shape == (1, 6, 9, 13)
 
 
 @pytest.mark.parametrize(

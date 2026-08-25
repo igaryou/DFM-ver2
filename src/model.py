@@ -182,14 +182,23 @@ class DDPFPNMultiStageMerging(nn.Module):
         if len(input_channels) != 4:
             raise ValueError("DDP FPN requires exactly four backbone stages")
         self.lateral = nn.ModuleList(
-            nn.Conv2d(input_channel, channels, 1)
+            nn.Sequential(
+                nn.Conv2d(input_channel, channels, 1),
+                group_norm(channels),
+            )
             for input_channel in input_channels
         )
         self.fpn_output = nn.ModuleList(
-            nn.Conv2d(channels, channels, 3, padding=1)
+            nn.Sequential(
+                nn.Conv2d(channels, channels, 3, padding=1),
+                group_norm(channels),
+            )
             for _ in input_channels
         )
-        self.merge = nn.Conv2d(channels * len(input_channels), channels, 1)
+        self.merge = nn.Sequential(
+            nn.Conv2d(channels * len(input_channels), channels, 1),
+            group_norm(channels),
+        )
 
     def forward(self, features: Iterable[torch.Tensor]) -> torch.Tensor:
         features = tuple(features)
