@@ -125,7 +125,12 @@ def load_transformer_image_backbone(
 ) -> tuple[nn.Module, list[int]]:
     """Build an HF backbone. Kept as a function so tests can replace the loader."""
     try:
-        from transformers import ConvNextConfig, ConvNextModel, SwinConfig, SwinModel
+        from transformers import (
+            ConvNextConfig,
+            ConvNextModel,
+            SwinBackbone,
+            SwinConfig,
+        )
     except ImportError as exc:
         raise RuntimeError(
             f"model.image_encoder.type={backbone_type} requires transformers"
@@ -135,11 +140,10 @@ def load_transformer_image_backbone(
     if backbone_type == "swin":
         hidden_sizes, depths, heads = _SWIN_SPECS[variant]
         if pretrained:
-            # Transformers 5 SDPA currently mis-shapes Swin's shifted-window
-            # mask for some rectangular inputs. Eager attention handles the
-            # same official weights and arbitrary ADE/Cityscapes sizes.
-            backbone = SwinModel.from_pretrained(
-                model_id, attn_implementation="eager"
+            backbone = SwinBackbone.from_pretrained(
+                model_id,
+                out_features=["stage1", "stage2", "stage3", "stage4"],
+                attn_implementation="eager",
             )
         else:
             swin_config = SwinConfig(
@@ -149,10 +153,16 @@ def load_transformer_image_backbone(
                 embed_dim=hidden_sizes[0],
                 depths=depths,
                 num_heads=heads,
-                output_hidden_states=True,
+                out_features=["stage1", "stage2", "stage3", "stage4"],
             )
             swin_config._attn_implementation = "eager"
-            backbone = SwinModel(swin_config)
+            backbone = SwinBackbone(swin_config)
+        hidden_sizes = list(backbone.channels)
+        # SwinBackbone returns its own normalized stage4 feature and does not
+        # consume SwinModel's classification-output LayerNorm. Keep those two
+        # redundant parameters out of DDP/optimizer rather than reporting them
+        # as trainable-but-unused.
+        backbone.swin.layernorm.requires_grad_(False)
     else:
         hidden_sizes, depths = _CONVNEXT_SPECS[variant]
         if pretrained:
@@ -164,7 +174,15 @@ def load_transformer_image_backbone(
                 depths=depths,
                 output_hidden_states=True,
             ))
-    configured_sizes = list(getattr(backbone.config, "hidden_sizes", hidden_sizes))
+        # Multi-scale hidden states bypass the classification-output norm.
+        # Preserve the existing feature path while excluding only this
+        # structurally unused pair from DDP/optimizer.
+        backbone.layernorm.requires_grad_(False)
+    configured_sizes = list(
+        backbone.channels
+        if backbone_type == "swin"
+        else getattr(backbone.config, "hidden_sizes", hidden_sizes)
+    )
     if len(configured_sizes) != 4:
         raise ValueError(
             f"{backbone_type} backbone must expose four hidden sizes, got "
@@ -298,6 +316,26 @@ class TransformerImageEncoder(nn.Module):
             self.backbone.eval()
         return self
 
+    def _extract_backbone_features(
+        self, backbone_input: torch.Tensor
+    ) -> tuple[torch.Tensor, ...]:
+        if self.backbone_type == "swin":
+            outputs = self.backbone(pixel_values=backbone_input, return_dict=True)
+            features = tuple(outputs.feature_maps)
+        else:
+            outputs = self.backbone(
+                pixel_values=backbone_input,
+                output_hidden_states=True,
+                return_dict=True,
+            )
+            features = tuple(outputs.hidden_states[-4:])
+        if len(features) != 4:
+            raise ValueError(
+                f"{self.backbone_type} must return four stage features, got "
+                f"{len(features)}"
+            )
+        return features
+
     def forward(self, image: torch.Tensor) -> torch.Tensor:
         normalized = image if self.input_already_normalized else (
             image - self.mean.to(image)
@@ -314,20 +352,7 @@ class TransformerImageEncoder(nn.Module):
                 backbone_input = F.pad(
                     backbone_input, (0, pad_width, 0, pad_height)
                 )
-        outputs = self.backbone(
-            pixel_values=backbone_input, output_hidden_states=True, return_dict=True
-        )
-        if self.backbone_type == "swin" and hasattr(outputs, "reshaped_hidden_states"):
-            hidden_states = tuple(outputs.reshaped_hidden_states[:4])
-        elif self.backbone_type == "swin":
-            hidden_states = tuple(outputs.hidden_states[:4])
-        else:
-            hidden_states = tuple(outputs.hidden_states[-4:])
-        if len(hidden_states) != 4:
-            raise ValueError(
-                f"{self.backbone_type} must return four hidden states, got "
-                f"{len(hidden_states)}"
-            )
+        hidden_states = self._extract_backbone_features(backbone_input)
         features = []
         for index, (hidden, channels) in enumerate(
             zip(hidden_states, self._hidden_sizes)
@@ -339,7 +364,14 @@ class TransformerImageEncoder(nn.Module):
                 state_spatial_size(backbone_input, divisor),
             )
             original_size = state_spatial_size(image, divisor)
-            features.append(feature[..., :original_size[0], :original_size[1]])
+            feature = feature[..., :original_size[0], :original_size[1]]
+            if feature.shape[1] != channels or feature.shape[-2:] != original_size:
+                raise AssertionError(
+                    f"{self.backbone_type} stage {index + 1} must have shape "
+                    f"[B,{channels},{original_size[0]},{original_size[1]}], got "
+                    f"{tuple(feature.shape)}"
+                )
+            features.append(feature)
         merged = self.neck(features) if not isinstance(self.neck, nn.Identity) else features[0]
         output = self.projection(merged)
         target_size = state_spatial_size(image, self.state_downsample_factor)

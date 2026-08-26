@@ -1,7 +1,7 @@
 experiment:
   name: dfm_joint_psd_ade20k_151state
   seed: 42
-  output_dir: /home/igarashi_25/DFM/results/joint_psd_ade20k_ver3
+  output_dir: /home/igarashi_25/DFM/results/joint_psd_ade20k_ver4
   stage: joint_training
 runtime:
   device: auto

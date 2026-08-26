@@ -175,6 +175,72 @@ def _gloo_worker(
         cleanup_distributed(context)
 
 
+def _swin_two_iteration_worker(
+    rank: int, world_size: int, rendezvous_file: str
+) -> None:
+    os.environ.update({
+        "GLOO_SOCKET_IFNAME": "lo",
+        "RANK": str(rank),
+        "LOCAL_RANK": str(rank),
+        "WORLD_SIZE": str(world_size),
+    })
+    context = setup_distributed(
+        {
+            "runtime": {"device": "cpu"},
+            "distributed": {
+                "enabled": True,
+                "backend": "gloo",
+                "init_method": f"file://{rendezvous_file}",
+            },
+        },
+        allow_cpu_distributed=True,
+        backend="gloo",
+    )
+    try:
+        import model as model_module
+        from transformers import SwinBackbone, SwinConfig
+
+        def tiny_swin_loader(backbone_type, variant, pretrained):
+            assert (backbone_type, variant, pretrained) == ("swin", "tiny", False)
+            config = SwinConfig(
+                image_size=224,
+                patch_size=4,
+                window_size=7,
+                embed_dim=8,
+                depths=[1, 1, 1, 1],
+                num_heads=[1, 2, 4, 8],
+                out_features=["stage1", "stage2", "stage3", "stage4"],
+            )
+            config._attn_implementation = "eager"
+            backbone = SwinBackbone(config)
+            backbone.swin.layernorm.requires_grad_(False)
+            return backbone, list(backbone.channels)
+
+        model_module.load_transformer_image_backbone = tiny_swin_loader
+        encoder = model_module.TransformerImageEncoder(
+            "swin", "tiny", False, False,
+            "ddp_fpn_merge", 8, 4, 4, True,
+        )
+        ddp = nn.parallel.DistributedDataParallel(
+            encoder, find_unused_parameters=False
+        )
+        optimizer = torch.optim.SGD(ddp.parameters(), lr=1.0e-3)
+        for iteration in range(2):
+            optimizer.zero_grad(set_to_none=True)
+            image = torch.randn(1, 3, 64, 64) + rank + iteration
+            output = ddp(image)
+            assert output.shape == (1, 4, 16, 16)
+            output.float().square().mean().backward()
+            missing = [
+                name for name, parameter in encoder.named_parameters()
+                if parameter.requires_grad and parameter.grad is None
+            ]
+            assert missing == []
+            optimizer.step()
+    finally:
+        cleanup_distributed(context)
+
+
 def test_world_size_one_fallback(monkeypatch):
     monkeypatch.delenv("RANK", raising=False)
     monkeypatch.delenv("LOCAL_RANK", raising=False)
@@ -198,6 +264,16 @@ def test_gloo_two_process_reductions_gradients_no_sync_and_rank0_write(tmp_path)
         join=True,
     )
     assert (tmp_path / "rank0-only.pt").read_bytes() == b"one writer"
+
+
+def test_swin_two_rank_two_iteration_ddp_has_no_unused_parameters(tmp_path):
+    rendezvous_file = tmp_path / "swin-gloo-rendezvous"
+    mp.spawn(
+        _swin_two_iteration_worker,
+        args=(2, str(rendezvous_file)),
+        nprocs=2,
+        join=True,
+    )
 
 
 def test_distributed_eval_sampler_has_no_duplicates():

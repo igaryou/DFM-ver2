@@ -16,6 +16,23 @@ uv run torchrun \
   src/train_joint.py \
   --config configs/joint_psd_ade20k.yaml
 
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+CUDA_VISIBLE_DEVICES=1,2 \
+python -m torch.distributed.run \
+  --standalone \
+  --nproc_per_node=2 \
+  src/train_joint.py \
+  --config configs/joint_psd_ade20k_swin_t.yaml
+
+cd /home/igarashi_25/DFM
+
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+CUDA_VISIBLE_DEVICES=2,3 \
+uv run python -m torch.distributed.run \
+  --standalone \
+  --nproc_per_node=2 \
+  src/train_joint.py \
+  --config configs/joint_psd_ade20k_swin_t.yaml
 
 CUDA_VISIBLE_DEVICES=0 PYTHONPATH=src \
 uv run python scripts/diagnose_source_ade20k.py \

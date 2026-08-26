@@ -55,7 +55,9 @@ class FakeBackbone(nn.Module):
                 align_corners=False,
             )
             features.append(stage(resized))
-        return SimpleNamespace(hidden_states=tuple(features))
+        return SimpleNamespace(
+            hidden_states=tuple(features), feature_maps=tuple(features)
+        )
 
 
 class FakeSegmentationModel(nn.Module):
@@ -219,6 +221,54 @@ def test_scratch_transformer_factory_forward_and_frozen_neck(
     assert not any(parameter.requires_grad for parameter in encoder.backbone.parameters())
     assert all(parameter.requires_grad for parameter in encoder.neck.parameters())
     assert all(parameter.requires_grad for parameter in encoder.projection.parameters())
+
+
+def test_real_scratch_swin_uses_four_stages_and_all_trainable_params_get_grad():
+    encoder = TransformerImageEncoder(
+        "swin", "tiny", False, False, "ddp_fpn_merge", 8, 6, 4, True
+    )
+    image = torch.randn(1, 3, 224, 224)
+    features = encoder._extract_backbone_features(image)
+    assert [feature.shape[1] for feature in features] == [96, 192, 384, 768]
+    assert [feature.shape[-2:] for feature in features] == [
+        (56, 56), (28, 28), (14, 14), (7, 7),
+    ]
+    output = encoder.projection(encoder.neck(features))
+    assert output.shape == (1, 6, 56, 56)
+    output.float().square().mean().backward()
+
+    for stage_index in range(4):
+        stage_parameters = [
+            parameter
+            for name, parameter in encoder.backbone.named_parameters()
+            if f"swin.encoder.layers.{stage_index}." in name
+            and parameter.requires_grad
+        ]
+        assert stage_parameters
+        assert all(parameter.grad is not None for parameter in stage_parameters)
+    missing = [
+        name for name, parameter in encoder.backbone.named_parameters()
+        if parameter.requires_grad and parameter.grad is None
+    ]
+    assert missing == []
+    assert not encoder.backbone.swin.layernorm.weight.requires_grad
+    assert not encoder.backbone.swin.layernorm.bias.requires_grad
+
+
+def test_real_scratch_convnext_has_no_trainable_unused_parameters():
+    encoder = TransformerImageEncoder(
+        "convnext", "tiny", False, False, "ddp_fpn_merge", 8, 6, 4, True
+    )
+    output = encoder(torch.randn(1, 3, 64, 64))
+    assert output.shape == (1, 6, 16, 16)
+    output.float().square().mean().backward()
+    missing = [
+        name for name, parameter in encoder.backbone.named_parameters()
+        if parameter.requires_grad and parameter.grad is None
+    ]
+    assert missing == []
+    assert not encoder.backbone.layernorm.weight.requires_grad
+    assert not encoder.backbone.layernorm.bias.requires_grad
 
 
 def test_ddp_fpn_merge_uses_highest_resolution():
@@ -391,21 +441,24 @@ def test_optimizer_excludes_frozen_source_and_backbone(monkeypatch):
     assert all(id(parameter) not in optimized for parameter in source.parameters())
 
 
-def test_new_encoder_checkpoint_and_parameter_report_round_trip(monkeypatch, tmp_path):
+@pytest.mark.parametrize("encoder_type", ["swin", "convnext"])
+def test_new_encoder_checkpoint_and_parameter_report_round_trip(
+    monkeypatch, tmp_path, encoder_type
+):
     monkeypatch.setattr(
         model_module,
         "load_transformer_image_backbone",
         lambda *args: (FakeBackbone(), [4, 8, 16, 32]),
     )
     config = load_config(ADE_CONFIG, [
-        "model.image_encoder.type=convnext",
+        f"model.image_encoder.type={encoder_type}",
         "model.image_encoder.pretrained=false",
         "model.image_encoder.neck.type=ddp_fpn_merge",
         "model.image_encoder.neck.channels=6",
     ])
     first = DiscreteFlowMapModel(_tiny_model_config(config))
     second = DiscreteFlowMapModel(_tiny_model_config(config))
-    checkpoint_path = tmp_path / "convnext.pt"
+    checkpoint_path = tmp_path / f"{encoder_type}.pt"
     torch.save({"model": first.state_dict()}, checkpoint_path)
     saved = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
     second.load_state_dict(saved["model"], strict=True)
@@ -413,7 +466,7 @@ def test_new_encoder_checkpoint_and_parameter_report_round_trip(monkeypatch, tmp
     assert report["total_parameters"] == report["endpoint"]["total"]
     assert report["backbone"]["total"] > 0
     assert report["neck"]["total"] > 0
-    assert model_signature(config)["model"]["image_encoder"]["type"] == "convnext"
+    assert model_signature(config)["model"]["image_encoder"]["type"] == encoder_type
 
 
 def test_legacy_model_signature_omits_new_rrdb_default_block():
