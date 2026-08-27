@@ -4,7 +4,7 @@ import torch
 
 
 class SegmentationMetrics:
-    """20-way confusion matrix; GT void is filtered, predicted void is retained."""
+    """Full-state confusion matrix with GT void filtered from evaluation."""
 
     def __init__(
         self,
@@ -13,6 +13,7 @@ class SegmentationMetrics:
         device: torch.device | str = "cpu",
         evaluated_class_indices: list[int] | range | None = None,
         nanmean: bool = False,
+        prediction_void_retained: bool = True,
     ) -> None:
         self.num_classes = num_classes
         self.void_class_index = void_class_index
@@ -22,6 +23,7 @@ class SegmentationMetrics:
             else [index for index in range(num_classes) if index != void_class_index]
         )
         self.nanmean = nanmean
+        self.prediction_void_retained = prediction_void_retained
         self.confusion_matrix = torch.zeros(
             num_classes, num_classes, dtype=torch.int64, device=device
         )
@@ -68,5 +70,5 @@ class SegmentationMetrics:
             "confusion_matrix": self.confusion_matrix.cpu().tolist(),
             "evaluated_class_indices": self.evaluated_class_indices,
             "void_gt_excluded": self.void_class_index,
-            "prediction_void_retained": True,
+            "prediction_void_retained": self.prediction_void_retained,
         }

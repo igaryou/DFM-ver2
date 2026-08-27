@@ -278,6 +278,9 @@ def _new_metrics(config: dict, device: torch.device) -> SegmentationMetrics:
         device=device,
         evaluated_class_indices=range(eval_range[0], eval_range[1] + 1),
         nanmean=config["evaluation"]["nanmean"],
+        prediction_void_retained=not config["evaluation"][
+            "exclude_void_from_prediction"
+        ],
     )
 
 
@@ -766,6 +769,10 @@ def run_source_diagnostics(
                     sample["original_shape"],
                     padded_shape=sample["padded_shape"],
                     align_corners=config["evaluation"]["align_corners"],
+                    void_class_index=config["dataset"]["void_class_index"],
+                    exclude_void=config["evaluation"][
+                        "exclude_void_from_prediction"
+                    ],
                 )
                 condition_metrics[(sigma, steps)].update(prediction, target)
                 if visualized < num_visualize:
@@ -789,6 +796,10 @@ def run_source_diagnostics(
                 sample["original_shape"],
                 padded_shape=sample["padded_shape"],
                 align_corners=config["evaluation"]["align_corners"],
+                void_class_index=config["dataset"]["void_class_index"],
+                exclude_void=config["evaluation"][
+                    "exclude_void_from_prediction"
+                ],
             )
             mu_zero_metrics.update(mu_zero_prediction, target)
 

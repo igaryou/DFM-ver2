@@ -189,6 +189,7 @@ evaluation:
   original_resolution: true
   interpolation: bilinear
   align_corners: false
+  exclude_void_from_prediction: true
   interval: {unit: optimizer_step, value: 16000}
 wandb:
   enabled: true

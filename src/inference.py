@@ -7,6 +7,35 @@ from discrete_flow_maps import flow_map, make_time_grid, sample_prior
 from state_space import resize_continuous, state_spatial_size
 
 
+def state_to_prediction(
+    continuous: torch.Tensor,
+    *,
+    void_class_index: int | None = None,
+    exclude_void: bool = False,
+) -> torch.Tensor:
+    """Convert continuous class scores to labels, optionally excluding void."""
+    if continuous.ndim != 4:
+        raise ValueError(
+            "continuous state must have shape [batch, classes, height, width]"
+        )
+    if not exclude_void:
+        return continuous.argmax(dim=1)
+    classes = continuous.shape[1]
+    if (
+        isinstance(void_class_index, bool)
+        or not isinstance(void_class_index, int)
+        or not 0 <= void_class_index < classes
+    ):
+        raise ValueError(
+            "void_class_index must be a valid class index when exclude_void=true"
+        )
+    if classes < 2:
+        raise ValueError("exclude_void=true requires at least one non-void class")
+    scores = continuous.clone()
+    scores[:, void_class_index] = -torch.inf
+    return scores.argmax(dim=1)
+
+
 @torch.no_grad()
 def run_flow_from_state(
     model,
@@ -60,7 +89,12 @@ def sample_segmentation_from_x0(
     if return_terminal_state:
         return x
     full_resolution = resize_continuous(x, image.shape[-2:])
-    prediction = full_resolution.argmax(dim=1)
+    evaluation = config.get("evaluation", {})
+    prediction = state_to_prediction(
+        full_resolution,
+        void_class_index=config.get("dataset", {}).get("void_class_index"),
+        exclude_void=evaluation.get("exclude_void_from_prediction", False),
+    )
     if return_trajectory:
         return prediction, trajectory
     return prediction
@@ -124,6 +158,8 @@ def terminal_state_to_original_prediction(
     *,
     padded_shape: tuple[int, int] | list[int] | None = None,
     align_corners: bool = False,
+    void_class_index: int | None = None,
+    exclude_void: bool = False,
 ) -> torch.Tensor:
     """Remove padding, bilinear-resize all channels, then take argmax."""
     continuous = state_to_original_continuous(
@@ -133,4 +169,8 @@ def terminal_state_to_original_prediction(
         padded_shape=padded_shape,
         align_corners=align_corners,
     )
-    return continuous.argmax(dim=1)
+    return state_to_prediction(
+        continuous,
+        void_class_index=void_class_index,
+        exclude_void=exclude_void,
+    )

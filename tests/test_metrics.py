@@ -15,3 +15,7 @@ def test_gt_void_is_excluded_but_predicted_void_is_an_error():
     assert result["pixel_acc"] == 0.5
     assert result["prediction_void_retained"] is True
 
+
+def test_metrics_report_excluded_prediction_void_policy():
+    metrics = SegmentationMetrics(prediction_void_retained=False)
+    assert metrics.compute()["prediction_void_retained"] is False

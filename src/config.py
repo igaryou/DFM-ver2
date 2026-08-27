@@ -260,6 +260,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "eval_class_indices": None,
         "ignore_index": None,
         "nanmean": False,
+        "exclude_void_from_prediction": True,
         "interval": {"unit": "epoch", "value": None},
         "test_time_augmentation": {"enabled": False, "flip": False},
     },
@@ -354,6 +355,19 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("dataset.name must be cityscapes or ade20k")
     if dataset["num_classes"] != config["model"]["num_classes"]:
         raise ValueError("dataset.num_classes and model.num_classes must match")
+    exclude_void = config["evaluation"]["exclude_void_from_prediction"]
+    if not isinstance(exclude_void, bool):
+        raise ValueError("evaluation.exclude_void_from_prediction must be a boolean")
+    void_class_index = dataset["void_class_index"]
+    if exclude_void and (
+        isinstance(void_class_index, bool)
+        or not isinstance(void_class_index, int)
+        or not 0 <= void_class_index < dataset["num_classes"]
+    ):
+        raise ValueError(
+            "dataset.void_class_index must be a valid class index when "
+            "evaluation.exclude_void_from_prediction=true"
+        )
     if dataset["name"] == "cityscapes":
         if dataset["num_classes"] != 20:
             raise ValueError("DFM Cityscapes training requires exactly 20 classes")

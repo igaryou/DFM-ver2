@@ -197,6 +197,7 @@ evaluation:
   eval_class_indices: [1, 150]
   ignore_index: 0
   nanmean: true
+  exclude_void_from_prediction: true
   interval: {unit: optimizer_step, value: 16000}
   test_time_augmentation: {enabled: false, flip: false}
 wandb:

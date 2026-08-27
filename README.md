@@ -62,7 +62,9 @@ configもload時に新形式へ変換されます。
 `one_hot_state`はFlow path専用、`valid_mask_full`はprimary/source supervision、
 `valid_mask_state`はconsistency専用です。ADE20Kでは全maskが`target != 0`、
 primary/source CEは`ignore_index=0`です。151 stateおよび評価class 1..150は
-変更していません。Cityscapesは20 state、void index 19、評価19 classを維持します。
+変更していません。最終出力だけはvoidをargmax候補から除外するため、これは
+**151-state Flow Map with semantic-only final prediction**です。Cityscapesも同様に、
+20 state、void index 19、評価19 classを維持しつつ最終出力はclass 0..18だけです。
 
 training Dataset/DataLoaderの返り値は両datasetとも`(image, target_full)`だけです。
 CPUでもGPUでも`[B,C,H,W]`のfull-resolution target one-hotは作りません。
@@ -72,6 +74,9 @@ state解像度へ縮小し、その`target_state`だけをone-hot化します。
 
 推論はstateのC-channel continuous terminal outputをpadded入力解像度へbilinear
 resizeし、padding除去、original GT解像度へのbilinear resize、最後にargmaxの順です。
+`evaluation.exclude_void_from_prediction: true`（標準）では、この最後のargmaxだけから
+void channelを除外します。Flow Map内部、terminal state、trajectoryにはvoid channelを
+そのまま保持します。
 ADE20Kのaspect ratio保持、幅2048以下・高さ512以下、size divisor、original-resolution
 評価、nanmeanの既存仕様を維持します。
 

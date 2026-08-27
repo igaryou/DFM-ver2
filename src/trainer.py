@@ -637,6 +637,9 @@ def validate(
         device=context.device,
         evaluated_class_indices=evaluated,
         nanmean=config["evaluation"]["nanmean"],
+        prediction_void_retained=not config["evaluation"][
+            "exclude_void_from_prediction"
+        ],
     )
     visualized = 0
     maximum_batches = config["evaluation"]["max_batches"]
@@ -665,6 +668,10 @@ def validate(
                     sample["original_shape"],
                     padded_shape=sample["padded_shape"],
                     align_corners=config["evaluation"]["align_corners"],
+                    void_class_index=config["dataset"]["void_class_index"],
+                    exclude_void=config["evaluation"][
+                        "exclude_void_from_prediction"
+                    ],
                 )
                 metrics.update(prediction, target)
                 visualization_items.append((image, target, prediction))

@@ -90,6 +90,9 @@ def evaluate(config: dict, checkpoint_path: str | Path) -> dict:
                 if eval_range is not None else None
             ),
             nanmean=config["evaluation"]["nanmean"],
+            prediction_void_retained=not config["evaluation"][
+                "exclude_void_from_prediction"
+            ],
         )
         checkpoint_stem = Path(checkpoint_path).stem
         output_dir = (
@@ -121,6 +124,10 @@ def evaluate(config: dict, checkpoint_path: str | Path) -> dict:
                         terminal, sample["model_shape"], sample["original_shape"],
                         padded_shape=sample["padded_shape"],
                         align_corners=config["evaluation"]["align_corners"],
+                        void_class_index=config["dataset"]["void_class_index"],
+                        exclude_void=config["evaluation"][
+                            "exclude_void_from_prediction"
+                        ],
                     )
                     metrics.update(prediction, target)
                     items.append((image, target, prediction))

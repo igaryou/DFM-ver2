@@ -3,6 +3,7 @@ from pathlib import Path
 import pytest
 import yaml
 
+from checkpoint import model_signature
 from config import load_config, save_resolved_config
 from trainer import log_esd_experiment_metadata
 
@@ -17,6 +18,7 @@ PSD_FROM_JOINT_CONFIG = (
 JOINT_PSD_CITYSCAPES_CONFIG = (
     Path(__file__).parents[1] / "configs" / "joint_psd_cityscapes.yaml"
 )
+DIAGONAL_ADE20K_CONFIG = Path(__file__).parents[1] / "configs" / "diagonal_ade20k.yaml"
 EXPECTED_ESD_METADATA = {
     "formulation": "stabilized_logit_space",
     "source": "discrete_flow_maps",
@@ -91,6 +93,34 @@ def test_yaml_load_and_cli_override():
     assert config["evaluation"]["interval"] == {"unit": "epoch", "value": None}
     assert config["training"]["checkpoint_interval_steps"] is None
     assert config["loss"]["consistency"]["warmup_steps"] == 0
+
+
+@pytest.mark.parametrize("path", [JOINT_PSD_CITYSCAPES_CONFIG, DIAGONAL_ADE20K_CONFIG])
+def test_void_is_excluded_from_final_predictions_by_default(path):
+    config = load_config(path)
+    assert config["evaluation"]["exclude_void_from_prediction"] is True
+
+
+def test_exclude_void_prediction_config_requires_boolean():
+    with pytest.raises(
+        ValueError, match="evaluation.exclude_void_from_prediction must be a boolean"
+    ):
+        load_config(CONFIG, ["evaluation.exclude_void_from_prediction=invalid"])
+
+
+def test_exclude_void_prediction_config_requires_valid_void_index():
+    with pytest.raises(ValueError, match="dataset.void_class_index must be a valid"):
+        load_config(CONFIG, ["dataset.void_class_index=20"])
+
+
+def test_prediction_policy_does_not_change_checkpoint_model_signature():
+    retained = load_config(
+        CONFIG, ["evaluation.exclude_void_from_prediction=false"]
+    )
+    excluded = load_config(
+        CONFIG, ["evaluation.exclude_void_from_prediction=true"]
+    )
+    assert model_signature(retained) == model_signature(excluded)
 
 
 def test_joint_psd_cityscapes_main_protocol_is_optimizer_step_based():
