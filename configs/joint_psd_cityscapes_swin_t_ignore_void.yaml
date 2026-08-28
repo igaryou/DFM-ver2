@@ -1,0 +1,127 @@
+extends: joint_psd_cityscapes.yaml
+
+experiment:
+  name: dfm_joint_psd_cityscapes_swin_t_ignore_void_160k
+  output_dir: /home/igarashi_25/DFM/results/joint_psd_cityscapes_swin_t_ignore_void_160k
+
+dataset:
+  name: cityscapes
+  num_classes: 20
+  eval_num_classes: 19
+  void_class_index: 19
+  image_size: [512, 1024]
+
+augmentation:
+  imagenet_normalize: false
+  horizontal_flip: {enabled: true, probability: 0.5}
+  random_resize:
+    enabled: true
+    base_scale: {width: 2048, height: 1024}
+    ratio_range: [0.5, 2.0]
+    keep_ratio: true
+  random_crop:
+    enabled: true
+    size: [512, 1024]
+    cat_max_ratio: 0.75
+    ignore_index: 19
+    max_attempts: 10
+  photometric_distortion:
+    enabled: true
+  normalize:
+    enabled: true
+    mean: [0.485, 0.456, 0.406]
+    std: [0.229, 0.224, 0.225]
+  pad:
+    enabled: true
+    size: [512, 1024]
+    image_value: 0.0
+    mask_value: 19
+
+model:
+  num_classes: 20
+  state_downsample_factor: 4
+  fusion_channels: 128
+  image_encoder:
+    type: swin
+    variant: tiny
+    pretrained: true
+    freeze: false
+    input_already_normalized: true
+    neck:
+      type: ddp_fpn_merge
+      channels: 256
+
+source:
+  type: trainable_segformer
+  prior_type: image_gaussian
+  prior_noise_std: 1.0
+  backbone: segformer
+  segformer_variant: b1
+  pretrained: true
+  freeze: false
+  freeze_encoder: false
+  decoder_channels: 256
+  learned_logvar: false
+  fixed_std: 1.0
+  mu_tanh_scale: 0.0
+  input_already_normalized: true
+  supervision: {type: align, weight: 2.0}
+
+training:
+  max_optimizer_steps: 160000
+  batch_size: 16
+  grad_accum_steps: 1
+  optimizer:
+    name: adamw
+    lr: 1.0e-4
+    weight_decay: 1.0e-3
+    betas: [0.9, 0.999]
+    parameter_groups:
+      model: {lr: 1.0e-4}
+      source: {lr: 5.0e-5}
+  scheduler:
+    name: poly
+    step_unit: optimizer_step
+    warmup_epochs: 0
+    warmup_steps: 1500
+    warmup_start_factor: 1.0e-6
+    power: 1.0
+    min_lr: 0.0
+    eta_min: 0.0
+  grad_clip: 1.0
+
+loss:
+  ignore_index: 19
+  mask_pixel_losses: true
+  primary: {type: diagonal_ce, weight: 1.0}
+  consistency:
+    enabled: true
+    type: psd
+    weight: 0.5
+    start: {unit: optimizer_step, value: 96000}
+    warmup_epochs: 0
+    warmup_steps: 0
+    adaptive_kl:
+      enabled: false
+    invalid_teacher:
+      strategy: mask_pixel
+      skip_batch_threshold: null
+
+evaluation:
+  split: val
+  batch_size: 2
+  num_steps: 1
+  sampler: flow_map
+  resize: {width: 2048, height: 1024, keep_ratio: true}
+  original_resolution: true
+  interpolation: bilinear
+  align_corners: false
+  eval_class_indices: [0, 18]
+  ignore_index: 19
+  exclude_void_from_prediction: true
+  interval: {unit: optimizer_step, value: 16000}
+
+wandb:
+  project: DFM
+  name: dfm-joint-psd-cityscapes-swin-t-ignore-void-160k
+  tags: [cityscapes, swin-t, joint, psd, ignore-void, 160k]

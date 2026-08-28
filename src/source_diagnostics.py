@@ -29,6 +29,7 @@ from metrics import SegmentationMetrics
 from model_factory import build_models
 from state_space import prepare_state_targets, resize_continuous
 from utils import autocast_context, resolve_device, seed_everything
+from visualization import colorize
 
 
 DEFAULT_SIGMA_VALUES = (1.0, 0.75, 0.5, 0.25, 0.1, 0.0)
@@ -129,31 +130,8 @@ def oracle_alignment_map(
     return alignment, target_state, valid
 
 
-def ade20k_palette(size: int = 256) -> np.ndarray:
-    """Deterministic label palette shared by all ADE20K diagnostic masks."""
-    palette = np.zeros((size, 3), dtype=np.uint8)
-    for label in range(size):
-        value = label
-        bit = 0
-        while value:
-            palette[label, 0] |= ((value >> 0) & 1) << (7 - bit)
-            palette[label, 1] |= ((value >> 1) & 1) << (7 - bit)
-            palette[label, 2] |= ((value >> 2) & 1) << (7 - bit)
-            bit += 1
-            value >>= 3
-    palette[0] = 0
-    return palette
-
-
-ADE20K_PALETTE = ade20k_palette()
-
-
 def colorize_ade20k(mask: torch.Tensor) -> np.ndarray:
-    indices = mask.detach().cpu().numpy().astype(np.int64)
-    indices = np.where(
-        (indices >= 0) & (indices < len(ADE20K_PALETTE)), indices, 0
-    )
-    return ADE20K_PALETTE[indices]
+    return colorize(mask, dataset_name="ade20k")
 
 
 @dataclass

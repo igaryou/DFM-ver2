@@ -703,6 +703,7 @@ def validate(
                             config["augmentation"]["imagenet_normalize"]
                             or config["augmentation"]["normalize"]["enabled"]
                         ),
+                        dataset_name=config["dataset"]["name"],
                     )
                     visualized += 1
                     remaining -= 1
