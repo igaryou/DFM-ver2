@@ -22,6 +22,18 @@ class ConsistencyResult:
     adaptive_weight: torch.Tensor | None = None
     directional_output: torch.Tensor | None = None
     dtypes: dict[str, torch.dtype] = field(default_factory=dict)
+    loss_per_sample: torch.Tensor | None = None
+    valid_sample: torch.Tensor | None = None
+
+
+@dataclass
+class AdaptiveDiagonalResult:
+    loss: torch.Tensor
+    raw_loss: torch.Tensor
+    adaptive_weight: torch.Tensor
+    mismatch_l2_sq: torch.Tensor
+    valid_mask: torch.Tensor
+    stats: dict[str, torch.Tensor]
 
 
 @dataclass
@@ -70,6 +82,65 @@ def diagonal_cross_entropy(
     )
     valid_mask = None if ignore_index is None else target != ignore_index
     return masked_mean(loss_map, valid_mask)
+
+
+def adaptive_diagonal_cross_entropy(
+    logits: torch.Tensor,
+    target: torch.Tensor,
+    *,
+    r: float = 0.5,
+    c: float = 0.01,
+    label_smoothing: float = 0.0,
+    ignore_index: int | None = None,
+) -> AdaptiveDiagonalResult:
+    """DFM Eq. (45)-(46) for a hard diagonal target.
+
+    The mismatch uses ``||softmax(logits) - one_hot(target)||^2`` in closed
+    form.  Its derived weight is detached, and the weighted CE is divided by
+    the valid-pixel count (not by the sum of weights).
+    """
+    if logits.shape[0] != target.shape[0] or logits.shape[-2:] != target.shape[-2:]:
+        raise ValueError("adaptive diagonal logits and target shapes do not match")
+    if r < 0.0 or c <= 0.0:
+        raise ValueError("adaptive diagonal requires r >= 0 and c > 0")
+    valid = torch.ones_like(target, dtype=torch.bool)
+    if ignore_index is not None:
+        valid = target != ignore_index
+    safe_target = target.masked_fill(~valid, 0)
+    ce_map = F.cross_entropy(
+        logits,
+        target,
+        label_smoothing=label_smoothing,
+        reduction="none",
+        ignore_index=-100 if ignore_index is None else ignore_index,
+    )
+    probability = torch.softmax(logits.float(), dim=1)
+    target_probability = probability.gather(1, safe_target[:, None]).squeeze(1)
+    mismatch = probability.square().sum(dim=1) - 2.0 * target_probability + 1.0
+    mismatch = mismatch.clamp_min(0.0)
+    adaptive_weight = (mismatch + c).pow(-r).detach()
+    valid_float = valid.to(ce_map.dtype)
+    count = valid_float.sum()
+    raw_loss = (ce_map * valid_float).sum() / count.clamp_min(1.0)
+    loss = (ce_map * adaptive_weight.to(ce_map.dtype) * valid_float).sum()
+    loss = loss / count.clamp_min(1.0)
+    valid_weight = adaptive_weight[valid]
+    valid_mismatch = mismatch[valid]
+    zero = loss.detach() * 0.0
+    stats = {
+        "loss_diagonal_raw": raw_loss.detach(),
+        "loss_diagonal_adaptive": loss.detach(),
+        "diagonal_adaptive_weight_mean": valid_weight.mean() if valid_weight.numel() else zero,
+        "diagonal_adaptive_weight_std": valid_weight.std(unbiased=False) if valid_weight.numel() else zero,
+        "diagonal_adaptive_weight_min": valid_weight.min() if valid_weight.numel() else zero,
+        "diagonal_adaptive_weight_max": valid_weight.max() if valid_weight.numel() else zero,
+        "diagonal_mismatch_l2_sq_mean": valid_mismatch.mean() if valid_mismatch.numel() else zero,
+    }
+    return AdaptiveDiagonalResult(
+        loss=loss.float(), raw_loss=raw_loss.float(),
+        adaptive_weight=adaptive_weight, mismatch_l2_sq=mismatch,
+        valid_mask=valid, stats=_detached(stats),
+    )
 
 
 def esd_schedule_weight(
@@ -206,6 +277,16 @@ def _psd_loss(
     student_probability = student_log_probability.exp()
     loss_map = -(teacher * student_log_probability).sum(dim=1)
     loss = masked_mean(loss_map, valid_mask).float()
+    if valid_mask is None:
+        valid_pixel = torch.ones_like(loss_map, dtype=torch.bool)
+    else:
+        valid_pixel = valid_mask.to(device=loss_map.device, dtype=torch.bool)
+    valid_count = valid_pixel.flatten(1).sum(dim=1)
+    loss_per_sample = (
+        (loss_map * valid_pixel.to(loss_map.dtype)).flatten(1).sum(dim=1)
+        / valid_count.clamp_min(1).to(loss_map.dtype)
+    ).float()
+    valid_sample = valid_count > 0
     _finite_loss("PSD", loss)
     return ConsistencyResult(
         loss=loss,
@@ -221,6 +302,9 @@ def _psd_loss(
         }),
         teacher_prob=teacher,
         student_prob=student_probability,
+        valid_pixel=valid_pixel,
+        loss_per_sample=loss_per_sample,
+        valid_sample=valid_sample,
         dtypes={
             "student_logits_before_cast": student_logits.dtype,
             "student_logits_after_cast": student_logits.dtype,

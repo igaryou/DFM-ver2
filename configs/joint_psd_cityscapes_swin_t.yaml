@@ -1,8 +1,8 @@
 extends: joint_psd_cityscapes.yaml
 
 experiment:
-  name: dfm_joint_psd_cityscapes_swin_t_ignore_void_160k
-  output_dir: /home/igarashi_25/DFM/results/joint_psd_cityscapes_swin_t_ignore_void_160k
+  name: dfm_joint_psd_cityscapes_swin_t_160k
+  output_dir: /home/igarashi_25/DFM/results/joint_psd_cityscapes_swin_t_160k_ver2
 
 dataset:
   name: cityscapes
@@ -65,7 +65,7 @@ source:
   fixed_std: 1.0
   mu_tanh_scale: 0.0
   input_already_normalized: true
-  supervision: {type: align, weight: 2.0}
+  supervision: {type: align, weight: 0.20}
 
 training:
   max_optimizer_steps: 160000
@@ -123,5 +123,5 @@ evaluation:
 
 wandb:
   project: DFM
-  name: dfm-joint-psd-cityscapes-swin-t-ignore-void-160k
+  name: dfm-joint-psd-cityscapes-swin-t-160k
   tags: [cityscapes, swin-t, joint, psd, ignore-void, 160k]

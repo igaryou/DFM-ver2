@@ -6,6 +6,11 @@ import torch
 import torch.nn as nn
 
 import losses
+from dfm_stabilization import (
+    PSDTimeWeightNetwork,
+    psd_multiplier_bucket_stats,
+    uncertainty_weighted_psd_loss,
+)
 from discrete_flow_maps import (
     linear_path,
     sample_consistency_times,
@@ -138,14 +143,31 @@ def compute_model_training_objectives(
     diagonal_logits_full = resize_continuous(
         diagonal_logits, targets.target_full.shape[-2:]
     )
-    diagonal_loss = losses.diagonal_cross_entropy(
-        diagonal_logits_full,
-        targets.target_full,
-        training["label_smoothing"],
-        ignore_index=(
-            ignore_index if targets.valid_mask_full is not None else None
-        ),
-    ).float()
+    diagonal_config = config["loss"]["primary"].get(
+        "adaptive_weighting", {"enabled": False, "r": 0.5, "c": 0.01}
+    )
+    diagonal_ignore = ignore_index if targets.valid_mask_full is not None else None
+    if diagonal_config["enabled"]:
+        diagonal_result = losses.adaptive_diagonal_cross_entropy(
+            diagonal_logits_full,
+            targets.target_full,
+            r=diagonal_config["r"],
+            c=diagonal_config["c"],
+            label_smoothing=training["label_smoothing"],
+            ignore_index=diagonal_ignore,
+        )
+        diagonal_loss = diagonal_result.loss
+        diagonal_raw_loss = diagonal_result.raw_loss
+        diagonal_stats = diagonal_result.stats
+    else:
+        diagonal_loss = losses.diagonal_cross_entropy(
+            diagonal_logits_full,
+            targets.target_full,
+            training["label_smoothing"],
+            ignore_index=diagonal_ignore,
+        ).float()
+        diagonal_raw_loss = diagonal_loss
+        diagonal_stats = {}
 
     if operation != "stage1_objectives" and effective_weight > 0.0 :
         consistency_image_feat = image_feat
@@ -173,17 +195,47 @@ def compute_model_training_objectives(
         consistency_result = None
         consistency_loss = zero
 
-    total = (
+    learnable_config = consistency_config.get("learnable_weight", {"enabled": False})
+    learnable_stats = {}
+    if (
+        consistency_result is not None
+        and learnable_config["enabled"]
+        and consistency_config["type"] == "psd"
+    ):
+        if consistency_result.loss_per_sample is None or consistency_result.valid_sample is None:
+            raise RuntimeError("PSD learnable weighting requires sample-wise PSD losses")
+        weight_logit = adapter.psd_weight_model(consistency_s)
+        consistency_loss, learnable_stats = uncertainty_weighted_psd_loss(
+            consistency_result.loss_per_sample,
+            consistency_result.valid_sample,
+            weight_logit,
+        )
+        learnable_stats.update(psd_multiplier_bucket_stats(
+            consistency_s.detach(), torch.exp(-weight_logit.detach().float()),
+            consistency_result.valid_sample,
+        ))
+    primary_objective = (
         config["loss"]["primary"]["weight"] * diagonal_loss
-        + effective_weight * consistency_loss
-        + source_stats["weighted_var"]
+    ).float()
+    psd_objective = (effective_weight * consistency_loss).float()
+    if adapter.psd_weight_model is not None and consistency_result is None:
+        # Keep every DDP-managed weight-network parameter in the graph before
+        # the PSD schedule opens, while producing exactly zero gradients.
+        psd_objective = psd_objective + sum(
+            (parameter.float().sum() * 0.0)
+            for parameter in adapter.psd_weight_model.parameters()
+        )
+    source_objective = (
+        source_stats["weighted_var"]
         + source_stats.get(
             "weighted_source_supervision", source_stats["weighted_align"]
         )
     ).float()
+    total = (primary_objective + psd_objective + source_objective).float()
     stats = {
         "loss_total": total.detach(),
         "loss_diagonal": diagonal_loss.detach(),
+        "loss_diagonal_raw": diagonal_raw_loss.detach(),
         "loss_consistency": consistency_loss.detach(),
         "loss_source_var": source_stats["loss_source_var"].detach(),
         "loss_source_align": source_stats["loss_source_align"].detach(),
@@ -220,6 +272,7 @@ def compute_model_training_objectives(
         "state_height": total.new_tensor(state_size[0]),
         "state_width": total.new_tensor(state_size[1]),
     }
+    stats.update(diagonal_stats)
     for key, value in source_stats.items():
         if key not in stats and torch.is_tensor(value) and value.numel() == 1:
             stats[key] = value.detach()
@@ -229,8 +282,15 @@ def compute_model_training_objectives(
         stats["consistency_t_mean"] = consistency_t.detach().float().mean()
         if u is not None:
             stats["consistency_u_mean"] = u.detach().float().mean()
+    # The raw consistency result is merged first; learned-objective metrics
+    # then deliberately define the optimizer-facing loss_consistency value.
+    stats.update(learnable_stats)
+    stats["loss_consistency"] = consistency_loss.detach()
     return {
         "loss": total,
+        "diagonal_objective": primary_objective,
+        "psd_objective": psd_objective,
+        "source_objective": source_objective,
         "stats": stats,
         "operation": operation,
         "consistency_type": (
@@ -254,6 +314,17 @@ class DDPCompatibleTrainingModel(nn.Module):
         self.endpoint_model = endpoint_model
         self.source_model = source_model
         self.config = config
+        learnable = config["loss"]["consistency"].get(
+            "learnable_weight", {"enabled": False}
+        )
+        self.psd_weight_model = (
+            PSDTimeWeightNetwork(
+                time_embedding_dim=learnable["time_embedding_dim"],
+                hidden_dim=learnable["hidden_dim"],
+                init_effective_weight=learnable["init_effective_weight"],
+            )
+            if learnable["enabled"] else None
+        )
 
     def forward(self, *, operation: str, **kwargs):
         return compute_model_training_objectives(

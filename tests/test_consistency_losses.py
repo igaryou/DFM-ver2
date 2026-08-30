@@ -100,6 +100,26 @@ def test_psd_uses_three_times_without_jvp_and_detaches_teacher(monkeypatch):
     assert model.x_projection.weight.grad is not None
 
 
+def test_psd_exposes_sample_means_and_excludes_empty_samples():
+    model = TinyFlowModel()
+    x, image, s, u, t = _inputs()
+    valid = torch.ones(2, 3, 4, dtype=torch.bool)
+    valid[0, :, 2:] = False
+    valid[1] = False
+    config = _config("psd", None)
+    result = compute_consistency_loss(
+        "psd", model=model, x_s=x, image=image, s=s, u=u, t=t,
+        precision=config["loss"]["consistency"]["precision"], config=config,
+        valid_mask=valid,
+    )
+    assert result.loss_per_sample.shape == (2,)
+    assert torch.equal(result.valid_sample, torch.tensor([True, False]))
+    assert result.loss_per_sample[1] == 0
+    log_probability = result.student_prob.clamp_min(1e-8).log()
+    loss_map = -(result.teacher_prob * log_probability).sum(1)
+    torch.testing.assert_close(result.loss_per_sample[0], loss_map[0][valid[0]].mean())
+
+
 @pytest.mark.parametrize("loss_type", ["csd", "ecld", "esd"])
 @pytest.mark.parametrize(
     ("jvp_dtype", "expected_dtype"),

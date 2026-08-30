@@ -159,6 +159,35 @@ def test_joint_samples_diagonal_and_consistency_times_independently(monkeypatch)
     assert float(result["stats"]["consistency_s_mean"]) == pytest.approx(0.1)
 
 
+def test_all_stabilizers_disabled_match_legacy_objective_and_gradients():
+    legacy_config = _config("psd")
+    new_config = deepcopy(legacy_config)
+    new_config["loss"]["primary"]["adaptive_weighting"] = {
+        "enabled": False, "r": 0.5, "c": 0.01,
+    }
+    new_config["loss"]["consistency"]["learnable_weight"] = {"enabled": False}
+    new_config["loss"]["consistency"]["gradient_surgery"] = {"enabled": False}
+    legacy_model = TinyEndpoint()
+    new_model = TinyEndpoint()
+    new_model.load_state_dict(legacy_model.state_dict())
+    image, target = _batch()
+    torch.manual_seed(123)
+    legacy = DDPCompatibleTrainingModel(legacy_model, None, legacy_config)(
+        operation="joint_objectives", image=image, target=target,
+        epoch_index=0, progress_in_epoch=0.0,
+    )
+    torch.manual_seed(123)
+    current = DDPCompatibleTrainingModel(new_model, None, new_config)(
+        operation="joint_objectives", image=image, target=target,
+        epoch_index=0, progress_in_epoch=0.0,
+    )
+    torch.testing.assert_close(current["loss"], legacy["loss"])
+    legacy["loss"].backward()
+    current["loss"].backward()
+    for old, new in zip(legacy_model.parameters(), new_model.parameters(), strict=True):
+        torch.testing.assert_close(new.grad, old.grad)
+
+
 def test_joint_config_forbids_init_from_and_stage2_requires_checkpoint():
     config = load_config(ROOT / "configs" / "joint_ecld_cityscapes.yaml")
     bad_joint = deepcopy(config)

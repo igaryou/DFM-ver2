@@ -162,7 +162,10 @@ def load_transformer_image_backbone(
         # consume SwinModel's classification-output LayerNorm. Keep those two
         # redundant parameters out of DDP/optimizer rather than reporting them
         # as trainable-but-unused.
-        backbone.swin.layernorm.requires_grad_(False)
+        swin_wrapper = getattr(backbone, "swin", None)
+        redundant_layernorm = getattr(swin_wrapper, "layernorm", None)
+        if redundant_layernorm is not None:
+            redundant_layernorm.requires_grad_(False)
     else:
         hidden_sizes, depths = _CONVNEXT_SPECS[variant]
         if pretrained:

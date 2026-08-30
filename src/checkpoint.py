@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import re
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
@@ -62,6 +63,7 @@ def checkpoint_payload(
     metrics: dict,
     distributed: dict | None = None,
     micro_step: int = 0,
+    psd_weight_model=None,
 ) -> dict:
     raw_model = model
     while isinstance(raw_model, DistributedDataParallel):
@@ -71,7 +73,7 @@ def checkpoint_payload(
     while isinstance(raw_source, DistributedDataParallel):
         raw_source = raw_source.module
     raw_source = getattr(raw_source, "_orig_mod", raw_source)
-    return {
+    payload = {
         "stage": config["experiment"]["stage"],
         "epoch": epoch,
         "global_step": global_step,
@@ -96,6 +98,9 @@ def checkpoint_payload(
             "local_batch_size": config["training"]["batch_size"],
         }),
     }
+    if psd_weight_model is not None:
+        payload["psd_weight_model"] = psd_weight_model.state_dict()
+    return payload
 
 
 def save_checkpoint(payload: dict, output_dir: str | Path, filename: str) -> Path:
@@ -197,6 +202,117 @@ def _without_module_prefix(state_dict: dict) -> dict:
     return state_dict
 
 
+def _swin_v5_key_to_v4(key: str) -> str | None:
+    prefix = "image_encoder.backbone.swin."
+    if not key.startswith(prefix):
+        return key
+    suffix = key.removeprefix(prefix)
+    if suffix in {"layernorm.weight", "layernorm.bias"}:
+        return None
+    key = "image_encoder.backbone." + suffix
+    for current, legacy in (
+        (".attention.q_proj.", ".attention.self.query."),
+        (".attention.k_proj.", ".attention.self.key."),
+        (".attention.v_proj.", ".attention.self.value."),
+        (".attention.o_proj.", ".attention.output.dense."),
+        (".attention.relative_position_bias.relative_position_bias_table", ".attention.self.relative_position_bias_table"),
+        (".mlp.fc1.", ".intermediate.dense."),
+        (".mlp.fc2.", ".output.dense."),
+    ):
+        key = key.replace(current, legacy)
+    return key
+
+
+def _segformer_v5_key_to_v4(key: str) -> str:
+    match = re.match(r"^encoder\.stages\.(\d+)\.(.+)$", key)
+    if match is None:
+        return key
+    stage, suffix = match.groups()
+    if suffix.startswith("patch_embeddings."):
+        return f"encoder.encoder.patch_embeddings.{stage}." + suffix.removeprefix("patch_embeddings.")
+    if suffix.startswith("layer_norm."):
+        return f"encoder.encoder.layer_norm.{stage}." + suffix.removeprefix("layer_norm.")
+    block = re.match(r"^blocks\.(\d+)\.(.+)$", suffix)
+    if block is None:
+        return key
+    block_index, block_suffix = block.groups()
+    for current, legacy in (
+        ("layernorm_before.", "layer_norm_1."),
+        ("attention.q_proj.", "attention.self.query."),
+        ("attention.k_proj.", "attention.self.key."),
+        ("attention.v_proj.", "attention.self.value."),
+        ("attention.o_proj.", "attention.output.dense."),
+        ("attention.sequence_reduction.sequence_reduction.", "attention.self.sr."),
+        ("attention.sequence_reduction.layer_norm.", "attention.self.layer_norm."),
+        ("layernorm_after.", "layer_norm_2."),
+        ("mlp.fc1.", "mlp.dense1."),
+        ("mlp.fc2.", "mlp.dense2."),
+    ):
+        if block_suffix.startswith(current):
+            block_suffix = legacy + block_suffix.removeprefix(current)
+            break
+    return f"encoder.encoder.block.{stage}.{block_index}.{block_suffix}"
+
+
+def _audit_compatible_state(
+    state: dict, module, *, component: str, converter
+) -> dict:
+    expected = module.state_dict()
+    converted = {}
+    for key, value in state.items():
+        converted_key = converter(key)
+        if converted_key is None:
+            continue
+        if converted_key in converted:
+            raise RuntimeError(f"{component} checkpoint conversion collision: {converted_key}")
+        converted[converted_key] = value
+    expected_buffers = dict(module.named_buffers())
+    for key, value in expected.items():
+        if (
+            key not in converted
+            and key.endswith("attention.self.relative_position_index")
+            and key in expected_buffers
+        ):
+            converted[key] = value
+    missing = sorted(set(expected) - set(converted))
+    unexpected = sorted(set(converted) - set(expected))
+    shape_mismatches = sorted(
+        (key, tuple(converted[key].shape), tuple(expected[key].shape))
+        for key in set(converted) & set(expected)
+        if converted[key].shape != expected[key].shape
+    )
+    if missing or unexpected or shape_mismatches:
+        raise RuntimeError(
+            f"{component} checkpoint compatibility audit failed before strict load: "
+            f"missing={missing}, unexpected={unexpected}, shape_mismatches={shape_mismatches}"
+        )
+    return converted
+
+
+def _model_state_for_current_transformers(state: dict, model) -> dict:
+    expected = model.state_dict()
+    if (
+        any(key.startswith("image_encoder.backbone.swin.") for key in state)
+        and any(key.startswith("image_encoder.backbone.embeddings.") for key in expected)
+    ):
+        return _audit_compatible_state(
+            state, model, component="Endpoint", converter=_swin_v5_key_to_v4
+        )
+    return state
+
+
+def _source_state_for_current_transformers(state: dict, source_model) -> dict:
+    expected = source_model.state_dict()
+    if (
+        any(key.startswith("encoder.stages.") for key in state)
+        and any(key.startswith("encoder.encoder.patch_embeddings.") for key in expected)
+    ):
+        return _audit_compatible_state(
+            state, source_model, component="Source", converter=_segformer_v5_key_to_v4
+        )
+    return state
+
+
 def _resume_stage_compatible(checkpoint: dict, config: dict) -> bool:
     saved_stage = checkpoint.get("stage")
     current_stage = config["experiment"]["stage"]
@@ -240,6 +356,7 @@ def initialize_or_resume(
     scheduler,
     scaler,
     logger=None,
+    psd_weight_model=None,
 ) -> TrainingState:
     checkpoint_config = config["checkpoint"]
     init_from = checkpoint_config["init_from"]
@@ -257,13 +374,15 @@ def initialize_or_resume(
                     "Stage 2 initialization checkpoint has no source_model state: "
                     f"{init_from}"
                 )
-        model.load_state_dict(
-            _without_module_prefix(checkpoint["model"]), strict=strict
+        model_state = _model_state_for_current_transformers(
+            _without_module_prefix(checkpoint["model"]), model
         )
+        model.load_state_dict(model_state, strict=strict)
         if source_model is not None:
-            source_model.load_state_dict(
-                _without_module_prefix(saved_source), strict=strict
+            source_state = _source_state_for_current_transformers(
+                _without_module_prefix(saved_source), source_model
             )
+            source_model.load_state_dict(source_state, strict=strict)
         lines = (
             f"Loaded Stage 2 initialization checkpoint: {init_from}",
             f"Checkpoint original stage: {checkpoint.get('stage')}",
@@ -293,19 +412,65 @@ def initialize_or_resume(
                 f"config={config['experiment']['stage']}"
             )
         _validate_resume_scheduler(checkpoint, config, resume)
-        model.load_state_dict(_without_module_prefix(checkpoint["model"]), strict=strict)
+        model_state = _model_state_for_current_transformers(
+            _without_module_prefix(checkpoint["model"]), model
+        )
+        model.load_state_dict(model_state, strict=strict)
         if source_model is not None:
             if checkpoint.get("source_model") is None:
                 raise RuntimeError("Resume checkpoint has no source_model state")
-            source_model.load_state_dict(
-                _without_module_prefix(checkpoint["source_model"]), strict=strict
+            source_state = _source_state_for_current_transformers(
+                _without_module_prefix(checkpoint["source_model"]), source_model
+            )
+            source_model.load_state_dict(source_state, strict=strict)
+        saved_psd_weight = checkpoint.get("psd_weight_model")
+        if psd_weight_model is not None:
+            if saved_psd_weight is None:
+                if logger is not None:
+                    logger.info(
+                        "Initializing new PSDTimeWeightNetwork because checkpoint "
+                        "predates learnable PSD weighting."
+                    )
+            else:
+                psd_weight_model.load_state_dict(
+                    _without_module_prefix(saved_psd_weight), strict=True
+                )
+        elif saved_psd_weight is not None:
+            raise RuntimeError(
+                "Resume checkpoint contains a PSD weight network, but the current "
+                "configuration disables learnable PSD weighting"
             )
         # A resume is deliberately a complete continuation. The load_* fields are
         # relevant to legacy/import workflows, but may not weaken resume semantics.
         if checkpoint.get("optimizer") is None or checkpoint.get("scheduler") is None:
             raise RuntimeError("Resume checkpoint lacks optimizer or scheduler state")
-        optimizer.load_state_dict(checkpoint["optimizer"])
-        scheduler.load_state_dict(checkpoint["scheduler"])
+        saved_optimizer = checkpoint["optimizer"]
+        current_optimizer = optimizer.state_dict()
+        if len(saved_optimizer["param_groups"]) == len(current_optimizer["param_groups"]):
+            optimizer.load_state_dict(saved_optimizer)
+            scheduler.load_state_dict(checkpoint["scheduler"])
+        elif psd_weight_model is not None and saved_psd_weight is None:
+            _load_optimizer_with_new_psd_group(
+                optimizer,
+                saved_optimizer,
+                model=model,
+                source_model=source_model,
+                saved_model_state=_without_module_prefix(checkpoint["model"]),
+                saved_source_state=_without_module_prefix(checkpoint["source_model"]),
+            )
+            _load_scheduler_with_new_psd_group(
+                scheduler, checkpoint["scheduler"], optimizer
+            )
+            if logger is not None:
+                logger.info(
+                    "Restored existing optimizer/scheduler state and initialized "
+                    "the new psd_weight parameter group with fresh optimizer state."
+                )
+        else:
+            raise RuntimeError(
+                "Resume optimizer parameter groups do not match the current model"
+            )
+        _validate_optimizer_state_shapes(optimizer)
         if scaler is not None and checkpoint.get("scaler") is not None:
             scaler.load_state_dict(checkpoint["scaler"])
         saved_distributed = checkpoint.get("distributed", {})
@@ -333,3 +498,143 @@ def initialize_or_resume(
             best_miou=float(metrics.get("best_mIoU", metrics.get("mIoU", float("-inf")))),
         )
     return TrainingState()
+
+
+def _group_by_name(groups: list[dict], name: str) -> dict | None:
+    return next((group for group in groups if group.get("name") == name), None)
+
+
+def _validate_optimizer_state_shapes(optimizer) -> None:
+    for group in optimizer.param_groups:
+        for parameter in group["params"]:
+            for key, value in optimizer.state.get(parameter, {}).items():
+                if (
+                    torch.is_tensor(value)
+                    and value.numel() != 1
+                    and value.shape != parameter.shape
+                ):
+                    raise RuntimeError(
+                        "Optimizer state shape mismatch after resume: "
+                        f"group={group.get('name')!r}, state={key!r}, "
+                        f"parameter={tuple(parameter.shape)}, state={tuple(value.shape)}"
+                    )
+
+
+def _saved_parameter_names(
+    state: dict,
+    current_named_parameters: dict[str, torch.nn.Parameter],
+    converter,
+) -> list[str]:
+    names = []
+    for key in state:
+        converted = converter(key)
+        if converted is not None and converted in current_named_parameters:
+            names.append(converted)
+    if len(names) != len(set(names)):
+        raise RuntimeError("Checkpoint parameter-name conversion produced duplicates")
+    return names
+
+
+def _load_optimizer_with_new_psd_group(
+    optimizer,
+    saved_state: dict,
+    *,
+    model,
+    source_model,
+    saved_model_state: dict,
+    saved_source_state: dict,
+) -> None:
+    """Restore old named groups exactly while leaving psd_weight state fresh."""
+    current = optimizer.state_dict()
+    merged = copy.deepcopy(current)
+    merged["state"] = {}
+    saved_groups = saved_state["param_groups"]
+    group_modules = {"model": model, "source": source_model}
+    group_saved_states = {
+        "model": saved_model_state,
+        "source": saved_source_state,
+    }
+    for group_index, current_group in enumerate(merged["param_groups"]):
+        name = current_group.get("name")
+        if name == "psd_weight":
+            continue
+        saved_group = _group_by_name(saved_groups, name)
+        if saved_group is None or len(saved_group["params"]) != len(current_group["params"]):
+            raise RuntimeError(f"Cannot migrate optimizer group {name!r}")
+        module = group_modules.get(name)
+        if module is None:
+            raise RuntimeError(f"Cannot identify module for optimizer group {name!r}")
+        current_named = {
+            parameter_name: parameter
+            for parameter_name, parameter in module.named_parameters()
+            if parameter.requires_grad
+        }
+        if name == "model" and any(
+            key.startswith("image_encoder.backbone.embeddings.")
+            for key in current_named
+        ):
+            converter = _swin_v5_key_to_v4
+        elif name == "source" and any(
+            key.startswith("encoder.encoder.patch_embeddings.")
+            for key in current_named
+        ):
+            converter = _segformer_v5_key_to_v4
+        else:
+            converter = lambda key: key
+        saved_names = _saved_parameter_names(
+            group_saved_states[name], current_named, converter
+        )
+        saved_ids = list(saved_group["params"])
+        if len(saved_names) != len(saved_ids):
+            raise RuntimeError(
+                f"Optimizer checkpoint parameter names do not match group {name!r}: "
+                f"names={len(saved_names)}, optimizer={len(saved_ids)}"
+            )
+        saved_id_by_name = dict(zip(saved_names, saved_ids, strict=True))
+        current_actual_group = optimizer.param_groups[group_index]
+        current_name_by_object = {
+            id(parameter): parameter_name
+            for parameter_name, parameter in current_named.items()
+        }
+        for key, value in saved_group.items():
+            if key != "params":
+                current_group[key] = copy.deepcopy(value)
+        for current_id, parameter in zip(
+            current_group["params"], current_actual_group["params"], strict=True
+        ):
+            parameter_name = current_name_by_object.get(id(parameter))
+            saved_id = saved_id_by_name.get(parameter_name)
+            if saved_id is None:
+                raise RuntimeError(
+                    f"No saved optimizer state mapping for {name}.{parameter_name}"
+                )
+            if saved_id in saved_state["state"]:
+                merged["state"][current_id] = copy.deepcopy(saved_state["state"][saved_id])
+    model_group = _group_by_name(merged["param_groups"], "model")
+    psd_group = _group_by_name(merged["param_groups"], "psd_weight")
+    if model_group is None or psd_group is None:
+        raise RuntimeError("Optimizer migration requires model and psd_weight groups")
+    model_initial = float(model_group.get("initial_lr", model_group["lr"]))
+    schedule_factor = float(model_group["lr"]) / max(model_initial, 1.0e-30)
+    psd_initial = float(psd_group.get("initial_lr", psd_group["lr"]))
+    psd_group["lr"] = psd_initial * schedule_factor
+    optimizer.load_state_dict(merged)
+
+
+def _load_scheduler_with_new_psd_group(scheduler, saved_state: dict, optimizer) -> None:
+    current = scheduler.state_dict()
+    migrated = copy.deepcopy(saved_state)
+    old_count = len(saved_state.get("base_lrs", []))
+    new_count = len(optimizer.param_groups)
+    for key, current_value in current.items():
+        saved_value = migrated.get(key)
+        if (
+            isinstance(saved_value, list)
+            and isinstance(current_value, list)
+            and len(saved_value) == old_count
+            and len(current_value) == new_count
+        ):
+            migrated[key] = copy.deepcopy(saved_value) + copy.deepcopy(current_value[old_count:])
+    if "_last_lr" in migrated and len(migrated["_last_lr"]) == new_count:
+        migrated["_last_lr"][-1] = optimizer.param_groups[-1]["lr"]
+    scheduler.load_state_dict(migrated)

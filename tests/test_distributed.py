@@ -213,7 +213,10 @@ def _swin_two_iteration_worker(
             )
             config._attn_implementation = "eager"
             backbone = SwinBackbone(config)
-            backbone.swin.layernorm.requires_grad_(False)
+            wrapper = getattr(backbone, "swin", None)
+            layernorm = getattr(wrapper, "layernorm", None)
+            if layernorm is not None:
+                layernorm.requires_grad_(False)
             return backbone, list(backbone.channels)
 
         model_module.load_transformer_image_backbone = tiny_swin_loader

@@ -18,6 +18,7 @@ from checkpoint import (
 )
 from config import save_resolved_config
 from dataset import ade20k_eval_collate, build_dataset
+from dfm_stabilization import apply_global_gradient_surgery
 from distributed import (
     DistributedContext,
     DistributedEvalSampler,
@@ -73,7 +74,27 @@ MIN_REDUCTION_KEYS = {
     "source_mu_min",
     "s_min",
     "t_min",
+    "diagonal_adaptive_weight_min",
+    "psd_weight_logit_min",
+    "psd_effective_multiplier_min",
 }
+
+MAX_REDUCTION_KEYS.update({
+    "diagonal_adaptive_weight_max",
+    "psd_weight_logit_max",
+    "psd_effective_multiplier_max",
+})
+
+DFM_RECIPE_SUMMARY_KEYS = (
+    "loss_diagonal_raw",
+    "loss_diagonal_adaptive",
+    "diagonal_adaptive_weight_mean",
+    "psd_weight_logit_mean",
+    "psd_effective_multiplier_mean",
+    "gradient_surgery_cosine",
+    "gradient_surgery_conflict_fraction",
+    "gradient_surgery_removed_fraction",
+)
 
 CONSISTENCY_SUMMARY_KEYS = {
     "psd": ("loss_psd", "psd_teacher_entropy"),
@@ -298,6 +319,13 @@ def _build_epoch_report(
     for key in CONSISTENCY_SUMMARY_KEYS.get(consistency_type, ()):
         if key in reduced_epoch:
             report[key] = float(reduced_epoch[key])
+    for key in DFM_RECIPE_SUMMARY_KEYS:
+        source_key = (
+            "gradient_surgery_conflict"
+            if key == "gradient_surgery_conflict_fraction" else key
+        )
+        if source_key in reduced_epoch:
+            report[key] = float(reduced_epoch[source_key])
     return report
 
 
@@ -363,6 +391,9 @@ def _wandb_epoch_payload(
     for key in CONSISTENCY_SUMMARY_KEYS.get(consistency_type, ()):
         if key in report:
             payload[f"epoch/{key}"] = report[key]
+    for key in DFM_RECIPE_SUMMARY_KEYS:
+        if key in report:
+            payload[f"epoch/{key}"] = report[key]
     return payload
 
 
@@ -421,6 +452,17 @@ def build_optimizer(config: dict, adapter: DDPCompatibleTrainingModel):
                 "lr": source_lr,
                 "name": "source",
             })
+    if adapter.psd_weight_model is not None:
+        psd_group = config["loss"]["consistency"]["learnable_weight"]
+        groups.append({
+            "params": [
+                parameter for parameter in adapter.psd_weight_model.parameters()
+                if parameter.requires_grad
+            ],
+            "lr": psd_group["lr"] or model_lr,
+            "weight_decay": psd_group["weight_decay"],
+            "name": "psd_weight",
+        })
     optimizer_class = {
         "adam": torch.optim.Adam,
         "adamw": torch.optim.AdamW,
@@ -766,6 +808,7 @@ def _save_training_checkpoint(
             micro_step=micro_step,
             model=adapter.endpoint_model,
             source_model=adapter.source_model,
+            psd_weight_model=adapter.psd_weight_model,
             optimizer=optimizer,
             scheduler=scheduler,
             scaler=scaler,
@@ -814,6 +857,15 @@ def run_training(config: dict, *, joint_entrypoint: bool = False) -> dict:
             save_resolved_config(config, output_dir / "config_resolved.yaml")
             logger = setup_logger(output_dir)
         barrier(context)
+        if (
+            config["loss"]["primary"]["adaptive_weighting"]["enabled"]
+            and config["training"]["label_smoothing"] != 0.0
+        ):
+            logger.warning(
+                "Adaptive diagonal weighting uses hard one-hot targets while CE "
+                "label_smoothing=%s; label_smoothing=0 is the closest paper recipe.",
+                config["training"]["label_smoothing"],
+            )
         logger.info(
             "world_size=%d rank=%d local_rank=%d global_batch_size=%d "
             "local_batch_size=%d grad_accum_steps=%d effective_global_batch_size=%d",
@@ -869,6 +921,7 @@ def run_training(config: dict, *, joint_entrypoint: bool = False) -> dict:
         state = initialize_or_resume(
             config, endpoint, source, optimizer, scheduler, scaler,
             logger if context.is_main_process else None,
+            psd_weight_model=adapter.psd_weight_model,
         )
         training_model = wrap_ddp(adapter, context, config)
         # Model initialization/checkpoint loading used the same seed. From here on,
@@ -1016,15 +1069,17 @@ def run_training(config: dict, *, joint_entrypoint: bool = False) -> dict:
                         or batch_index + 1 == epoch_total_iterations
                         or reaches_limit
                     )
+                    surgery_config = consistency_config["gradient_surgery"]
+                    surgery_enabled = surgery_config["enabled"]
                     sync_context = (
                         training_model.no_sync()
-                        if context.distributed and not should_step
+                        if context.distributed and not should_step and not surgery_enabled
                         else nullcontext()
                     )
                     with sync_context:
                         with autocast_context(config, context.device):
                             objectives = run_model_training_objectives(
-                                training_model,
+                                adapter if surgery_enabled else training_model,
                                 operation=operation,
                                 image=image,
                                 target=target,
@@ -1037,7 +1092,17 @@ def run_training(config: dict, *, joint_entrypoint: bool = False) -> dict:
                             scaled_loss = (
                                 objectives["loss"] / training["grad_accum_steps"]
                             )
-                        scaler.scale(scaled_loss).backward()
+                        if surgery_enabled:
+                            surgery_stats = apply_global_gradient_surgery(
+                                adapter=adapter,
+                                objectives=objectives,
+                                scaler=scaler,
+                                world_size=context.world_size,
+                                eps=surgery_config["eps"],
+                            )
+                            objectives["stats"].update(surgery_stats)
+                        else:
+                            scaler.scale(scaled_loss).backward()
 
                     grad_norm = None
                     if should_step:

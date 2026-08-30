@@ -241,7 +241,10 @@ def test_real_scratch_swin_uses_four_stages_and_all_trainable_params_get_grad():
         stage_parameters = [
             parameter
             for name, parameter in encoder.backbone.named_parameters()
-            if f"swin.encoder.layers.{stage_index}." in name
+            if (
+                f"swin.encoder.layers.{stage_index}." in name
+                or f"encoder.layers.{stage_index}." in name
+            )
             and parameter.requires_grad
         ]
         assert stage_parameters
@@ -251,8 +254,11 @@ def test_real_scratch_swin_uses_four_stages_and_all_trainable_params_get_grad():
         if parameter.requires_grad and parameter.grad is None
     ]
     assert missing == []
-    assert not encoder.backbone.swin.layernorm.weight.requires_grad
-    assert not encoder.backbone.swin.layernorm.bias.requires_grad
+    if hasattr(encoder.backbone, "swin"):
+        assert not encoder.backbone.swin.layernorm.weight.requires_grad
+        assert not encoder.backbone.swin.layernorm.bias.requires_grad
+    else:
+        assert not hasattr(encoder.backbone, "layernorm")
 
 
 def test_real_scratch_convnext_has_no_trainable_unused_parameters():

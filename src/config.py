@@ -194,7 +194,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "loss": {
         "ignore_index": None,
         "mask_pixel_losses": False,
-        "primary": {"type": "diagonal_ce", "weight": 1.0},
+        "primary": {
+            "type": "diagonal_ce",
+            "weight": 1.0,
+            "adaptive_weighting": {"enabled": False, "r": 0.5, "c": 0.01},
+        },
         "consistency": {
             "enabled": False,
             "type": "esd",
@@ -211,6 +215,22 @@ DEFAULT_CONFIG: dict[str, Any] = {
                 "debug_assertions": False,
             },
             "psd": {},
+            "gradient_surgery": {
+                "enabled": False,
+                "priority": "diagonal",
+                "scope": "endpoint_model",
+                "eps": 1.0e-12,
+            },
+            "learnable_weight": {
+                "enabled": False,
+                "dependency": "s",
+                "type": "uncertainty",
+                "time_embedding_dim": 32,
+                "hidden_dim": 64,
+                "init_effective_weight": 0.5,
+                "lr": None,
+                "weight_decay": 0.0,
+            },
             "csd": {},
             "ecld": {
                 "ec_weight": 4.0,
@@ -602,6 +622,27 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
     if config["checkpoint"]["init_from"] and config["checkpoint"]["resume"]:
         raise ValueError("checkpoint.init_from and checkpoint.resume are mutually exclusive")
     consistency = config["loss"]["consistency"]
+    adaptive_diagonal = config["loss"]["primary"]["adaptive_weighting"]
+    if not isinstance(adaptive_diagonal["enabled"], bool):
+        raise ValueError("loss.primary.adaptive_weighting.enabled must be boolean")
+    if adaptive_diagonal["r"] < 0 or adaptive_diagonal["c"] <= 0:
+        raise ValueError("adaptive diagonal weighting requires r >= 0 and c > 0")
+    surgery = consistency["gradient_surgery"]
+    if surgery["priority"] != "diagonal" or surgery["scope"] != "endpoint_model":
+        raise ValueError("gradient surgery supports diagonal/endpoint_model only")
+    if surgery["eps"] <= 0:
+        raise ValueError("gradient surgery eps must be positive")
+    if surgery["enabled"] and training["grad_accum_steps"] != 1:
+        raise ValueError("gradient surgery requires training.grad_accum_steps=1")
+    learnable = consistency["learnable_weight"]
+    if learnable["dependency"] != "s" or learnable["type"] != "uncertainty":
+        raise ValueError("learnable PSD weighting supports s/uncertainty only")
+    if learnable["time_embedding_dim"] <= 0 or learnable["hidden_dim"] <= 0:
+        raise ValueError("learnable PSD weight dimensions must be positive")
+    if learnable["init_effective_weight"] <= 0:
+        raise ValueError("learnable PSD initial effective weight must be positive")
+    if (surgery["enabled"] or learnable["enabled"]) and consistency["type"] != "psd":
+        raise ValueError("gradient surgery and learnable weighting currently require PSD")
     start = consistency["start"]
     if start["unit"] not in {"epoch", "optimizer_step"}:
         raise ValueError("loss.consistency.start.unit must be epoch or optimizer_step")
