@@ -461,6 +461,12 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("runtime.amp_dtype must be bf16 or fp16")
     training = config["training"]
     if (
+        isinstance(training["grad_accum_steps"], bool)
+        or not isinstance(training["grad_accum_steps"], int)
+        or training["grad_accum_steps"] <= 0
+    ):
+        raise ValueError("training.grad_accum_steps must be a positive integer")
+    if (
         training["max_batches_per_epoch"] is not None
         and training["max_batches_per_epoch"] <= 0
     ):
@@ -632,8 +638,6 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("gradient surgery supports diagonal/endpoint_model only")
     if surgery["eps"] <= 0:
         raise ValueError("gradient surgery eps must be positive")
-    if surgery["enabled"] and training["grad_accum_steps"] != 1:
-        raise ValueError("gradient surgery requires training.grad_accum_steps=1")
     learnable = consistency["learnable_weight"]
     if learnable["type"] != "uncertainty":
         raise ValueError("learnable consistency weighting supports uncertainty only")

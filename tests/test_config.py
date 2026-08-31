@@ -162,6 +162,25 @@ def test_scheduler_unit_and_debug_epoch_limit_are_validated():
         load_config(CONFIG, ["training.max_batches_per_epoch=0"])
 
 
+@pytest.mark.parametrize("value", ["0", "-1", "true", "1.5"])
+def test_gradient_accumulation_requires_positive_integer(value):
+    with pytest.raises(ValueError, match="grad_accum_steps must be a positive integer"):
+        load_config(CONFIG, [f"training.grad_accum_steps={value}"])
+
+
+def test_gradient_surgery_accepts_accumulation_two_and_full_recipe_loads():
+    path = (
+        Path(__file__).parents[1]
+        / "configs"
+        / "joint_psd_cityscapes_swin_t_adaptive_surgery_fullres_psd_accum2.yaml"
+    )
+    config = load_config(path)
+    assert config["training"]["batch_size"] == 8
+    assert config["training"]["grad_accum_steps"] == 2
+    assert config["loss"]["consistency"]["gradient_surgery"]["enabled"] is True
+    assert config["loss"]["consistency"]["psd"]["loss_resolution"] == "full"
+
+
 def test_missing_required_section_has_clear_error(tmp_path):
     raw = yaml.safe_load(CONFIG.read_text())
     del raw["loss"]

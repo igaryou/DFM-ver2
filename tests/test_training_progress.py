@@ -385,3 +385,113 @@ def test_training_logs_only_one_epoch_record_and_one_epoch_wandb_call(
     file_log = (output_dir / "train_log.txt").read_text()
     assert "epoch=1 iter=" not in file_log
     assert file_log.count("| epoch:1 ") == 1
+
+
+def test_gradient_surgery_accumulation_steps_optimizer_and_scheduler_per_window(
+    tmp_path, monkeypatch
+):
+    output_dir = tmp_path / "surgery-accum-run"
+    surgery_config = (
+        ROOT
+        / "configs"
+        / "joint_psd_cityscapes_swin_t_adaptive_surgery_fullres_psd_accum2.yaml"
+    )
+    config = load_config(
+        surgery_config,
+        [
+            f"experiment.output_dir={output_dir}",
+            "checkpoint.resume=null",
+            "runtime.device=cpu",
+            "training.epochs=1",
+            "training.max_optimizer_steps=96003",
+            "training.max_batches_per_epoch=3",
+            "training.checkpoint_interval_steps=null",
+            "training.validation_epochs=[]",
+            "evaluation.interval.value=null",
+            "wandb.enabled=false",
+        ],
+    )
+    batches = [
+        (torch.full((2, 1), float(index)), torch.zeros(2, dtype=torch.long))
+        for index in range(1, 4)
+    ]
+    endpoint = nn.Linear(2, 1, bias=False)
+    source = nn.Linear(1, 1, bias=False)
+    counters = {"optimizer": 0, "scheduler": 0}
+
+    class _CountingSGD(torch.optim.SGD):
+        def step(self, closure=None):
+            counters["optimizer"] += 1
+            return super().step(closure)
+
+    class _CountingScheduler:
+        last_epoch = -1
+
+        def step(self):
+            counters["scheduler"] += 1
+            self.last_epoch += 1
+
+    def fake_objectives(model, *, operation, image, **kwargs):
+        del operation, kwargs
+        endpoint_parameter = model.endpoint_model.weight.flatten()
+        source_parameter = model.source_model.weight.flatten()[0]
+        coefficient = image.mean()
+        diagonal = coefficient * endpoint_parameter[0]
+        psd = coefficient * (-endpoint_parameter[0] + endpoint_parameter[1])
+        source_objective = endpoint_parameter.sum() * 0.0
+        loss = diagonal + psd + source_objective + coefficient * source_parameter
+        detached = loss.detach()
+        return {
+            "diagonal_objective": diagonal,
+            "psd_objective": psd,
+            "source_objective": source_objective,
+            "loss": loss,
+            "stats": {
+                "loss_total": detached,
+                "loss_diagonal": diagonal.detach(),
+                "loss_consistency": psd.detach(),
+                "consistency_effective_weight": detached.new_tensor(1.0),
+                "loss_psd": psd.detach(),
+                "psd_teacher_entropy": detached.new_tensor(0.0),
+            },
+            "consistency_type": "psd",
+        }
+
+    monkeypatch.setattr(
+        trainer, "_build_loaders",
+        lambda config, context, local_batch_size: (batches, [], None),
+    )
+    monkeypatch.setattr(
+        trainer, "build_models",
+        lambda config, device: (endpoint.to(device), source.to(device)),
+    )
+    monkeypatch.setattr(
+        trainer, "build_optimizer",
+        lambda config, adapter: _CountingSGD(adapter.parameters(), lr=0.1),
+    )
+    scheduler = _CountingScheduler()
+    monkeypatch.setattr(trainer, "build_scheduler", lambda config, optimizer: scheduler)
+    monkeypatch.setattr(
+        trainer, "initialize_or_resume",
+        lambda *args, **kwargs: SimpleNamespace(
+            start_epoch=0,
+            global_step=96000,
+            best_miou=float("-inf"),
+            micro_step=96000,
+        ),
+    )
+    monkeypatch.setattr(trainer, "run_model_training_objectives", fake_objectives)
+    monkeypatch.setattr(trainer, "_save_training_checkpoint", lambda **kwargs: None)
+    monkeypatch.setattr(trainer, "tqdm", _FakeTqdm())
+
+    result = trainer.run_training(config, joint_entrypoint=True)
+
+    assert counters == {"optimizer": 2, "scheduler": 2}
+    records = [
+        json.loads(line)
+        for line in (output_dir / "metrics.jsonl").read_text().splitlines()
+    ]
+    epoch_record = records[0]
+    assert epoch_record["optimizer_step"] == 96002
+    assert epoch_record["gradient_surgery_accumulated_microbatches"] == pytest.approx(1.5)
+    assert epoch_record["gradient_surgery_partial_accumulation"] == pytest.approx(0.5)

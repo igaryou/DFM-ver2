@@ -18,7 +18,7 @@ from checkpoint import (
 )
 from config import save_resolved_config
 from dataset import ade20k_eval_collate, build_dataset
-from dfm_stabilization import apply_global_gradient_surgery
+from dfm_stabilization import GradientSurgeryAccumulator
 from distributed import (
     DistributedContext,
     DistributedEvalSampler,
@@ -99,6 +99,9 @@ DFM_RECIPE_SUMMARY_KEYS = (
     "gradient_surgery_cosine",
     "gradient_surgery_conflict_fraction",
     "gradient_surgery_removed_fraction",
+    "gradient_surgery_accumulated_microbatches",
+    "gradient_surgery_accumulation_enabled",
+    "gradient_surgery_partial_accumulation",
     "psd_loss_height",
     "psd_loss_width",
     "psd_loss_resolution_is_full",
@@ -987,6 +990,11 @@ def run_training(config: dict, *, joint_entrypoint: bool = False) -> dict:
 
         training = config["training"]
         consistency_config = config["loss"]["consistency"]
+        surgery_config = consistency_config["gradient_surgery"]
+        surgery_enabled = surgery_config["enabled"]
+        surgery_accumulator = (
+            GradientSurgeryAccumulator() if surgery_enabled else None
+        )
         numbered_checkpoint_epochs = _numbered_checkpoint_epochs(
             total_epochs=training["epochs"],
             checkpoint_interval=training["checkpoint_interval_epochs"],
@@ -1002,6 +1010,12 @@ def run_training(config: dict, *, joint_entrypoint: bool = False) -> dict:
         validated_optimizer_steps: set[int] = set()
         best_checkpoint_steps: set[int] = set()
         latest_checkpoint_steps: set[int] = set()
+
+        def assert_checkpointable_surgery_state() -> None:
+            if surgery_accumulator is not None and not surgery_accumulator.is_empty:
+                raise RuntimeError(
+                    "refusing to checkpoint a partially accumulated gradient surgery window"
+                )
 
         def run_validation(
             displayed_epoch: int,
@@ -1041,6 +1055,7 @@ def run_training(config: dict, *, joint_entrypoint: bool = False) -> dict:
             if is_new_best and trigger in {
                 "optimizer_step_interval", "final_optimizer_step"
             }:
+                assert_checkpointable_surgery_state()
                 checkpoint_metrics = {
                     **result,
                     "best_mIoU": state.best_miou,
@@ -1128,8 +1143,6 @@ def run_training(config: dict, *, joint_entrypoint: bool = False) -> dict:
                         or batch_index + 1 == epoch_total_iterations
                         or reaches_limit
                     )
-                    surgery_config = consistency_config["gradient_surgery"]
-                    surgery_enabled = surgery_config["enabled"]
                     sync_context = (
                         training_model.no_sync()
                         if context.distributed and not should_step and not surgery_enabled
@@ -1152,19 +1165,38 @@ def run_training(config: dict, *, joint_entrypoint: bool = False) -> dict:
                                 objectives["loss"] / training["grad_accum_steps"]
                             )
                         if surgery_enabled:
-                            surgery_stats = apply_global_gradient_surgery(
+                            assert surgery_accumulator is not None
+                            surgery_accumulator.accumulate(
                                 adapter=adapter,
                                 objectives=objectives,
                                 scaler=scaler,
-                                world_size=context.world_size,
-                                eps=surgery_config["eps"],
                             )
-                            objectives["stats"].update(surgery_stats)
                         else:
                             scaler.scale(scaled_loss).backward()
 
                     grad_norm = None
                     if should_step:
+                        if surgery_enabled:
+                            assert surgery_accumulator is not None
+                            accumulated_microbatches = (
+                                surgery_accumulator.microbatch_count
+                            )
+                            surgery_stats = surgery_accumulator.finalize(
+                                adapter=adapter,
+                                scaler=scaler,
+                                world_size=context.world_size,
+                                eps=surgery_config["eps"],
+                            )
+                            surgery_stats["gradient_surgery_partial_accumulation"] = (
+                                torch.tensor(
+                                    float(
+                                        accumulated_microbatches
+                                        < training["grad_accum_steps"]
+                                    ),
+                                    device=context.device,
+                                )
+                            )
+                            objectives["stats"].update(surgery_stats)
                         scaler.unscale_(optimizer)
                         if training["grad_clip"] is not None:
                             grad_norm = torch.nn.utils.clip_grad_norm_(
@@ -1195,6 +1227,7 @@ def run_training(config: dict, *, joint_entrypoint: bool = False) -> dict:
                             )
                             validation_step = state.global_step
                         if validation_trigger is not None or numbered_step_due:
+                            assert_checkpointable_surgery_state()
                             checkpoint_metrics = {
                                 **(
                                     validation_metrics
@@ -1365,6 +1398,7 @@ def run_training(config: dict, *, joint_entrypoint: bool = False) -> dict:
             ):
                 filenames.append("best.pt")
             if filenames:
+                assert_checkpointable_surgery_state()
                 _save_training_checkpoint(
                     config=config,
                     training_model=training_model,

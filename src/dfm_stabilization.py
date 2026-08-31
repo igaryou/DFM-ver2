@@ -286,19 +286,39 @@ def project_conflicting_gradient(
     return SurgeryResult(projected=projected, stats=stats)
 
 
-def _global_gradients(
+def _local_gradients(
     objective: torch.Tensor,
     parameters: list[nn.Parameter],
     *,
-    world_size: int,
+    retain_graph: bool,
 ) -> list[torch.Tensor | None]:
     if not parameters:
         return []
     if not objective.requires_grad:
         return [None] * len(parameters)
-    local = torch.autograd.grad(
-        objective, parameters, retain_graph=True, allow_unused=True
-    )
+    return list(torch.autograd.grad(
+        objective, parameters, retain_graph=retain_graph, allow_unused=True
+    ))
+
+
+def _global_average_accumulated_gradients(
+    accumulated: list[torch.Tensor | None],
+    parameters: list[nn.Parameter],
+    *,
+    microbatch_count: int,
+    world_size: int,
+) -> list[torch.Tensor | None]:
+    """Average a detached local accumulation window, then communicate once."""
+    if len(accumulated) != len(parameters):
+        raise ValueError("accumulated gradients and parameters differ in length")
+    if not parameters:
+        return []
+    if microbatch_count <= 0:
+        raise ValueError("microbatch_count must be positive")
+    local = [
+        None if gradient is None else gradient / microbatch_count
+        for gradient in accumulated
+    ]
     global_gradients: list[torch.Tensor | None] = [None] * len(parameters)
     used = torch.tensor(
         [gradient is not None for gradient in local],
@@ -331,6 +351,190 @@ def _global_gradients(
     return global_gradients
 
 
+def _trainable_parameters(module: nn.Module | None) -> list[nn.Parameter]:
+    return (
+        [] if module is None
+        else [parameter for parameter in module.parameters() if parameter.requires_grad]
+    )
+
+
+def _consistency_weight_model(adapter: nn.Module) -> nn.Module | None:
+    # New adapters expose the generic name; the fallback keeps old diagnostic
+    # adapters and PSD-only checkpoints working unchanged.
+    if hasattr(adapter, "consistency_weight_model"):
+        return adapter.consistency_weight_model
+    return getattr(adapter, "psd_weight_model", None)
+
+
+class GradientSurgeryAccumulator:
+    """Accumulate local microbatch task gradients for one optimizer update.
+
+    ``accumulate`` performs no collective and stores only detached gradients, so
+    every microbatch graph can be released immediately. ``finalize`` averages
+    the actual window, globally reduces it once, projects once, and assigns the
+    scaled gradients expected by ``GradScaler.unscale_``.
+    """
+
+    _NAMES = ("diagonal", "psd", "other", "source", "weight")
+
+    def __init__(self) -> None:
+        self._count = 0
+        self._scale: float | None = None
+        self._parameters: dict[str, list[nn.Parameter]] = {}
+        self._buffers: dict[str, list[torch.Tensor | None]] = {}
+
+    @property
+    def microbatch_count(self) -> int:
+        return self._count
+
+    @property
+    def is_empty(self) -> bool:
+        return self._count == 0
+
+    def reset(self) -> None:
+        self._count = 0
+        self._scale = None
+        self._parameters.clear()
+        self._buffers.clear()
+
+    def _current_parameters(self, adapter: nn.Module) -> dict[str, list[nn.Parameter]]:
+        endpoint = _trainable_parameters(adapter.endpoint_model)
+        return {
+            "diagonal": endpoint,
+            "psd": endpoint,
+            "other": endpoint,
+            "source": _trainable_parameters(adapter.source_model),
+            "weight": _trainable_parameters(_consistency_weight_model(adapter)),
+        }
+
+    def accumulate(self, *, adapter: nn.Module, objectives: dict, scaler) -> None:
+        scaler_enabled = scaler is not None and scaler.is_enabled()
+        if scaler_enabled:
+            # Initialize GradScaler's device-side scale without retaining the
+            # returned tensor or attaching parameter .grad values.
+            scaler.scale(objectives["loss"])
+        scale = float(scaler.get_scale()) if scaler_enabled else 1.0
+        parameters = self._current_parameters(adapter)
+        if self.is_empty:
+            self._scale = scale
+            self._parameters = parameters
+            self._buffers = {
+                name: [None] * len(values) for name, values in parameters.items()
+            }
+        else:
+            if scale != self._scale:
+                raise RuntimeError(
+                    "GradScaler scale changed inside a surgery accumulation window"
+                )
+            for name in self._NAMES:
+                if [id(p) for p in parameters[name]] != [
+                    id(p) for p in self._parameters[name]
+                ]:
+                    raise RuntimeError(
+                        "trainable parameter set changed inside a surgery accumulation window"
+                    )
+
+        requests = (
+            ("diagonal", objectives["diagonal_objective"] * scale),
+            ("psd", objectives["psd_objective"] * scale),
+            ("other", objectives["source_objective"] * scale),
+            ("source", objectives["loss"] * scale),
+            ("weight", objectives["loss"] * scale),
+        )
+        active = [
+            index for index, (name, objective) in enumerate(requests)
+            if self._parameters[name] and objective.requires_grad
+        ]
+        last_active = active[-1] if active else None
+        for index, (name, objective) in enumerate(requests):
+            values = _local_gradients(
+                objective,
+                self._parameters[name],
+                retain_graph=index != last_active,
+            )
+            for buffer_index, value in enumerate(values):
+                if value is None:
+                    continue
+                detached = value.detach()
+                existing = self._buffers[name][buffer_index]
+                if existing is None:
+                    self._buffers[name][buffer_index] = detached.clone()
+                else:
+                    existing.add_(detached)
+        self._count += 1
+
+    def finalize(
+        self,
+        *,
+        adapter: nn.Module,
+        scaler,
+        world_size: int = 1,
+        eps: float = 1.0e-12,
+    ) -> dict[str, torch.Tensor]:
+        if self.is_empty:
+            raise RuntimeError("cannot finalize an empty gradient surgery window")
+        parameters = self._current_parameters(adapter)
+        for name in self._NAMES:
+            if [id(p) for p in parameters[name]] != [
+                id(p) for p in self._parameters[name]
+            ]:
+                raise RuntimeError(
+                    "trainable parameter set changed before surgery finalization"
+                )
+        scaler_enabled = scaler is not None and scaler.is_enabled()
+        scale = float(scaler.get_scale()) if scaler_enabled else 1.0
+        if scale != self._scale:
+            raise RuntimeError("GradScaler scale changed before surgery finalization")
+        count = self._count
+        averaged = {
+            name: _global_average_accumulated_gradients(
+                self._buffers[name], self._parameters[name],
+                microbatch_count=count, world_size=world_size,
+            )
+            for name in self._NAMES
+        }
+        surgery = project_conflicting_gradient(
+            averaged["diagonal"], averaged["psd"], eps=eps
+        )
+        for parameter, d_value, p_value, other_value in zip(
+            self._parameters["diagonal"], averaged["diagonal"],
+            surgery.projected, averaged["other"], strict=True,
+        ):
+            values = [
+                value for value in (d_value, p_value, other_value)
+                if value is not None
+            ]
+            parameter.grad = sum(values[1:], values[0].clone()) if values else None
+        for name in ("source", "weight"):
+            for parameter, gradient in zip(
+                self._parameters[name], averaged[name], strict=True
+            ):
+                parameter.grad = None if gradient is None else gradient.clone()
+
+        stats = dict(surgery.stats)
+        reference = next(iter(self._parameters["diagonal"]), None)
+        stats_device = reference.device if reference is not None else torch.device("cpu")
+        stats["gradient_surgery_accumulated_microbatches"] = torch.tensor(
+            float(count), device=stats_device
+        )
+        stats["gradient_surgery_accumulation_enabled"] = torch.tensor(
+            float(count > 1), device=stats_device
+        )
+        if scale != 1.0:
+            stats["gradient_surgery_dot"] = (
+                stats["gradient_surgery_dot"] / (scale * scale)
+            )
+            for key in (
+                "gradient_surgery_diagonal_norm",
+                "gradient_surgery_psd_norm_before",
+                "gradient_surgery_psd_norm_after",
+                "gradient_surgery_removed_component_norm",
+            ):
+                stats[key] = stats[key] / scale
+        self.reset()
+        return stats
+
+
 def apply_global_gradient_surgery(
     *,
     adapter: nn.Module,
@@ -339,44 +543,9 @@ def apply_global_gradient_surgery(
     world_size: int = 1,
     eps: float = 1.0e-12,
 ) -> dict[str, torch.Tensor]:
-    """Assign globally averaged, projected scaled gradients to adapter parameters."""
-    scaler_enabled = scaler is not None and scaler.is_enabled()
-    if scaler_enabled:
-        # GradScaler lazily creates its device-side scale on scale().  The
-        # explicit-gradient path still needs that state for unscale_/step().
-        scaler.scale(objectives["loss"])
-    scale = float(scaler.get_scale()) if scaler_enabled else 1.0
-    endpoint = [p for p in adapter.endpoint_model.parameters() if p.requires_grad]
-    source = (
-        [p for p in adapter.source_model.parameters() if p.requires_grad]
-        if adapter.source_model is not None else []
+    """Backward-compatible one-microbatch gradient surgery wrapper."""
+    accumulator = GradientSurgeryAccumulator()
+    accumulator.accumulate(adapter=adapter, objectives=objectives, scaler=scaler)
+    return accumulator.finalize(
+        adapter=adapter, scaler=scaler, world_size=world_size, eps=eps
     )
-    weight = (
-        [p for p in adapter.psd_weight_model.parameters() if p.requires_grad]
-        if adapter.psd_weight_model is not None else []
-    )
-    gd = _global_gradients(objectives["diagonal_objective"] * scale, endpoint, world_size=world_size)
-    gp = _global_gradients(objectives["psd_objective"] * scale, endpoint, world_size=world_size)
-    other = _global_gradients(objectives["source_objective"] * scale, endpoint, world_size=world_size)
-    surgery = project_conflicting_gradient(gd, gp, eps=eps)
-    for parameter, d_value, p_value, other_value in zip(
-        endpoint, gd, surgery.projected, other, strict=True
-    ):
-        values = [value for value in (d_value, p_value, other_value) if value is not None]
-        parameter.grad = sum(values[1:], values[0].clone()) if values else None
-    for parameters, objective in ((source, objectives["loss"]), (weight, objectives["loss"])):
-        gradients = _global_gradients(objective * scale, parameters, world_size=world_size)
-        for parameter, gradient in zip(parameters, gradients, strict=True):
-            parameter.grad = gradient
-    if scale == 1.0:
-        return surgery.stats
-    stats = dict(surgery.stats)
-    stats["gradient_surgery_dot"] = stats["gradient_surgery_dot"] / (scale * scale)
-    for key in (
-        "gradient_surgery_diagonal_norm",
-        "gradient_surgery_psd_norm_before",
-        "gradient_surgery_psd_norm_after",
-        "gradient_surgery_removed_component_norm",
-    ):
-        stats[key] = stats[key] / scale
-    return stats

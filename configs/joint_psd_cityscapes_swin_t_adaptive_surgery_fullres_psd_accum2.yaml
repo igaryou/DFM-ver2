@@ -1,0 +1,12 @@
+extends: joint_psd_cityscapes_swin_t_adaptive_surgery_fullres_psd.yaml
+
+experiment:
+  name: dfm_joint_psd_cityscapes_swin_t_adaptive_surgery_fullres_psd_accum2_160k
+  output_dir: /rda5/users/igarashi_25/DFM/results/joint_psd_cityscapes_swin_t_adaptive_surgery_fullres_psd_accum2_160k
+
+training:
+  batch_size: 8
+  grad_accum_steps: 2
+
+wandb:
+  name: dfm-joint-psd-cityscapes-swin-t-adaptive-surgery-fullres-psd-accum2-160k

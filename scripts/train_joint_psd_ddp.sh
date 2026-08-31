@@ -67,12 +67,18 @@ uv run torchrun \
   --config configs/joint_psd_cityscapes_swin_t_dfm_recipe.yaml
 
 
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+CUDA_VISIBLE_DEVICES=2,3 \
+uv run torchrun \
+  --standalone \
+  --nproc_per_node=2 \
+  src/train_joint.py \
+  --config configs/joint_psd_cityscapes_swin_t_adaptive_surgery_fullres_psd.yaml
 
 
 
 
-
-
+/home/igarashi_25/DFM/configs/joint_psd_cityscapes_swin_t_adaptive_surgery_fullres_psd.yaml
 
 
 
