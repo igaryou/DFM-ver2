@@ -1,0 +1,10 @@
+extends: joint_psd_cityscapes_swin_t_dfm_recipe.yaml
+
+experiment:
+  name: dfm_joint_psd_cityscapes_swin_t_adaptive_surgery_fullres_psd_160k
+  output_dir: /rda5/users/igarashi_25/DFM/results/joint_psd_cityscapes_swin_t_adaptive_surgery_fullres_psd_160k
+
+loss:
+  consistency:
+    psd:
+      loss_resolution: full

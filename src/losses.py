@@ -243,6 +243,9 @@ def _psd_loss(
     probability_eps: float,
     flow: Callable = flow_map,
     valid_mask: torch.Tensor | None = None,
+    loss_resolution: str = "state",
+    full_resolution_size: tuple[int, int] | None = None,
+    valid_mask_full: torch.Tensor | None = None,
 ) -> ConsistencyResult:
     if not bool(((s < u) & (u < t)).all()):
         raise ValueError("PSD requires s < u < t")
@@ -273,14 +276,37 @@ def _psd_loss(
     student_logits = _forward_logits(
         model, x_s, image, s, t, image_feat=image_feat
     ).float()
-    student_log_probability = F.log_softmax(student_logits, dim=1)
-    student_probability = student_log_probability.exp()
-    loss_map = -(teacher * student_log_probability).sum(dim=1)
-    loss = masked_mean(loss_map, valid_mask).float()
-    if valid_mask is None:
+    if loss_resolution == "state":
+        # Keep this path identical to the original state-resolution PSD.
+        student_log_probability = F.log_softmax(student_logits, dim=1)
+        student_probability = student_log_probability.exp()
+        loss_teacher = teacher
+        loss_map = -(loss_teacher * student_log_probability).sum(dim=1)
+        loss_valid_mask = valid_mask
+    elif loss_resolution == "full":
+        if full_resolution_size is None:
+            raise ValueError("full-resolution PSD requires full_resolution_size")
+        full_resolution_size = tuple(int(value) for value in full_resolution_size)
+        student_logits_full = resize_continuous(
+            student_logits, full_resolution_size
+        )
+        student_log_probability = F.log_softmax(student_logits_full, dim=1)
+        with torch.no_grad():
+            loss_teacher = _normalize_probability(
+                resize_continuous(teacher, full_resolution_size), probability_eps
+            ).detach()
+        loss_map = -(loss_teacher * student_log_probability).sum(dim=1)
+        loss_valid_mask = valid_mask_full
+        # Returning a full [B,C,H,W] probability would retain another very large
+        # tensor. Diagnostics keep the state-resolution probability instead.
+        student_probability = torch.softmax(student_logits, dim=1)
+    else:
+        raise ValueError("PSD loss_resolution must be state or full")
+    loss = masked_mean(loss_map, loss_valid_mask).float()
+    if loss_valid_mask is None:
         valid_pixel = torch.ones_like(loss_map, dtype=torch.bool)
     else:
-        valid_pixel = valid_mask.to(device=loss_map.device, dtype=torch.bool)
+        valid_pixel = loss_valid_mask.to(device=loss_map.device, dtype=torch.bool)
     valid_count = valid_pixel.flatten(1).sum(dim=1)
     loss_per_sample = (
         (loss_map * valid_pixel.to(loss_map.dtype)).flatten(1).sum(dim=1)
@@ -299,6 +325,11 @@ def _psd_loss(
             "psd_direct_probability_sum_error": (
                 student_probability.sum(dim=1) - 1.0
             ).abs().max(),
+            "psd_loss_height": loss.new_tensor(loss_map.shape[-2]),
+            "psd_loss_width": loss.new_tensor(loss_map.shape[-1]),
+            "psd_loss_resolution_is_full": loss.new_tensor(
+                float(loss_resolution == "full")
+            ),
         }),
         teacher_prob=teacher,
         student_prob=student_probability,
@@ -724,6 +755,8 @@ def compute_consistency_loss(
     precision: dict | None = None,
     config: dict | None = None,
     valid_mask: torch.Tensor | None = None,
+    full_resolution_size: tuple[int, int] | None = None,
+    valid_mask_full: torch.Tensor | None = None,
 ) -> ConsistencyResult:
     if loss_type not in {"psd", "csd", "ecld", "esd"}:
         raise ValueError(f"Unknown consistency loss: {loss_type}")
@@ -734,6 +767,15 @@ def compute_consistency_loss(
         assert valid_mask.shape == x_s.shape[:1] + x_s.shape[-2:], (
             f"consistency mask {valid_mask.shape} != state pixels "
             f"{x_s.shape[:1] + x_s.shape[-2:]}"
+        )
+    if loss_type == "psd" and valid_mask_full is not None:
+        if full_resolution_size is None:
+            full_resolution_size = tuple(valid_mask_full.shape[-2:])
+        assert valid_mask_full.shape == (
+            x_s.shape[0], *tuple(full_resolution_size)
+        ), (
+            f"full consistency mask {valid_mask_full.shape} != full pixels "
+            f"{(x_s.shape[0], *tuple(full_resolution_size))}"
         )
     config = config or {}
     consistency = config.get("loss", {}).get("consistency", {})
@@ -755,11 +797,15 @@ def compute_consistency_loss(
     if loss_type == "psd":
         if u is None:
             raise ValueError("PSD requires intermediate time u")
+        psd = consistency.get("psd", {})
         result = _psd_loss(
             model=model, x_s=x_s, image=image, image_feat=image_feat,
             s=s, u=u, t=t,
             time_eps=time_eps, probability_eps=probability_eps, flow=flow,
             valid_mask=valid_mask,
+            loss_resolution=psd.get("loss_resolution", "state"),
+            full_resolution_size=full_resolution_size,
+            valid_mask_full=valid_mask_full,
         )
     elif loss_type == "csd":
         result = _csd_loss(

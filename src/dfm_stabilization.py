@@ -117,9 +117,14 @@ def psd_multiplier_bucket_stats(
         ("psd_effective_multiplier_s_0_75_1", s >= 0.75),
     )
     valid = valid_sample.bool()
-    zero = multiplier.detach().sum() * 0.0
+    empty = multiplier.detach().new_tensor(float("nan"))
+
     return {
-        name: multiplier[valid & mask].mean().detach() if (valid & mask).any() else zero
+        name: (
+            multiplier[valid & mask].mean().detach()
+            if (valid & mask).any()
+            else empty
+        )
         for name, mask in buckets
     }
 

@@ -94,6 +94,9 @@ DFM_RECIPE_SUMMARY_KEYS = (
     "gradient_surgery_cosine",
     "gradient_surgery_conflict_fraction",
     "gradient_surgery_removed_fraction",
+    "psd_loss_height",
+    "psd_loss_width",
+    "psd_loss_resolution_is_full",
 )
 
 CONSISTENCY_SUMMARY_KEYS = {

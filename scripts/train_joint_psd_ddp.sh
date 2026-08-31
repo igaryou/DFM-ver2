@@ -58,6 +58,13 @@ uv run torchrun \
   --config configs/joint_psd_cityscapes_swin_t.yaml
 
 
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+CUDA_VISIBLE_DEVICES=2,3 \
+uv run torchrun \
+  --standalone \
+  --nproc_per_node=2 \
+  src/train_joint.py \
+  --config configs/joint_psd_cityscapes_swin_t_dfm_recipe.yaml
 
 
 
@@ -86,8 +93,8 @@ python scripts/diagnose_psd_gradient_conflict.py \
 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
 CUDA_VISIBLE_DEVICES=2 \
 python scripts/diagnose_psd_time_maps.py \
-  --config /home/igarashi_25/DFM/results/joint_psd_cityscapes_swin_t__160k/config_resolved.yaml \
-  --checkpoint /rda5/users/igarashi_25/DFM/results/joint_psd_cityscapes_swin_t__160k/step_128000.pt \
+  --config /home/igarashi_25/DFM/results/joint_psd_cityscapes_swin_t_adaptive_surgery_resume_160k/config_resolved.yaml \
+  --checkpoint /home/igarashi_25/DFM/results/joint_psd_cityscapes_swin_t_adaptive_surgery_resume_160k/step_112000.pt \
   --batch-size 8 \
   --time-bin-batches 8 \
   --eval-batch-size 8 \

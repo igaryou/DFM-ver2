@@ -2,7 +2,7 @@ extends: joint_psd_cityscapes_swin_t.yaml
 
 experiment:
   name: dfm_joint_psd_cityscapes_swin_t_dfm_recipe_160k
-  output_dir: /rda5/users/igarashi_25/DFM/results/joint_psd_cityscapes_swin_t_dfm_recipe_160k
+  output_dir: /rda5/users/igarashi_25/DFM/results/joint_psd_cityscapes_swin_t_adaptive_surgery_resume_160k
 
 loss:
   primary:
@@ -11,7 +11,7 @@ loss:
       r: 0.5
       c: 0.01
   consistency:
-    weight: 1.0
+    weight: 0.5
     max_weight: 1.0
     gradient_surgery:
       enabled: true
@@ -19,13 +19,13 @@ loss:
       scope: endpoint_model
       eps: 1.0e-12
     learnable_weight:
-      enabled: true
+      enabled: false
       dependency: s
       type: uncertainty
       time_embedding_dim: 32
-      hidden_dim: 64
+      hidden_dim: 128
       init_effective_weight: 0.5
 
 checkpoint:
-  resume: /rda5/users/igarashi_25/DFM/results/joint_psd_cityscapes_swin_t__160k/step_096000.pt
+  resume: /home/igarashi_25/DFM/results/joint_psd_cityscapes_swin_t__160k/step_096000.pt
   init_from: null

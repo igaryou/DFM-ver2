@@ -214,7 +214,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
                 "numerical_dtype": "fp32",
                 "debug_assertions": False,
             },
-            "psd": {},
+            "psd": {"loss_resolution": "state"},
             "gradient_surgery": {
                 "enabled": False,
                 "priority": "diagonal",
@@ -660,6 +660,10 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
     if precision["numerical_dtype"] != "fp32":
         raise ValueError("loss.consistency.precision.numerical_dtype must be fp32")
     if consistency["type"] == "psd":
+        if consistency["psd"]["loss_resolution"] not in {"state", "full"}:
+            raise ValueError(
+                "loss.consistency.psd.loss_resolution must be 'state' or 'full'"
+            )
         if precision["jvp_dtype"] is not None:
             raise ValueError("PSD does not use JVP; precision.jvp_dtype must be null")
     elif precision["jvp_dtype"] not in {"bf16", "fp32"}:

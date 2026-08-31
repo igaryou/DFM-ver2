@@ -239,6 +239,8 @@ def build_diagnostic_graph(
         precision=config["loss"]["consistency"]["precision"],
         config=config,
         valid_mask=targets.valid_mask_state,
+        full_resolution_size=tuple(targets.target_full.shape[-2:]),
+        valid_mask_full=targets.valid_mask_full,
     )
     if consistency.teacher_prob is None or consistency.student_prob is None:
         raise RuntimeError("PSD diagnostic requires teacher and student probabilities")

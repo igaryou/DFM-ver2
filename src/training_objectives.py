@@ -189,6 +189,8 @@ def compute_model_training_objectives(
             precision=consistency_config["precision"],
             config=config,
             valid_mask=targets.valid_mask_state,
+            full_resolution_size=tuple(targets.target_full.shape[-2:]),
+            valid_mask_full=targets.valid_mask_full,
         )
         consistency_loss = consistency_result.loss
     else:
