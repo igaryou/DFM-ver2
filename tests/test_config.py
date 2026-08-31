@@ -1,3 +1,4 @@
+from copy import deepcopy
 from pathlib import Path
 
 import pytest
@@ -177,8 +178,34 @@ def test_gradient_surgery_accepts_accumulation_two_and_full_recipe_loads():
     config = load_config(path)
     assert config["training"]["batch_size"] == 8
     assert config["training"]["grad_accum_steps"] == 2
+    assert config["training"]["max_batches_per_epoch"] == 370
     assert config["loss"]["consistency"]["gradient_surgery"]["enabled"] is True
     assert config["loss"]["consistency"]["psd"]["loss_resolution"] == "full"
+    assert config["training"]["batch_size"] * config["training"]["grad_accum_steps"] == 16
+    assert config["training"]["max_batches_per_epoch"] // config["training"]["grad_accum_steps"] == 185
+    assert config["training"]["max_batches_per_epoch"] * config["training"]["batch_size"] == 2960
+    assert 185 * 16 == 2960
+
+
+def test_accum2_full_psd_recipe_differs_from_parent_only_as_intended():
+    root = Path(__file__).parents[1]
+    parent = load_config(
+        root / "configs" / "joint_psd_cityscapes_swin_t_adaptive_surgery_fullres_psd.yaml"
+    )
+    accumulated = load_config(
+        root / "configs"
+        / "joint_psd_cityscapes_swin_t_adaptive_surgery_fullres_psd_accum2.yaml"
+    )
+    normalized = deepcopy(accumulated)
+    normalized["experiment"]["name"] = parent["experiment"]["name"]
+    normalized["experiment"]["output_dir"] = parent["experiment"]["output_dir"]
+    normalized["training"]["batch_size"] = parent["training"]["batch_size"]
+    normalized["training"]["grad_accum_steps"] = parent["training"]["grad_accum_steps"]
+    normalized["training"]["max_batches_per_epoch"] = parent["training"]["max_batches_per_epoch"]
+    normalized["wandb"]["name"] = parent["wandb"]["name"]
+    # The loader records the source filename; it is metadata, not an experiment setting.
+    normalized["runtime"]["config_path"] = parent["runtime"]["config_path"]
+    assert normalized == parent
 
 
 def test_missing_required_section_has_clear_error(tmp_path):
