@@ -1,0 +1,14 @@
+extends: joint_esd_cityscapes_swin_t_dfm_recipe_resume.yaml
+
+experiment:
+  name: dfm_joint_esd_cityscapes_swin_t_core_resume_160k
+  output_dir: /rda5/users/igarashi_25/DFM/results/joint_esd_cityscapes_swin_t_core_resume_160k
+
+loss:
+  consistency:
+    learnable_weight:
+      enabled: false
+
+wandb:
+  name: dfm-joint-esd-cityscapes-swin-t-core-resume-160k
+  tags: [cityscapes, swin-t, joint, esd, core, adaptive-diagonal, adaptive-kl, resume-96k]

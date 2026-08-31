@@ -635,14 +635,23 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
     if surgery["enabled"] and training["grad_accum_steps"] != 1:
         raise ValueError("gradient surgery requires training.grad_accum_steps=1")
     learnable = consistency["learnable_weight"]
-    if learnable["dependency"] != "s" or learnable["type"] != "uncertainty":
-        raise ValueError("learnable PSD weighting supports s/uncertainty only")
+    if learnable["type"] != "uncertainty":
+        raise ValueError("learnable consistency weighting supports uncertainty only")
     if learnable["time_embedding_dim"] <= 0 or learnable["hidden_dim"] <= 0:
-        raise ValueError("learnable PSD weight dimensions must be positive")
+        raise ValueError("learnable consistency weight dimensions must be positive")
     if learnable["init_effective_weight"] <= 0:
-        raise ValueError("learnable PSD initial effective weight must be positive")
-    if (surgery["enabled"] or learnable["enabled"]) and consistency["type"] != "psd":
-        raise ValueError("gradient surgery and learnable weighting currently require PSD")
+        raise ValueError("learnable consistency initial effective weight must be positive")
+    if surgery["enabled"] and consistency["type"] != "psd":
+        raise ValueError("gradient surgery is supported only for PSD")
+    if learnable["enabled"]:
+        expected_dependency = {"psd": "s", "esd": "st"}.get(consistency["type"])
+        if expected_dependency is None:
+            raise ValueError("learnable weighting is supported only for PSD and ESD")
+        if learnable["dependency"] != expected_dependency:
+            raise ValueError(
+                f"{consistency['type'].upper()} learnable weighting requires "
+                f"dependency={expected_dependency}"
+            )
     start = consistency["start"]
     if start["unit"] not in {"epoch", "optimizer_step"}:
         raise ValueError("loss.consistency.start.unit must be epoch or optimizer_step")

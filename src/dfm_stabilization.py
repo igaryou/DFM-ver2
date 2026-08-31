@@ -51,13 +51,47 @@ class PSDTimeWeightNetwork(nn.Module):
         return self.output(F.silu(self.hidden(self.embedding(s)))).squeeze(-1)
 
 
-def uncertainty_weighted_psd_loss(
+class ESDTimeWeightNetwork(nn.Module):
+    """Original-like reconstruction of the ESD w(s,t) network.
+
+    DFM specifies dependency on (s,t), but does not fully specify the weighting
+    network architecture.  This mirrors the existing PSD reconstruction with
+    two shared scalar embeddings and a small MLP.
+    """
+
+    def __init__(
+        self,
+        time_embedding_dim: int = 32,
+        hidden_dim: int = 64,
+        init_effective_weight: float = 1.0,
+    ) -> None:
+        super().__init__()
+        if time_embedding_dim <= 0 or hidden_dim <= 0:
+            raise ValueError("ESD weight embedding and hidden dimensions must be positive")
+        if not 0.0 < init_effective_weight:
+            raise ValueError("init_effective_weight must be positive")
+        self.embedding = SinusoidalScalarEmbedding(time_embedding_dim)
+        self.hidden = nn.Linear(2 * time_embedding_dim, hidden_dim)
+        self.output = nn.Linear(hidden_dim, 1)
+        nn.init.zeros_(self.output.weight)
+        nn.init.constant_(self.output.bias, -math.log(init_effective_weight))
+
+    def forward(self, s: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        if s.shape != t.shape:
+            raise ValueError("ESD weight times s and t must have matching [B] shapes")
+        embedding = torch.cat((self.embedding(s), self.embedding(t)), dim=1)
+        return self.output(F.silu(self.hidden(embedding))).squeeze(-1)
+
+
+def uncertainty_weighted_consistency_loss(
     loss_per_sample: torch.Tensor,
     valid_sample: torch.Tensor,
     weight_logit: torch.Tensor,
+    *,
+    metric_prefix: str,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     if loss_per_sample.shape != weight_logit.shape or valid_sample.shape != weight_logit.shape:
-        raise ValueError("sample PSD loss, validity, and w(s) must all have shape [B]")
+        raise ValueError("sample consistency loss, validity, and weight logit must have shape [B]")
     valid = valid_sample.to(dtype=torch.bool, device=weight_logit.device)
     multiplier = torch.exp(-weight_logit.float())
     weighted = multiplier * loss_per_sample.float()
@@ -88,20 +122,41 @@ def uncertainty_weighted_psd_loss(
         w_values = multipliers = None
     zero = objective.detach() * 0.0
     stats = {
-        "loss_psd_raw": raw.detach(),
-        "loss_psd_learnable": objective.detach(),
-        "loss_psd_uncertainty_weighted": learned.detach(),
-        "loss_psd_uncertainty_regularizer": regularizer.detach(),
-        "psd_weight_logit_mean": w_values.mean().detach() if w_values is not None else zero,
-        "psd_weight_logit_std": w_values.std(unbiased=False).detach() if w_values is not None else zero,
-        "psd_weight_logit_min": w_values.min().detach() if w_values is not None else zero,
-        "psd_weight_logit_max": w_values.max().detach() if w_values is not None else zero,
-        "psd_effective_multiplier_mean": multipliers.mean().detach() if multipliers is not None else zero,
-        "psd_effective_multiplier_std": multipliers.std(unbiased=False).detach() if multipliers is not None else zero,
-        "psd_effective_multiplier_min": multipliers.min().detach() if multipliers is not None else zero,
-        "psd_effective_multiplier_max": multipliers.max().detach() if multipliers is not None else zero,
+        f"loss_{metric_prefix}_raw": raw.detach(),
+        f"loss_{metric_prefix}_learnable": objective.detach(),
+        f"loss_{metric_prefix}_uncertainty_weighted": learned.detach(),
+        f"loss_{metric_prefix}_uncertainty_regularizer": regularizer.detach(),
+        f"{metric_prefix}_weight_logit_mean": w_values.mean().detach() if w_values is not None else zero,
+        f"{metric_prefix}_weight_logit_std": w_values.std(unbiased=False).detach() if w_values is not None else zero,
+        f"{metric_prefix}_weight_logit_min": w_values.min().detach() if w_values is not None else zero,
+        f"{metric_prefix}_weight_logit_max": w_values.max().detach() if w_values is not None else zero,
+        f"{metric_prefix}_effective_multiplier_mean": multipliers.mean().detach() if multipliers is not None else zero,
+        f"{metric_prefix}_effective_multiplier_std": multipliers.std(unbiased=False).detach() if multipliers is not None else zero,
+        f"{metric_prefix}_effective_multiplier_min": multipliers.min().detach() if multipliers is not None else zero,
+        f"{metric_prefix}_effective_multiplier_max": multipliers.max().detach() if multipliers is not None else zero,
     }
     return objective.float(), stats
+
+
+def uncertainty_weighted_psd_loss(
+    loss_per_sample: torch.Tensor,
+    valid_sample: torch.Tensor,
+    weight_logit: torch.Tensor,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Backward-compatible PSD wrapper around the generic uncertainty loss."""
+    return uncertainty_weighted_consistency_loss(
+        loss_per_sample, valid_sample, weight_logit, metric_prefix="psd"
+    )
+
+
+def uncertainty_weighted_esd_loss(
+    loss_per_sample: torch.Tensor,
+    valid_sample: torch.Tensor,
+    weight_logit: torch.Tensor,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    return uncertainty_weighted_consistency_loss(
+        loss_per_sample, valid_sample, weight_logit, metric_prefix="esd"
+    )
 
 
 def psd_multiplier_bucket_stats(
@@ -126,6 +181,47 @@ def psd_multiplier_bucket_stats(
             else empty
         )
         for name, mask in buckets
+    }
+
+
+def esd_multiplier_bucket_stats(
+    s: torch.Tensor,
+    t: torch.Tensor,
+    multiplier: torch.Tensor,
+    valid_sample: torch.Tensor,
+) -> dict[str, torch.Tensor]:
+    delta = t - s
+    bucket_specs = {
+        "s": (
+            ("0_0_1", s < 0.1),
+            ("0_1_0_25", (s >= 0.1) & (s < 0.25)),
+            ("0_25_0_5", (s >= 0.25) & (s < 0.5)),
+            ("0_5_0_75", (s >= 0.5) & (s < 0.75)),
+            ("0_75_1", s >= 0.75),
+        ),
+        "t": (
+            ("0_0_1", t < 0.1),
+            ("0_1_0_25", (t >= 0.1) & (t < 0.25)),
+            ("0_25_0_5", (t >= 0.25) & (t < 0.5)),
+            ("0_5_0_75", (t >= 0.5) & (t < 0.75)),
+            ("0_75_1", t >= 0.75),
+        ),
+        "delta": (
+            ("0_0_1", delta < 0.1),
+            ("0_1_0_25", (delta >= 0.1) & (delta < 0.25)),
+            ("0_25_0_5", (delta >= 0.25) & (delta < 0.5)),
+            ("0_5_1", delta >= 0.5),
+        ),
+    }
+    valid = valid_sample.bool()
+    empty = multiplier.detach().new_tensor(float("nan"))
+    return {
+        f"esd_effective_multiplier_{axis}_{suffix}": (
+            multiplier[valid & mask].mean().detach()
+            if (valid & mask).any() else empty
+        )
+        for axis, specs in bucket_specs.items()
+        for suffix, mask in specs
     }
 
 

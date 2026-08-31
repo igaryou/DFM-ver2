@@ -77,12 +77,17 @@ MIN_REDUCTION_KEYS = {
     "diagonal_adaptive_weight_min",
     "psd_weight_logit_min",
     "psd_effective_multiplier_min",
+    "esd_adaptive_weight_min",
+    "esd_weight_logit_min",
+    "esd_effective_multiplier_min",
 }
 
 MAX_REDUCTION_KEYS.update({
     "diagonal_adaptive_weight_max",
     "psd_weight_logit_max",
     "psd_effective_multiplier_max",
+    "esd_weight_logit_max",
+    "esd_effective_multiplier_max",
 })
 
 DFM_RECIPE_SUMMARY_KEYS = (
@@ -97,6 +102,45 @@ DFM_RECIPE_SUMMARY_KEYS = (
     "psd_loss_height",
     "psd_loss_width",
     "psd_loss_resolution_is_full",
+    "loss_esd_raw_kl",
+    "loss_esd_adaptive_kl",
+    "esd_log_arg_min",
+    "esd_log_arg_mean",
+    "esd_nonfinite_ratio",
+    "esd_valid_pixel_ratio",
+    "esd_adaptive_weight_mean",
+    "esd_adaptive_weight_std",
+    "esd_adaptive_weight_min",
+    "esd_adaptive_weight_max",
+    "esd_mismatch_l2_sq_mean",
+    "esd_weight_logit_mean",
+    "esd_weight_logit_std",
+    "esd_weight_logit_min",
+    "esd_weight_logit_max",
+    "esd_effective_multiplier_mean",
+    "esd_effective_multiplier_std",
+    "esd_effective_multiplier_min",
+    "esd_effective_multiplier_max",
+    "loss_esd_raw",
+    "loss_esd_learnable",
+    "loss_esd_uncertainty_weighted",
+    "loss_esd_uncertainty_regularizer",
+    "esd_jvp_output_abs_mean",
+    "esd_jvp_output_abs_max",
+    "esd_effective_multiplier_s_0_0_1",
+    "esd_effective_multiplier_s_0_1_0_25",
+    "esd_effective_multiplier_s_0_25_0_5",
+    "esd_effective_multiplier_s_0_5_0_75",
+    "esd_effective_multiplier_s_0_75_1",
+    "esd_effective_multiplier_t_0_0_1",
+    "esd_effective_multiplier_t_0_1_0_25",
+    "esd_effective_multiplier_t_0_25_0_5",
+    "esd_effective_multiplier_t_0_5_0_75",
+    "esd_effective_multiplier_t_0_75_1",
+    "esd_effective_multiplier_delta_0_0_1",
+    "esd_effective_multiplier_delta_0_1_0_25",
+    "esd_effective_multiplier_delta_0_25_0_5",
+    "esd_effective_multiplier_delta_0_5_1",
 )
 
 CONSISTENCY_SUMMARY_KEYS = {
@@ -255,6 +299,7 @@ def _build_epoch_report(
     max_peak_reserved_mb: float,
     epoch_lr: float,
     epoch_source_lr: float | None,
+    epoch_consistency_weight_lr: float | None = None,
 ) -> dict[str, float | int | str]:
     required = (
         "loss_total",
@@ -319,6 +364,8 @@ def _build_epoch_report(
     })
     if epoch_source_lr is not None:
         report["source_lr"] = epoch_source_lr
+    if epoch_consistency_weight_lr is not None:
+        report["consistency_weight_lr"] = epoch_consistency_weight_lr
     for key in CONSISTENCY_SUMMARY_KEYS.get(consistency_type, ()):
         if key in reduced_epoch:
             report[key] = float(reduced_epoch[key])
@@ -356,7 +403,7 @@ def _format_epoch_summary(
             rendered = value
         elif key in integer_keys:
             rendered = str(int(value))
-        elif key in {"lr", "source_lr"}:
+        elif key in {"lr", "source_lr", "consistency_weight_lr"}:
             rendered = f"{float(value):.8e}"
         elif key in memory_keys:
             rendered = f"{float(value):.1f}"
@@ -381,6 +428,7 @@ def _wandb_epoch_payload(
         "weighted_align": "weighted_align",
         "lr": "lr",
         "source_lr": "source_lr",
+        "consistency_weight_lr": "consistency_weight_lr",
         "images_per_second": "images_per_second",
         "optimizer_updates_per_second": "optimizer_updates_per_second",
         "grad_norm": "grad_norm",
@@ -455,16 +503,17 @@ def build_optimizer(config: dict, adapter: DDPCompatibleTrainingModel):
                 "lr": source_lr,
                 "name": "source",
             })
-    if adapter.psd_weight_model is not None:
-        psd_group = config["loss"]["consistency"]["learnable_weight"]
+    if adapter.consistency_weight_model is not None:
+        weight_group = config["loss"]["consistency"]["learnable_weight"]
+        consistency_type = config["loss"]["consistency"]["type"]
         groups.append({
             "params": [
-                parameter for parameter in adapter.psd_weight_model.parameters()
+                parameter for parameter in adapter.consistency_weight_model.parameters()
                 if parameter.requires_grad
             ],
-            "lr": psd_group["lr"] or model_lr,
-            "weight_decay": psd_group["weight_decay"],
-            "name": "psd_weight",
+            "lr": weight_group["lr"] or model_lr,
+            "weight_decay": weight_group["weight_decay"],
+            "name": "psd_weight" if consistency_type == "psd" else "esd_weight",
         })
     optimizer_class = {
         "adam": torch.optim.Adam,
@@ -811,7 +860,7 @@ def _save_training_checkpoint(
             micro_step=micro_step,
             model=adapter.endpoint_model,
             source_model=adapter.source_model,
-            psd_weight_model=adapter.psd_weight_model,
+            consistency_weight_model=adapter.consistency_weight_model,
             optimizer=optimizer,
             scheduler=scheduler,
             scaler=scaler,
@@ -924,7 +973,7 @@ def run_training(config: dict, *, joint_entrypoint: bool = False) -> dict:
         state = initialize_or_resume(
             config, endpoint, source, optimizer, scheduler, scaler,
             logger if context.is_main_process else None,
-            psd_weight_model=adapter.psd_weight_model,
+            consistency_weight_model=adapter.consistency_weight_model,
         )
         training_model = wrap_ddp(adapter, context, config)
         # Model initialization/checkpoint loading used the same seed. From here on,
@@ -1036,6 +1085,13 @@ def run_training(config: dict, *, joint_entrypoint: bool = False) -> dict:
             )
             epoch_lr = float(optimizer.param_groups[0]["lr"])
             epoch_source_lr = _parameter_group_lr(optimizer, "source")
+            epoch_consistency_weight_lr = _parameter_group_lr(
+                optimizer, "psd_weight"
+            )
+            if epoch_consistency_weight_lr is None:
+                epoch_consistency_weight_lr = _parameter_group_lr(
+                    optimizer, "esd_weight"
+                )
             epoch_total_iterations = _epoch_total_iterations(
                 len(train_loader),
                 max_iterations,
@@ -1230,6 +1286,7 @@ def run_training(config: dict, *, joint_entrypoint: bool = False) -> dict:
                 max_peak_reserved_mb=max_peak_reserved_mb,
                 epoch_lr=epoch_lr,
                 epoch_source_lr=epoch_source_lr,
+                epoch_consistency_weight_lr=epoch_consistency_weight_lr,
             )
             raw_epoch_metrics = {
                 key: float(value) for key, value in reduced_epoch.items()

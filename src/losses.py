@@ -48,6 +48,8 @@ class ESDResult:
     adaptive_weight: torch.Tensor
     directional_logits: torch.Tensor
     dtypes: dict[str, torch.dtype] = field(default_factory=dict)
+    loss_per_sample: torch.Tensor | None = None
+    valid_sample: torch.Tensor | None = None
 
 
 def masked_mean(loss_map: torch.Tensor, valid_mask: torch.Tensor | None) -> torch.Tensor:
@@ -669,20 +671,36 @@ def _esd_loss(
                 skip_batch_threshold if skip_batch_threshold is not None else 0.0
             )
         )
+        reduction_mask = (
+            valid_pixel if invalid_strategy == "mask_pixel"
+            else semantic_valid_pixel
+        )
+        valid_count = reduction_mask.flatten(1).sum(dim=1)
+        loss_per_sample = (
+            (loss_map * reduction_mask.to(loss_map.dtype)).flatten(1).sum(dim=1)
+            / valid_count.clamp_min(1).to(loss_map.dtype)
+        ).float()
+        valid_sample = valid_count > 0
         if skip_for_threshold or skip_for_strategy:
             loss = zero_with_graph
-        elif invalid_strategy == "mask_pixel":
-            loss = masked_mean(loss_map, valid_pixel)
+            loss_per_sample = loss_per_sample * 0.0
+            valid_sample = torch.zeros_like(valid_sample)
         else:
-            loss = masked_mean(loss_map, semantic_valid_pixel)
+            loss = masked_mean(loss_map, reduction_mask)
         loss = loss.float()
         entropy = -(
             teacher_probability
             * teacher_probability.clamp_min(1.0e-12).log()
         ).sum(dim=1)
+        valid_adaptive = adaptive_weight[reduction_mask]
+        valid_mismatch = mismatch.detach()[reduction_mask]
+        raw_kl = masked_mean(kl_per_pixel, reduction_mask).float()
+        zero_stat = loss.detach() * 0.0
         stats = {
             "loss_consistency": loss,
             "loss_esd": loss,
+            "loss_esd_raw_kl": raw_kl,
+            "loss_esd_adaptive_kl": loss,
             "esd_log_arg_min": torch.nan_to_num(
                 log_arg_raw.detach(), nan=0.0,
                 posinf=torch.finfo(torch.float32).max,
@@ -702,8 +720,21 @@ def _esd_loss(
             "esd_delta_abs_mean": delta.detach().abs().mean(),
             "esd_delta_abs_max": delta.detach().abs().max(),
             "esd_valid_pixel_ratio": valid_pixel.float().mean(),
-            "esd_adaptive_weight_mean": adaptive_weight.mean(),
-            "esd_adaptive_weight_max": adaptive_weight.max(),
+            "esd_adaptive_weight_mean": (
+                valid_adaptive.mean() if valid_adaptive.numel() else zero_stat
+            ),
+            "esd_adaptive_weight_std": (
+                valid_adaptive.std(unbiased=False) if valid_adaptive.numel() else zero_stat
+            ),
+            "esd_adaptive_weight_min": (
+                valid_adaptive.min() if valid_adaptive.numel() else zero_stat
+            ),
+            "esd_adaptive_weight_max": (
+                valid_adaptive.max() if valid_adaptive.numel() else zero_stat
+            ),
+            "esd_mismatch_l2_sq_mean": (
+                valid_mismatch.mean() if valid_mismatch.numel() else zero_stat
+            ),
             "esd_skipped_batch": loss.new_tensor(
                 float(skip_for_threshold or skip_for_strategy)
             ),
@@ -729,6 +760,8 @@ def _esd_loss(
         valid_pixel=valid_pixel.detach(),
         adaptive_weight=adaptive_weight,
         directional_output=directional,
+        loss_per_sample=loss_per_sample,
+        valid_sample=valid_sample,
         dtypes={
             "student_logits_before_cast": logits_before.dtype,
             "directional_logits_before_cast": directional_before.dtype,
@@ -895,6 +928,8 @@ def esd_loss(
         adaptive_weight=result.adaptive_weight,
         directional_logits=result.directional_output,
         dtypes=result.dtypes,
+        loss_per_sample=result.loss_per_sample,
+        valid_sample=result.valid_sample,
     )
 
 

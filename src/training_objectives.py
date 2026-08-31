@@ -7,8 +7,11 @@ import torch.nn as nn
 
 import losses
 from dfm_stabilization import (
+    ESDTimeWeightNetwork,
     PSDTimeWeightNetwork,
+    esd_multiplier_bucket_stats,
     psd_multiplier_bucket_stats,
+    uncertainty_weighted_esd_loss,
     uncertainty_weighted_psd_loss,
 )
 from discrete_flow_maps import (
@@ -199,33 +202,46 @@ def compute_model_training_objectives(
 
     learnable_config = consistency_config.get("learnable_weight", {"enabled": False})
     learnable_stats = {}
-    if (
-        consistency_result is not None
-        and learnable_config["enabled"]
-        and consistency_config["type"] == "psd"
-    ):
+    if consistency_result is not None and learnable_config["enabled"]:
         if consistency_result.loss_per_sample is None or consistency_result.valid_sample is None:
-            raise RuntimeError("PSD learnable weighting requires sample-wise PSD losses")
-        weight_logit = adapter.psd_weight_model(consistency_s)
-        consistency_loss, learnable_stats = uncertainty_weighted_psd_loss(
-            consistency_result.loss_per_sample,
-            consistency_result.valid_sample,
-            weight_logit,
-        )
-        learnable_stats.update(psd_multiplier_bucket_stats(
-            consistency_s.detach(), torch.exp(-weight_logit.detach().float()),
-            consistency_result.valid_sample,
-        ))
+            raise RuntimeError("learnable weighting requires sample-wise consistency losses")
+        if consistency_config["type"] == "psd":
+            weight_logit = adapter.consistency_weight_model(consistency_s)
+            consistency_loss, learnable_stats = uncertainty_weighted_psd_loss(
+                consistency_result.loss_per_sample,
+                consistency_result.valid_sample,
+                weight_logit,
+            )
+            learnable_stats.update(psd_multiplier_bucket_stats(
+                consistency_s.detach(), torch.exp(-weight_logit.detach().float()),
+                consistency_result.valid_sample,
+            ))
+        elif consistency_config["type"] == "esd":
+            weight_logit = adapter.consistency_weight_model(
+                consistency_s, consistency_t
+            )
+            consistency_loss, learnable_stats = uncertainty_weighted_esd_loss(
+                consistency_result.loss_per_sample,
+                consistency_result.valid_sample,
+                weight_logit,
+            )
+            learnable_stats.update(esd_multiplier_bucket_stats(
+                consistency_s.detach(), consistency_t.detach(),
+                torch.exp(-weight_logit.detach().float()),
+                consistency_result.valid_sample,
+            ))
+        else:  # Config validation rejects this before training.
+            raise RuntimeError("learnable weighting supports PSD and ESD only")
     primary_objective = (
         config["loss"]["primary"]["weight"] * diagonal_loss
     ).float()
     psd_objective = (effective_weight * consistency_loss).float()
-    if adapter.psd_weight_model is not None and consistency_result is None:
+    if adapter.consistency_weight_model is not None and consistency_result is None:
         # Keep every DDP-managed weight-network parameter in the graph before
-        # the PSD schedule opens, while producing exactly zero gradients.
+        # the consistency schedule opens, while producing exactly zero gradients.
         psd_objective = psd_objective + sum(
             (parameter.float().sum() * 0.0)
-            for parameter in adapter.psd_weight_model.parameters()
+            for parameter in adapter.consistency_weight_model.parameters()
         )
     source_objective = (
         source_stats["weighted_var"]
@@ -319,14 +335,26 @@ class DDPCompatibleTrainingModel(nn.Module):
         learnable = config["loss"]["consistency"].get(
             "learnable_weight", {"enabled": False}
         )
-        self.psd_weight_model = (
-            PSDTimeWeightNetwork(
+        consistency_type = config["loss"]["consistency"]["type"]
+        if learnable["enabled"] and consistency_type == "psd":
+            self.consistency_weight_model = PSDTimeWeightNetwork(
                 time_embedding_dim=learnable["time_embedding_dim"],
                 hidden_dim=learnable["hidden_dim"],
                 init_effective_weight=learnable["init_effective_weight"],
             )
-            if learnable["enabled"] else None
-        )
+        elif learnable["enabled"] and consistency_type == "esd":
+            self.consistency_weight_model = ESDTimeWeightNetwork(
+                time_embedding_dim=learnable["time_embedding_dim"],
+                hidden_dim=learnable["hidden_dim"],
+                init_effective_weight=learnable["init_effective_weight"],
+            )
+        else:
+            self.consistency_weight_model = None
+
+    @property
+    def psd_weight_model(self):
+        """Backward-compatible alias used by existing PSD surgery/tests."""
+        return self.consistency_weight_model
 
     def forward(self, *, operation: str, **kwargs):
         return compute_model_training_objectives(

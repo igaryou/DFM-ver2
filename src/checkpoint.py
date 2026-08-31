@@ -64,6 +64,7 @@ def checkpoint_payload(
     distributed: dict | None = None,
     micro_step: int = 0,
     psd_weight_model=None,
+    consistency_weight_model=None,
 ) -> dict:
     raw_model = model
     while isinstance(raw_model, DistributedDataParallel):
@@ -98,7 +99,12 @@ def checkpoint_payload(
             "local_batch_size": config["training"]["batch_size"],
         }),
     }
-    if psd_weight_model is not None:
+    if consistency_weight_model is not None:
+        payload["consistency_weight_model"] = consistency_weight_model.state_dict()
+        if config["loss"]["consistency"]["type"] == "psd":
+            # Keep emitting the legacy key so older PSD-only readers still work.
+            payload["psd_weight_model"] = consistency_weight_model.state_dict()
+    elif psd_weight_model is not None:
         payload["psd_weight_model"] = psd_weight_model.state_dict()
     return payload
 
@@ -357,6 +363,7 @@ def initialize_or_resume(
     scaler,
     logger=None,
     psd_weight_model=None,
+    consistency_weight_model=None,
 ) -> TrainingState:
     checkpoint_config = config["checkpoint"]
     init_from = checkpoint_config["init_from"]
@@ -423,22 +430,36 @@ def initialize_or_resume(
                 _without_module_prefix(checkpoint["source_model"]), source_model
             )
             source_model.load_state_dict(source_state, strict=strict)
-        saved_psd_weight = checkpoint.get("psd_weight_model")
-        if psd_weight_model is not None:
-            if saved_psd_weight is None:
+        weight_model = (
+            consistency_weight_model
+            if consistency_weight_model is not None else psd_weight_model
+        )
+        saved_weight = checkpoint.get(
+            "consistency_weight_model", checkpoint.get("psd_weight_model")
+        )
+        consistency_type = config["loss"]["consistency"]["type"]
+        if weight_model is not None:
+            if saved_weight is None:
                 if logger is not None:
-                    logger.info(
-                        "Initializing new PSDTimeWeightNetwork because checkpoint "
-                        "predates learnable PSD weighting."
-                    )
+                    if consistency_type == "psd":
+                        logger.info(
+                            "Initializing new PSDTimeWeightNetwork because checkpoint "
+                            "predates learnable PSD weighting."
+                        )
+                    else:
+                        logger.info(
+                            "Initializing new %s learnable weight network because "
+                            "the checkpoint predates that network.",
+                            consistency_type.upper(),
+                        )
             else:
-                psd_weight_model.load_state_dict(
-                    _without_module_prefix(saved_psd_weight), strict=True
+                weight_model.load_state_dict(
+                    _without_module_prefix(saved_weight), strict=True
                 )
-        elif saved_psd_weight is not None:
+        elif saved_weight is not None:
             raise RuntimeError(
-                "Resume checkpoint contains a PSD weight network, but the current "
-                "configuration disables learnable PSD weighting"
+                "Resume checkpoint contains a consistency weight network, but "
+                "the current configuration disables learnable weighting"
             )
         # A resume is deliberately a complete continuation. The load_* fields are
         # relevant to legacy/import workflows, but may not weaken resume semantics.
@@ -449,22 +470,27 @@ def initialize_or_resume(
         if len(saved_optimizer["param_groups"]) == len(current_optimizer["param_groups"]):
             optimizer.load_state_dict(saved_optimizer)
             scheduler.load_state_dict(checkpoint["scheduler"])
-        elif psd_weight_model is not None and saved_psd_weight is None:
-            _load_optimizer_with_new_psd_group(
+        elif weight_model is not None and saved_weight is None:
+            weight_group_name = (
+                "psd_weight" if consistency_type == "psd" else "esd_weight"
+            )
+            _load_optimizer_with_new_weight_group(
                 optimizer,
                 saved_optimizer,
+                weight_group_name=weight_group_name,
                 model=model,
                 source_model=source_model,
                 saved_model_state=_without_module_prefix(checkpoint["model"]),
                 saved_source_state=_without_module_prefix(checkpoint["source_model"]),
             )
-            _load_scheduler_with_new_psd_group(
+            _load_scheduler_with_new_weight_group(
                 scheduler, checkpoint["scheduler"], optimizer
             )
             if logger is not None:
                 logger.info(
                     "Restored existing optimizer/scheduler state and initialized "
-                    "the new psd_weight parameter group with fresh optimizer state."
+                    "the new %s parameter group with fresh optimizer state.",
+                    weight_group_name,
                 )
         else:
             raise RuntimeError(
@@ -535,16 +561,17 @@ def _saved_parameter_names(
     return names
 
 
-def _load_optimizer_with_new_psd_group(
+def _load_optimizer_with_new_weight_group(
     optimizer,
     saved_state: dict,
     *,
+    weight_group_name: str,
     model,
     source_model,
     saved_model_state: dict,
     saved_source_state: dict,
 ) -> None:
-    """Restore old named groups exactly while leaving psd_weight state fresh."""
+    """Restore old named groups while leaving the new weight group fresh."""
     current = optimizer.state_dict()
     merged = copy.deepcopy(current)
     merged["state"] = {}
@@ -556,7 +583,7 @@ def _load_optimizer_with_new_psd_group(
     }
     for group_index, current_group in enumerate(merged["param_groups"]):
         name = current_group.get("name")
-        if name == "psd_weight":
+        if name == weight_group_name:
             continue
         saved_group = _group_by_name(saved_groups, name)
         if saved_group is None or len(saved_group["params"]) != len(current_group["params"]):
@@ -611,17 +638,19 @@ def _load_optimizer_with_new_psd_group(
             if saved_id in saved_state["state"]:
                 merged["state"][current_id] = copy.deepcopy(saved_state["state"][saved_id])
     model_group = _group_by_name(merged["param_groups"], "model")
-    psd_group = _group_by_name(merged["param_groups"], "psd_weight")
-    if model_group is None or psd_group is None:
-        raise RuntimeError("Optimizer migration requires model and psd_weight groups")
+    weight_group = _group_by_name(merged["param_groups"], weight_group_name)
+    if model_group is None or weight_group is None:
+        raise RuntimeError(
+            f"Optimizer migration requires model and {weight_group_name} groups"
+        )
     model_initial = float(model_group.get("initial_lr", model_group["lr"]))
     schedule_factor = float(model_group["lr"]) / max(model_initial, 1.0e-30)
-    psd_initial = float(psd_group.get("initial_lr", psd_group["lr"]))
-    psd_group["lr"] = psd_initial * schedule_factor
+    weight_initial = float(weight_group.get("initial_lr", weight_group["lr"]))
+    weight_group["lr"] = weight_initial * schedule_factor
     optimizer.load_state_dict(merged)
 
 
-def _load_scheduler_with_new_psd_group(scheduler, saved_state: dict, optimizer) -> None:
+def _load_scheduler_with_new_weight_group(scheduler, saved_state: dict, optimizer) -> None:
     current = scheduler.state_dict()
     migrated = copy.deepcopy(saved_state)
     old_count = len(saved_state.get("base_lrs", []))
@@ -638,3 +667,15 @@ def _load_scheduler_with_new_psd_group(scheduler, saved_state: dict, optimizer) 
     if "_last_lr" in migrated and len(migrated["_last_lr"]) == new_count:
         migrated["_last_lr"][-1] = optimizer.param_groups[-1]["lr"]
     scheduler.load_state_dict(migrated)
+
+
+def _load_optimizer_with_new_psd_group(optimizer, saved_state: dict, **kwargs) -> None:
+    """Backward-compatible private wrapper."""
+    _load_optimizer_with_new_weight_group(
+        optimizer, saved_state, weight_group_name="psd_weight", **kwargs
+    )
+
+
+def _load_scheduler_with_new_psd_group(scheduler, saved_state: dict, optimizer) -> None:
+    """Backward-compatible private wrapper."""
+    _load_scheduler_with_new_weight_group(scheduler, saved_state, optimizer)

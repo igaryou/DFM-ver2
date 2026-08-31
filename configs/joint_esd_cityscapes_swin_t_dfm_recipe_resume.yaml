@@ -1,0 +1,60 @@
+extends: joint_psd_cityscapes_swin_t.yaml
+
+experiment:
+  name: dfm_joint_esd_cityscapes_swin_t_dfm_recipe_resume_160k
+  output_dir: /rda5/users/igarashi_25/DFM/results/joint_esd_cityscapes_swin_t_dfm_recipe_resume_160k
+
+loss:
+  primary:
+    adaptive_weighting:
+      enabled: true
+      r: 0.5
+      c: 0.01
+  consistency:
+    enabled: true
+    type: esd
+    weight: 1.0
+    max_weight: 1.0
+    start:
+      unit: optimizer_step
+      value: 96000
+    warmup_steps: 0
+    precision:
+      jvp_dtype: bf16
+      numerical_dtype: fp32
+      debug_assertions: false
+    gradient_surgery:
+      enabled: false
+    adaptive_kl:
+      enabled: true
+      c: 1.0e-6
+      r: 0.5
+      normalize_mean: false
+      max_weight: null
+    invalid_teacher:
+      strategy: mask_pixel
+      log_eps: 1.0e-6
+      skip_batch_threshold: null
+    esd:
+      formulation: stabilized_logit_space
+      source: discrete_flow_maps
+      additional_numerical_safeguards: true
+    learnable_weight:
+      enabled: true
+      dependency: st
+      type: uncertainty
+      time_embedding_dim: 32
+      # Reconstruction choices: DFM specifies w(s,t), not this exact MLP size
+      # or initialization.
+      hidden_dim: 64
+      init_effective_weight: 1.0
+      lr: null
+      weight_decay: 0.0
+
+checkpoint:
+  resume: /home/igarashi_25/DFM/results/joint_psd_cityscapes_swin_t__160k/step_096000.pt
+  init_from: null
+
+wandb:
+  name: dfm-joint-esd-cityscapes-swin-t-dfm-recipe-resume-160k
+  tags: [cityscapes, swin-t, joint, esd, dfm-recipe, adaptive-diagonal, adaptive-kl, learnable-st-weight, resume-96k]
