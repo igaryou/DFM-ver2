@@ -5,7 +5,7 @@ cd /home/igarashi_25/DFM
 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
 CUDA_VISIBLE_DEVICES=0,1 \
 uv run torchrun --standalone --nproc_per_node=2 src/train_joint.py \
-  --config configs/joint_psd_cityscapes.yaml
+  --config configs/_base_/cityscapes/joint_psd_160k.yaml
 
 cd /home/igarashi_25/DFM
 
@@ -14,7 +14,7 @@ uv run torchrun \
   --standalone \
   --nproc_per_node=2 \
   src/train_joint.py \
-  --config configs/joint_psd_ade20k.yaml
+  --config configs/_base_/ade20k/joint_psd.yaml
 
 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
 CUDA_VISIBLE_DEVICES=1,2 \
@@ -22,7 +22,7 @@ python -m torch.distributed.run \
   --standalone \
   --nproc_per_node=2 \
   src/train_joint.py \
-  --config configs/joint_psd_ade20k_swin_t.yaml
+  --config configs/ade20k/psd/swin_t.yaml
 
 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
 CUDA_VISIBLE_DEVICES=2,3 \
@@ -30,13 +30,13 @@ uv run python -m torch.distributed.run \
   --standalone \
   --nproc_per_node=2 \
   src/train_joint.py \
-  --config configs/joint_psd_ade20k_swin_t.yaml
+  --config configs/ade20k/psd/swin_t.yaml
 
 
 
 CUDA_VISIBLE_DEVICES=0 PYTHONPATH=src \
 uv run python scripts/diagnose_source_ade20k.py \
-  --config configs/joint_psd_ade20k.yaml \
+  --config configs/_base_/ade20k/joint_psd.yaml \
   --checkpoint results/joint_psd_ade20k_ver2/latest.pt \
   --output_dir results/source_diagnostics_final \
   --sigma_values 1.0 0.75 0.5 0.25 0.1 0.0 \
@@ -55,7 +55,7 @@ uv run torchrun \
   --standalone \
   --nproc_per_node=2 \
   src/train_joint.py \
-  --config configs/joint_psd_cityscapes_swin_t.yaml
+  --config configs/cityscapes/psd/swin_t_linear_160k.yaml
 
 
 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
@@ -64,7 +64,7 @@ uv run torchrun \
   --standalone \
   --nproc_per_node=2 \
   src/train_joint.py \
-  --config configs/joint_psd_cityscapes_swin_t_dfm_recipe.yaml
+  --config configs/cityscapes/psd/swin_t_dfm_recipe.yaml
 
 
 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
@@ -73,12 +73,20 @@ uv run torchrun \
   --standalone \
   --nproc_per_node=2 \
   src/train_joint.py \
-  --config configs/joint_psd_cityscapes_swin_t_adaptive_surgery_fullres_psd.yaml
+  --config configs/cityscapes/psd/swin_t_adaptive_surgery_fullres.yaml
 
 
+cd /home/igarashi_25/DFM
 
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+CUDA_VISIBLE_DEVICES=2,3 \
+uv run torchrun \
+  --standalone \
+  --nproc_per_node=2 \
+  src/train_joint.py \
+  --config configs/cityscapes/psd/swin_t_adaptive_surgery_fullres_accum2.yaml
 
-/home/igarashi_25/DFM/configs/joint_psd_cityscapes_swin_t_adaptive_surgery_fullres_psd.yaml
+/home/igarashi_25/DFM/configs/cityscapes/psd/swin_t_adaptive_surgery_fullres.yaml
 
 
 
@@ -100,7 +108,7 @@ PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
 CUDA_VISIBLE_DEVICES=2 \
 python scripts/diagnose_psd_time_maps.py \
   --config /home/igarashi_25/DFM/results/joint_psd_cityscapes_swin_t_adaptive_surgery_resume_160k/config_resolved.yaml \
-  --checkpoint /home/igarashi_25/DFM/results/joint_psd_cityscapes_swin_t_adaptive_surgery_resume_160k/step_112000.pt \
+  --checkpoint /home/igarashi_25/DFM/results/joint_psd_cityscapes_swin_t_adaptive_surgery_resume_160k/step_128000.pt \
   --batch-size 8 \
   --time-bin-batches 8 \
   --eval-batch-size 8 \

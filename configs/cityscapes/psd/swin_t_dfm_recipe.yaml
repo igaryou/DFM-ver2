@@ -1,4 +1,4 @@
-extends: joint_psd_cityscapes_swin_t.yaml
+extends: ../../_base_/cityscapes/swin_t_160k.yaml
 
 experiment:
   name: dfm_joint_psd_cityscapes_swin_t_dfm_recipe_160k
@@ -7,14 +7,14 @@ experiment:
 loss:
   primary:
     adaptive_weighting:
-      enabled: true
+      enabled: false
       r: 0.5
       c: 0.01
   consistency:
     weight: 0.5
     max_weight: 1.0
     gradient_surgery:
-      enabled: true
+      enabled: false
       priority: diagonal
       scope: endpoint_model
       eps: 1.0e-12

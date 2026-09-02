@@ -12,11 +12,46 @@ def _time_view(time: torch.Tensor, ndim: int = 4) -> torch.Tensor:
     return time.reshape(time.shape[0], *([1] * (ndim - 1)))
 
 
-def linear_path(x0: torch.Tensor, x1: torch.Tensor, time: torch.Tensor) -> torch.Tensor:
+def _path_config(config: dict | None) -> dict:
+    if config is None:
+        return {"type": "power", "exponent": 1.0}
+    if "flow" in config:
+        config = config["flow"]
+    if "path" in config:
+        config = config["path"]
+    return config
+
+
+def path_coefficient(time: torch.Tensor, config: dict | None = None) -> torch.Tensor:
+    """Return alpha(t) while keeping raw model time inputs unchanged."""
+    path = _path_config(config)
+    path_type = path.get("type", "power")
+    if path_type != "power":
+        raise ValueError(f"Unknown flow path type: {path_type}")
+    return time.pow(float(path.get("exponent", 1.0)))
+
+
+def path_derivative(time: torch.Tensor, config: dict | None = None) -> torch.Tensor:
+    """Return d alpha(t) / dt for the configured path."""
+    path = _path_config(config)
+    path_type = path.get("type", "power")
+    if path_type != "power":
+        raise ValueError(f"Unknown flow path type: {path_type}")
+    exponent = float(path.get("exponent", 1.0))
+    return exponent * time.pow(exponent - 1.0)
+
+
+def linear_path(
+    x0: torch.Tensor,
+    x1: torch.Tensor,
+    time: torch.Tensor,
+    config: dict | None = None,
+) -> torch.Tensor:
+    """Backward-compatible name for the configurable interpolation path."""
     if x0.shape != x1.shape:
         raise ValueError("x0 and x1 must have the same shape")
-    time_view = _time_view(time, x0.ndim).to(dtype=x0.dtype)
-    return (1.0 - time_view) * x0 + time_view * x1
+    alpha = _time_view(path_coefficient(time, config), x0.ndim).to(dtype=x0.dtype)
+    return (1.0 - alpha) * x0 + alpha * x1
 
 
 def flow_map(
@@ -25,14 +60,19 @@ def flow_map(
     s: torch.Tensor,
     t: torch.Tensor,
     time_eps: float = 1.0e-5,
+    path_config: dict | None = None,
 ) -> torch.Tensor:
-    """X_{s,t}=x_s+((t-s)/(1-s))(psi_{s,t}-x_s)."""
+    """Generalized X_{s,t} using progress alpha(t), with raw s/t inputs."""
     if x_s.shape != mean_denoiser.shape:
         raise ValueError("x_s and mean_denoiser must have identical shapes")
     if s.shape != t.shape or s.ndim != 1:
         raise ValueError("s and t must both have shape [B]")
-    denominator = (1.0 - s).clamp_min(time_eps)
-    gamma = _time_view((t - s) / denominator, x_s.ndim).to(dtype=x_s.dtype)
+    alpha_s = path_coefficient(s, path_config)
+    alpha_t = path_coefficient(t, path_config)
+    denominator = (1.0 - alpha_s).clamp_min(time_eps)
+    gamma = _time_view(
+        (alpha_t - alpha_s) / denominator, x_s.ndim
+    ).to(dtype=x_s.dtype)
     return x_s + gamma * (mean_denoiser - x_s)
 
 

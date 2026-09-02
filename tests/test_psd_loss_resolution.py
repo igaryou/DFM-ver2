@@ -16,9 +16,10 @@ from state_space import resize_continuous
 
 
 ROOT = Path(__file__).parents[1]
-BASE_CONFIG = ROOT / "configs" / "joint_psd_cityscapes_swin_t_dfm_recipe.yaml"
+BASE_CONFIG = ROOT / "configs" / "cityscapes" / "psd" / "swin_t_dfm_recipe.yaml"
 FULL_CONFIG = (
-    ROOT / "configs" / "joint_psd_cityscapes_swin_t_adaptive_surgery_fullres_psd.yaml"
+    ROOT / "configs" / "cityscapes" / "psd"
+    / "swin_t_adaptive_surgery_fullres.yaml"
 )
 
 
@@ -83,7 +84,9 @@ def _compute(model, config, *, valid_state=None, valid_full=None):
 
 
 def test_default_config_uses_state_psd_resolution():
-    config = load_config(ROOT / "configs" / "joint_psd_cityscapes.yaml")
+    config = load_config(
+        ROOT / "configs" / "_base_" / "cityscapes" / "joint_psd_160k.yaml"
+    )
     assert config["loss"]["consistency"]["psd"]["loss_resolution"] == "state"
 
 
@@ -201,7 +204,7 @@ def test_invalid_psd_resolution_is_rejected():
         match="loss.consistency.psd.loss_resolution must be 'state' or 'full'",
     ):
         load_config(
-            ROOT / "configs" / "joint_psd_cityscapes.yaml",
+            ROOT / "configs" / "_base_" / "cityscapes" / "joint_psd_160k.yaml",
             ["loss.consistency.psd.loss_resolution=invalid"],
         )
 

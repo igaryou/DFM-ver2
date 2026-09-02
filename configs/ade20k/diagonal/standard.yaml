@@ -1,4 +1,4 @@
-extends: joint_psd_ade20k.yaml
+extends: ../../_base_/ade20k/joint_psd.yaml
 
 experiment:
   name: dfm_quarter_state_diagonal_ade20k_151state

@@ -1,4 +1,4 @@
-extends: debug_ddp_stage2_ecld.yaml
+extends: ddp_stage2.yaml
 experiment:
   name: dfm_debug_ddp_joint_ecld
   output_dir: /home/igarashi_25/DFM/results/debug_ddp_joint_ecld

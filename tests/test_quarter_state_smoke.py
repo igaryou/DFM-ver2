@@ -58,8 +58,8 @@ def _make_smoke_components(config: dict):
 @pytest.mark.parametrize(
     "config_name,image_size,supervision",
     [
-        ("diagonal_cityscapes.yaml", (32, 64), "align"),
-        ("diagonal_ade20k.yaml", (32, 32), "cross_entropy"),
+        ("cityscapes/diagonal/standard.yaml", (32, 64), "align"),
+        ("ade20k/diagonal/standard.yaml", (32, 32), "cross_entropy"),
     ],
 )
 def test_forward_backward_optimizer_evaluation_and_checkpoint_smoke(
@@ -112,7 +112,7 @@ def test_forward_backward_optimizer_evaluation_and_checkpoint_smoke(
         scaler=None,
         metrics={"mIoU": 0.0},
     )
-    path = save_checkpoint(payload, tmp_path, f"{config_name}.pt")
+    path = save_checkpoint(payload, tmp_path, f"{Path(config_name).name}.pt")
 
     resumed_config = deepcopy(config)
     resumed_config["checkpoint"].update({"resume": str(path), "init_from": None})

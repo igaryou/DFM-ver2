@@ -1,4 +1,4 @@
-extends: joint_psd_cityscapes_swin_t.yaml
+extends: ../../_base_/cityscapes/swin_t_160k.yaml
 
 experiment:
   name: dfm_joint_esd_cityscapes_swin_t_dfm_recipe_resume_160k

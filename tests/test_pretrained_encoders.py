@@ -32,8 +32,8 @@ from training_objectives import compute_model_training_objectives
 
 
 ROOT = Path(__file__).parents[1]
-ADE_CONFIG = ROOT / "configs" / "joint_psd_ade20k.yaml"
-CITY_CONFIG = ROOT / "configs" / "debug_diagonal_cityscapes.yaml"
+ADE_CONFIG = ROOT / "configs" / "_base_" / "ade20k" / "joint_psd.yaml"
+CITY_CONFIG = ROOT / "configs" / "debug" / "diagonal" / "cityscapes.yaml"
 
 
 class FakeBackbone(nn.Module):
@@ -489,14 +489,14 @@ def test_legacy_model_signature_omits_new_rrdb_default_block():
 @pytest.mark.parametrize(
     "name",
     [
-        "joint_psd_ade20k_swin_t.yaml",
-        "joint_psd_ade20k_frozen_source.yaml",
-        "joint_psd_ade20k_swin_t_frozen_source.yaml",
+        "ade20k/psd/swin_t.yaml",
+        "ade20k/psd/frozen_source.yaml",
+        "ade20k/psd/swin_t_frozen_source.yaml",
     ],
 )
 def test_ade_examples_extend_base_and_preserve_training_protocol(name):
     raw = yaml.safe_load((ROOT / "configs" / name).read_text())
-    assert raw["extends"] == "joint_psd_ade20k.yaml"
+    assert raw["extends"] == "../../_base_/ade20k/joint_psd.yaml"
     assert set(raw) <= {"extends", "model", "source"}
     base = load_config(ADE_CONFIG)
     example = load_config(ROOT / "configs" / name)

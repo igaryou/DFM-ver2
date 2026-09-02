@@ -19,8 +19,12 @@ ROOT = Path(__file__).parents[1]
 
 
 def configs(tmp_path):
-    stage1 = load_config(ROOT / "configs" / "debug_diagonal_cityscapes.yaml")
-    raw = yaml.safe_load((ROOT / "configs" / "debug_esd_cityscapes.yaml").read_text())
+    stage1 = load_config(
+        ROOT / "configs" / "debug" / "diagonal" / "cityscapes.yaml"
+    )
+    raw = yaml.safe_load(
+        (ROOT / "configs" / "debug" / "esd" / "cityscapes.yaml").read_text()
+    )
     raw["checkpoint"]["init_from"] = str(tmp_path / "stage1.pt")
     stage2_path = tmp_path / "stage2.yaml"
     stage2_path.write_text(yaml.safe_dump(raw))
@@ -385,7 +389,7 @@ def test_init_from_accepts_ddp_prefixed_model_states(tmp_path):
 
 
 def test_joint_resume_is_complete_and_rejects_other_stages(tmp_path):
-    joint = load_config(ROOT / "configs" / "joint_ecld_cityscapes.yaml")
+    joint = load_config(ROOT / "configs" / "cityscapes" / "ecld" / "joint.yaml")
     joint["training"]["batch_size"] = 2
     model, optimizer, scheduler, scaler = objects()
     model(torch.ones(1, 3)).sum().backward()
@@ -423,7 +427,7 @@ def test_joint_resume_is_complete_and_rejects_other_stages(tmp_path):
 
 
 def test_legacy_step_scheduler_checkpoint_is_rejected_on_resume(tmp_path):
-    joint = load_config(ROOT / "configs" / "joint_ecld_cityscapes.yaml")
+    joint = load_config(ROOT / "configs" / "cityscapes" / "ecld" / "joint.yaml")
     model, optimizer, scheduler, scaler = objects()
     payload = checkpoint_payload(
         config=joint,

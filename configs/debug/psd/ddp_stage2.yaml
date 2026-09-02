@@ -1,4 +1,4 @@
-extends: debug_esd_cityscapes.yaml
+extends: ../esd/cityscapes.yaml
 experiment:
   name: dfm_debug_ddp_stage2_psd
   output_dir: /home/igarashi_25/DFM/results/debug_ddp_stage2_psd

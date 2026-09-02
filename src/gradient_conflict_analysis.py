@@ -211,7 +211,9 @@ def build_diagnostic_graph(
         if not bool(((s < u) & (u < t)).all()):
             raise ValueError("diagnostic PSD consistency_times require s < u < t")
 
-    diagonal_state = linear_path(x0, targets.one_hot_state, diagonal_time)
+    diagonal_state = linear_path(
+        x0, targets.one_hot_state, diagonal_time, config
+    )
     diagonal_logits = endpoint_model.forward_logits_with_image_feat(
         diagonal_state, image_feat, diagonal_time, diagonal_time
     )
@@ -226,7 +228,7 @@ def build_diagnostic_graph(
     ).float()
     primary = config["loss"]["primary"]["weight"] * primary_ce
 
-    consistency_state = linear_path(x0, targets.one_hot_state, s)
+    consistency_state = linear_path(x0, targets.one_hot_state, s, config)
     consistency = losses.compute_consistency_loss(
         "psd",
         model=endpoint_model,

@@ -189,13 +189,15 @@ def test_all_stabilizers_disabled_match_legacy_objective_and_gradients():
 
 
 def test_joint_config_forbids_init_from_and_stage2_requires_checkpoint():
-    config = load_config(ROOT / "configs" / "joint_ecld_cityscapes.yaml")
+    config = load_config(ROOT / "configs" / "cityscapes" / "ecld" / "joint.yaml")
     bad_joint = deepcopy(config)
     bad_joint["checkpoint"]["init_from"] = "stage1.pt"
     with pytest.raises(ValueError, match="forbids checkpoint.init_from"):
         validate_config(bad_joint)
 
-    bad_stage2 = load_config(ROOT / "configs" / "stage2_ecld_cityscapes.yaml")
+    bad_stage2 = load_config(
+        ROOT / "configs" / "cityscapes" / "ecld" / "stage2.yaml"
+    )
     bad_stage2["checkpoint"]["init_from"] = None
     bad_stage2["checkpoint"]["resume"] = None
     with pytest.raises(ValueError, match="requires checkpoint"):

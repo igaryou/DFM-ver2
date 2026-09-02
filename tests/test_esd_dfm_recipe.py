@@ -15,8 +15,8 @@ from losses import compute_consistency_loss, esd_loss, masked_mean
 
 
 ROOT = Path(__file__).parents[1]
-FULL_CONFIG = ROOT / "configs" / "joint_esd_cityscapes_swin_t_dfm_recipe_resume.yaml"
-CORE_CONFIG = ROOT / "configs" / "joint_esd_cityscapes_swin_t_core_resume.yaml"
+FULL_CONFIG = ROOT / "configs" / "cityscapes" / "esd" / "swin_t_dfm_recipe_resume.yaml"
+CORE_CONFIG = ROOT / "configs" / "cityscapes" / "esd" / "swin_t_core_resume.yaml"
 
 
 class AnalyticalModel(nn.Module):

@@ -19,7 +19,7 @@ from trainer import (
 
 
 ROOT = Path(__file__).parents[1]
-CONFIG = ROOT / "configs" / "joint_ecld_cityscapes.yaml"
+CONFIG = ROOT / "configs" / "cityscapes" / "ecld" / "joint.yaml"
 
 
 class _FakeProgress:
@@ -394,7 +394,7 @@ def test_gradient_surgery_accumulation_steps_optimizer_and_scheduler_per_window(
     surgery_config = (
         ROOT
         / "configs"
-        / "joint_psd_cityscapes_swin_t_adaptive_surgery_fullres_psd_accum2.yaml"
+        / "cityscapes" / "psd" / "swin_t_adaptive_surgery_fullres_accum2.yaml"
     )
     config = load_config(
         surgery_config,
@@ -406,9 +406,10 @@ def test_gradient_surgery_accumulation_steps_optimizer_and_scheduler_per_window(
             "training.max_optimizer_steps=96003",
             "training.max_batches_per_epoch=3",
             "training.checkpoint_interval_steps=null",
-            "training.validation_epochs=[]",
-            "evaluation.interval.value=null",
-            "wandb.enabled=false",
+                "training.validation_epochs=[]",
+                "evaluation.interval.value=null",
+                "loss.consistency.gradient_surgery.enabled=true",
+                "wandb.enabled=false",
         ],
     )
     batches = [

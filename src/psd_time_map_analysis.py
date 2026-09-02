@@ -478,7 +478,7 @@ def _phase_b(
                 del probability
             for s_value in PISS_GRID[1:]:
                 s = x0.new_full((x0.shape[0],), s_value, dtype=torch.float32)
-                x_s = linear_path(x0, x1, s)
+                x_s = linear_path(x0, x1, s, config)
                 probability_ss = _original_probability(
                     endpoint, x_s, image_feat, s_value, s_value, sample, config
                 )

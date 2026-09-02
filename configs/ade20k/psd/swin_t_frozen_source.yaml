@@ -1,4 +1,15 @@
-extends: joint_psd_ade20k.yaml
+extends: ../../_base_/ade20k/joint_psd.yaml
+
+model:
+  image_encoder:
+    type: swin
+    variant: tiny
+    pretrained: true
+    freeze: false
+    input_already_normalized: true
+    neck:
+      type: ddp_fpn_merge
+      channels: 256
 
 source:
   type: task_finetuned_segformer

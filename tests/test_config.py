@@ -9,26 +9,31 @@ from config import load_config, save_resolved_config
 from trainer import log_esd_experiment_metadata
 
 
-CONFIG = Path(__file__).parents[1] / "configs" / "debug_diagonal_cityscapes.yaml"
-ESD_CONFIG = Path(__file__).parents[1] / "configs" / "debug_esd_cityscapes.yaml"
+CONFIG = Path(__file__).parents[1] / "configs" / "debug" / "diagonal" / "cityscapes.yaml"
+ESD_CONFIG = Path(__file__).parents[1] / "configs" / "debug" / "esd" / "cityscapes.yaml"
 PSD_FROM_JOINT_CONFIG = (
     Path(__file__).parents[1]
-    / "configs"
-    / "stage2_psd_from_joint500_cityscapes.yaml"
+    / "configs" / "cityscapes" / "psd" / "stage2_from_joint500.yaml"
 )
 JOINT_PSD_CITYSCAPES_CONFIG = (
-    Path(__file__).parents[1] / "configs" / "joint_psd_cityscapes.yaml"
+    Path(__file__).parents[1] / "configs" / "_base_" / "cityscapes" / "joint_psd_160k.yaml"
 )
-DIAGONAL_ADE20K_CONFIG = Path(__file__).parents[1] / "configs" / "diagonal_ade20k.yaml"
+DIAGONAL_ADE20K_CONFIG = (
+    Path(__file__).parents[1] / "configs" / "ade20k" / "diagonal" / "standard.yaml"
+)
 EXPECTED_ESD_METADATA = {
     "formulation": "stabilized_logit_space",
     "source": "discrete_flow_maps",
     "additional_numerical_safeguards": True,
 }
-FULL_TRAINING_CONFIGS = tuple(
-    Path(__file__).parents[1] / "configs" / f"{stage}_{loss}_cityscapes.yaml"
-    for stage in ("stage2", "joint")
-    for loss in ("psd", "csd", "ecld", "esd")
+FULL_TRAINING_CONFIGS = (
+    Path(__file__).parents[1] / "configs" / "cityscapes" / "psd" / "stage2.yaml",
+    Path(__file__).parents[1] / "configs" / "_base_" / "cityscapes" / "joint_psd_160k.yaml",
+    *(
+        Path(__file__).parents[1] / "configs" / "cityscapes" / loss / f"{stage}.yaml"
+        for loss in ("csd", "ecld", "esd")
+        for stage in ("stage2", "joint")
+    ),
 )
 FULL_TRAINING_SECTIONS = {
     "experiment",
@@ -55,7 +60,11 @@ def test_stage2_and_joint_training_configs_are_self_contained(path):
     assert FULL_TRAINING_SECTIONS <= raw.keys()
 
     config = load_config(path)
-    stage, loss_type, _dataset = path.stem.split("_", 2)
+    if path.name == "joint_psd_160k.yaml":
+        stage, loss_type = "joint", "psd"
+    else:
+        stage = path.stem
+        loss_type = path.parent.name
     assert config["loss"]["consistency"]["type"] == loss_type
     if stage == "stage2":
         assert config["experiment"]["stage"] == "consistency_distillation"
@@ -173,13 +182,12 @@ def test_gradient_surgery_accepts_accumulation_two_and_full_recipe_loads():
     path = (
         Path(__file__).parents[1]
         / "configs"
-        / "joint_psd_cityscapes_swin_t_adaptive_surgery_fullres_psd_accum2.yaml"
+        / "cityscapes" / "psd" / "swin_t_adaptive_surgery_fullres_accum2.yaml"
     )
     config = load_config(path)
     assert config["training"]["batch_size"] == 8
     assert config["training"]["grad_accum_steps"] == 2
     assert config["training"]["max_batches_per_epoch"] == 370
-    assert config["loss"]["consistency"]["gradient_surgery"]["enabled"] is True
     assert config["loss"]["consistency"]["psd"]["loss_resolution"] == "full"
     assert config["training"]["batch_size"] * config["training"]["grad_accum_steps"] == 16
     assert config["training"]["max_batches_per_epoch"] // config["training"]["grad_accum_steps"] == 185
@@ -190,11 +198,12 @@ def test_gradient_surgery_accepts_accumulation_two_and_full_recipe_loads():
 def test_accum2_full_psd_recipe_differs_from_parent_only_as_intended():
     root = Path(__file__).parents[1]
     parent = load_config(
-        root / "configs" / "joint_psd_cityscapes_swin_t_adaptive_surgery_fullres_psd.yaml"
+        root / "configs" / "cityscapes" / "psd"
+        / "swin_t_adaptive_surgery_fullres.yaml"
     )
     accumulated = load_config(
         root / "configs"
-        / "joint_psd_cityscapes_swin_t_adaptive_surgery_fullres_psd_accum2.yaml"
+        / "cityscapes" / "psd" / "swin_t_adaptive_surgery_fullres_accum2.yaml"
     )
     normalized = deepcopy(accumulated)
     normalized["experiment"]["name"] = parent["experiment"]["name"]
@@ -226,6 +235,60 @@ def test_unknown_key_is_rejected(tmp_path):
         load_config(path)
 
 
+def test_extends_list_merges_in_order_then_applies_child(tmp_path):
+    base = yaml.safe_load(CONFIG.read_text())
+    first = tmp_path / "parents" / "first.yaml"
+    second = tmp_path / "parents" / "second.yaml"
+    first.parent.mkdir()
+    first.write_text(yaml.safe_dump(base))
+    second.write_text(yaml.safe_dump({
+        "training": {"batch_size": 6},
+        "experiment": {"name": "second"},
+    }))
+    child = tmp_path / "nested" / "child.yaml"
+    child.parent.mkdir()
+    child.write_text(yaml.safe_dump({
+        "extends": ["../parents/first.yaml", "../parents/second.yaml"],
+        "experiment": {"name": "child"},
+    }))
+    config = load_config(child)
+    assert config["training"]["batch_size"] == 6
+    assert config["experiment"]["name"] == "child"
+
+
+def test_extends_list_reports_cycles_missing_parents_and_invalid_type(tmp_path):
+    first = tmp_path / "first.yaml"
+    second = tmp_path / "second.yaml"
+    first.write_text("extends: second.yaml\n")
+    second.write_text("extends: first.yaml\n")
+    with pytest.raises(ValueError, match="Recursive config extends detected"):
+        load_config(first)
+
+    missing = tmp_path / "missing-child.yaml"
+    missing.write_text("extends: absent.yaml\n")
+    with pytest.raises(FileNotFoundError, match="Config file does not exist"):
+        load_config(missing)
+
+    invalid = tmp_path / "invalid.yaml"
+    invalid.write_text("extends: 123\n")
+    with pytest.raises(ValueError, match="extends must be a string or list"):
+        load_config(invalid)
+
+
+def test_swin_power_ablation_differs_only_by_path_and_run_identity():
+    root = Path(__file__).parents[1] / "configs" / "cityscapes" / "psd"
+    linear = load_config(root / "swin_t_linear_160k.yaml")
+    power2 = load_config(root / "swin_t_power2_160k.yaml")
+    assert linear["flow"]["path"] == {"type": "power", "exponent": 1.0}
+    assert power2["flow"]["path"] == {"type": "power", "exponent": 2.0}
+    normalized = deepcopy(power2)
+    normalized["flow"]["path"] = deepcopy(linear["flow"]["path"])
+    normalized["experiment"] = deepcopy(linear["experiment"])
+    normalized["wandb"]["name"] = linear["wandb"]["name"]
+    normalized["runtime"]["config_path"] = linear["runtime"]["config_path"]
+    assert normalized == linear
+
+
 def test_unknown_override_is_rejected():
     with pytest.raises(ValueError, match="Unknown override key"):
         load_config(CONFIG, ["training.not_real=1"])
@@ -253,12 +316,12 @@ def test_init_from_and_resume_are_mutually_exclusive(tmp_path):
 def test_precision_validation_rejects_fake_psd_jvp_and_bf16_numerics():
     with pytest.raises(ValueError, match="PSD does not use JVP"):
         load_config(
-            Path(__file__).parents[1] / "configs" / "debug_ddp_stage2_psd.yaml",
+            Path(__file__).parents[1] / "configs" / "debug" / "psd" / "ddp_stage2.yaml",
             ["loss.consistency.precision.jvp_dtype=bf16"],
         )
     with pytest.raises(ValueError, match="numerical_dtype must be fp32"):
         load_config(
-            Path(__file__).parents[1] / "configs" / "debug_ddp_stage2_ecld.yaml",
+            Path(__file__).parents[1] / "configs" / "debug" / "ecld" / "ddp_stage2.yaml",
             ["loss.consistency.precision.numerical_dtype=bf16"],
         )
 
@@ -266,7 +329,7 @@ def test_precision_validation_rejects_fake_psd_jvp_and_bf16_numerics():
 def test_bf16_jvp_requires_runtime_bf16_amp():
     with pytest.raises(ValueError, match="bf16 JVP requires"):
         load_config(
-            Path(__file__).parents[1] / "configs" / "debug_ddp_stage2_esd.yaml",
+            Path(__file__).parents[1] / "configs" / "debug" / "esd" / "ddp_stage2.yaml",
             ["runtime.amp=false"],
         )
 

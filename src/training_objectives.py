@@ -104,7 +104,9 @@ def compute_model_training_objectives(
             batch_size, image.device,
             time_config["min_time"], time_config["max_time"],
         )
-        diagonal_state = linear_path(x0, targets.one_hot_state, diagonal_time)
+        diagonal_state = linear_path(
+            x0, targets.one_hot_state, diagonal_time, config
+        )
         schedule_weight = 0.0
         effective_weight = 0.0
     else:
@@ -113,7 +115,9 @@ def compute_model_training_objectives(
             time_config["min_time"], time_config["max_time"],
             time_config["min_gap"],
         )
-        consistency_state = linear_path(x0, targets.one_hot_state, consistency_s)
+        consistency_state = linear_path(
+            x0, targets.one_hot_state, consistency_s, config
+        )
         if operation == "joint_objectives":
             # Joint training intentionally samples an independent diagonal time.
             diagonal_time = sample_stage1_times(
@@ -121,7 +125,7 @@ def compute_model_training_objectives(
                 time_config["min_time"], time_config["max_time"],
             )
             diagonal_state = linear_path(
-                x0, targets.one_hot_state, diagonal_time
+                x0, targets.one_hot_state, diagonal_time, config
             )
         else:
             # Preserve the original Stage 2 diagonal-at-s behavior.

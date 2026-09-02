@@ -89,17 +89,17 @@ uv sync --extra full
 
 | dataset | diagonal | joint PSD |
 |---|---|---|
-| Cityscapes | `configs/diagonal_cityscapes.yaml` | `configs/joint_psd_cityscapes.yaml` |
-| ADE20K | `configs/diagonal_ade20k.yaml` | `configs/joint_psd_ade20k.yaml` |
+| Cityscapes | `configs/cityscapes/diagonal/standard.yaml` | `configs/cityscapes/psd/swin_t_linear_160k.yaml` |
+| ADE20K | `configs/ade20k/diagonal/standard.yaml` | `configs/_base_/ade20k/joint_psd.yaml` |
 
 学習例:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 uv run python src/train.py \
-  --config configs/diagonal_ade20k.yaml
+  --config configs/ade20k/diagonal/standard.yaml
 
 CUDA_VISIBLE_DEVICES=0,1 uv run torchrun --standalone --nproc_per_node=2 \
-  src/train_joint.py --config configs/joint_psd_ade20k.yaml
+  src/train_joint.py --config configs/_base_/ade20k/joint_psd.yaml
 ```
 
 長時間学習を始める前に、`training.max_optimizer_steps`、dataset path、global batch、
@@ -107,17 +107,31 @@ CUDA_VISIBLE_DEVICES=0,1 uv run torchrun --standalone --nproc_per_node=2 \
 
 ## 全体構成
 
-経路とmean-denoiser Flow Mapは次のとおりです。
+経路進行率 `alpha(t)` と mean-denoiser Flow Map は次のとおりです。モデルの
+time embedding と推論 grid には raw time `t` を渡し、経路係数だけを変換します。
 
 \[
-x_t=(1-t)x_0+t x_1,\qquad
+x_t=(1-\alpha(t))x_0+\alpha(t)x_1,\qquad \alpha(t)=t^p,
+\qquad
 X^\theta_{s,t}(x_s)
-=x_s+\frac{t-s}{1-s}\left(\psi^\theta_{s,t}(x_s,I)-x_s\right).
+=x_s+\frac{\alpha(t)-\alpha(s)}{1-\alpha(s)}
+\left(\psi^\theta_{s,t}(x_s,I)-x_s\right).
 \]
 
 `x_1`はvoidを含む20-class one-hotです。`x_0`は`source.prior_type`で
 `gaussian`、`dirichlet`、`image_gaussian`から選びます。
-`flow.time_eps`はFlow Mapの分母のゼロ除算防止にだけ使います。
+`flow.path.exponent: 1.0` が従来の線形経路、`2.0` が power-2 経路です。
+`flow.time_eps`はFlow Mapなどの分母のゼロ除算防止に使います。
+
+Cityscapes Swin-T PSD の比較実験:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 uv run python src/train_joint.py \
+  --config configs/cityscapes/psd/swin_t_linear_160k.yaml
+
+CUDA_VISIBLE_DEVICES=0 uv run python src/train_joint.py \
+  --config configs/cityscapes/psd/swin_t_power2_160k.yaml
+```
 
 学習方式は2つです。
 
@@ -149,7 +163,7 @@ unit testでも禁止関数に置き換えて検証しています。
 ```bash
 CUDA_VISIBLE_DEVICES=0 \
 uv run python src/train.py \
-  --config configs/stage1_diagonal_cityscapes.yaml
+  --config configs/cityscapes/diagonal/stage1.yaml
 ```
 
 ### Stage 2
@@ -162,7 +176,7 @@ Stage 1 checkpointを指定します。旧`esd_distillation`はESD checkpointの
 ```bash
 CUDA_VISIBLE_DEVICES=0 \
 uv run python src/train.py \
-  --config configs/stage2_ecld_cityscapes.yaml
+  --config configs/cityscapes/ecld/stage2.yaml
 ```
 
 ### Joint training（対角事前学習なし）
@@ -175,7 +189,7 @@ source priorを生成し、対角CE用の時刻と整合性用の時刻を別々
 ```bash
 CUDA_VISIBLE_DEVICES=0 \
 uv run python src/train_joint.py \
-  --config configs/joint_ecld_cityscapes.yaml
+  --config configs/cityscapes/ecld/joint.yaml
 ```
 
 ## 整合性損失
@@ -302,7 +316,7 @@ loss:
 非対応の環境は明示的なエラーです。比較時は既存キーをoverrideできます。
 
 ```bash
-uv run python src/train.py --config configs/debug_ddp_stage2_ecld.yaml \
+uv run python src/train.py --config configs/debug/ecld/ddp_stage2.yaml \
   --set loss.consistency.precision.jvp_dtype=fp32
 ```
 
@@ -373,7 +387,7 @@ uv run torchrun \
   --standalone \
   --nproc_per_node=2 \
   src/train.py \
-  --config configs/stage2_ecld_cityscapes.yaml
+  --config configs/cityscapes/ecld/stage2.yaml
 ```
 
 ```bash
@@ -383,7 +397,7 @@ uv run torchrun \
   --standalone \
   --nproc_per_node=2 \
   src/train_joint.py \
-  --config configs/joint_ecld_cityscapes.yaml
+  --config configs/cityscapes/ecld/joint.yaml
 ```
 
 対応スクリプトは`scripts/train_stage2_{psd,csd,ecld,esd}_ddp.sh`と
@@ -425,7 +439,7 @@ DDP evaluationも可能です。
 ```bash
 CUDA_VISIBLE_DEVICES=0,1 \
 uv run torchrun --standalone --nproc_per_node=2 src/evaluate.py \
-  --config configs/stage2_ecld_cityscapes.yaml \
+  --config configs/cityscapes/ecld/stage2.yaml \
   --checkpoint /path/to/best.pt
 ```
 
@@ -483,7 +497,7 @@ mu=0、Flow Map step数、1/4-state oracle align floorを一括診断できま�
 ```bash
 CUDA_VISIBLE_DEVICES=2 PYTHONPATH=src \
 uv run python scripts/diagnose_source_ade20k.py \
-  --config configs/joint_psd_ade20k.yaml \
+  --config configs/_base_/ade20k/joint_psd.yaml \
   --checkpoint results/joint_psd_ade20k_ver2/latest.pt \
   --output_dir results/source_diagnostics_final \
   --sigma_values 1.0 0.75 0.5 0.25 0.1 0.0 \

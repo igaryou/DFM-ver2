@@ -235,7 +235,10 @@ def run_flow_with_image_feat(
         t = scalar_t.expand(batch)
         logits = model.forward_logits_with_image_feat(state, image_feat, s, t)
         probability = torch.softmax(logits.float(), dim=1).to(state.dtype)
-        state = flow_map(state, probability, s, t, config["flow"]["time_eps"])
+        state = flow_map(
+            state, probability, s, t,
+            config["flow"]["time_eps"], config["flow"],
+        )
     return state
 
 

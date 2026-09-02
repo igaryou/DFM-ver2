@@ -60,7 +60,9 @@ def run_flow_from_state(
         logits = model.forward_logits(x, image, s, t)
         assert logits.shape == x.shape
         probability = torch.softmax(logits.float(), dim=1).to(x.dtype)
-        x = flow_map(x, probability, s, t, config["flow"]["time_eps"])
+        x = flow_map(
+            x, probability, s, t, config["flow"]["time_eps"], config["flow"]
+        )
         trajectory.append(x.argmax(dim=1))
     if return_trajectory:
         return x, torch.stack(trajectory, dim=1)

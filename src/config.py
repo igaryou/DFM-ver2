@@ -150,6 +150,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "time_eps": 1.0e-5,
         "probability_eps": 1.0e-8,
         "start_time": 0.0,
+        "path": {"type": "power", "exponent": 1.0},
     },
     "time_sampling": {
         "distribution": "uniform_sorted",
@@ -615,6 +616,15 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
             )
     if config["flow"]["time_eps"] <= 0:
         raise ValueError("flow.time_eps must be positive")
+    path = config["flow"]["path"]
+    if path["type"] != "power":
+        raise ValueError("flow.path.type must be power")
+    if (
+        isinstance(path["exponent"], bool)
+        or not isinstance(path["exponent"], (int, float))
+        or path["exponent"] <= 0
+    ):
+        raise ValueError("flow.path.exponent must be positive")
     ts = config["time_sampling"]
     if ts["distribution"] != "uniform_sorted":
         raise ValueError("time_sampling.distribution must be uniform_sorted")
@@ -785,29 +795,51 @@ def apply_overrides(config: dict[str, Any], overrides: Iterable[str]) -> dict[st
     return validate_config(result)
 
 
-def _load_raw_config(path: Path, seen: set[Path] | None = None) -> dict[str, Any]:
-    seen = set() if seen is None else seen
+def _load_raw_config(
+    path: Path,
+    stack: tuple[Path, ...] = (),
+) -> tuple[dict[str, Any], list[str]]:
     path = path.expanduser().resolve()
-    if path in seen:
-        raise ValueError(f"Recursive config extends detected: {path}")
-    seen.add(path)
+    if path in stack:
+        cycle = " -> ".join(str(item) for item in (*stack, path))
+        raise ValueError(f"Recursive config extends detected: {cycle}")
+    if not path.is_file():
+        raise FileNotFoundError(f"Config file does not exist: {path}")
     with path.open("r", encoding="utf-8") as handle:
         raw = yaml.safe_load(handle)
     if not isinstance(raw, dict):
         raise ValueError(f"YAML root must be a mapping: {path}")
     extends = raw.pop("extends", None)
-    if extends is not None:
-        base_path = Path(extends)
+    if extends is None:
+        parents: list[str] = []
+    elif isinstance(extends, str):
+        parents = [extends]
+    elif (
+        isinstance(extends, list)
+        and all(isinstance(parent, str) and parent for parent in extends)
+    ):
+        parents = extends
+    else:
+        raise ValueError(f"extends must be a string or list of strings: {path}")
+    merged: dict[str, Any] = {}
+    chain: list[str] = []
+    for parent in parents:
+        base_path = Path(parent)
         if not base_path.is_absolute():
             base_path = path.parent / base_path
-        raw = _merge(_load_raw_config(base_path, seen), raw)
-    seen.remove(path)
-    return raw
+        parent_raw, parent_chain = _load_raw_config(
+            base_path, (*stack, path)
+        )
+        merged = _merge(merged, parent_raw)
+        chain.extend(parent_chain)
+    merged = _merge(merged, raw)
+    chain.append(str(path))
+    return merged, chain
 
 
 def load_config(path: str | Path, overrides: Iterable[str] = ()) -> dict[str, Any]:
     config_path = Path(path).expanduser().resolve()
-    raw = _load_raw_config(config_path)
+    raw, _config_chain = _load_raw_config(config_path)
     _validate_required(raw)
     _check_unknown(raw, DEFAULT_CONFIG)
     config = _merge(DEFAULT_CONFIG, _expand(raw))

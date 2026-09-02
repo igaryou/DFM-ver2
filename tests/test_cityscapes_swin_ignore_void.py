@@ -13,7 +13,7 @@ from state_space import prepare_state_targets, state_spatial_size
 
 
 ROOT = Path(__file__).parents[1]
-CONFIG = ROOT / "configs" / "joint_psd_cityscapes_swin_t_ignore_void.yaml"
+CONFIG = ROOT / "configs" / "cityscapes" / "psd" / "swin_t_linear_160k.yaml"
 
 
 class PixelwiseFlowModel(nn.Module):
@@ -69,7 +69,7 @@ def test_new_config_keeps_20_states_and_matches_ade_training_protocol():
     }
     assert config["loss"]["ignore_index"] == 19
     assert config["loss"]["mask_pixel_losses"] is True
-    assert config["source"]["supervision"] == {"type": "align", "weight": 2.0}
+    assert config["source"]["supervision"] == {"type": "align", "weight": 0.2}
     assert config["training"]["max_optimizer_steps"] == 160000
     assert config["training"]["batch_size"] == 16
     assert config["training"]["optimizer"]["parameter_groups"] == {

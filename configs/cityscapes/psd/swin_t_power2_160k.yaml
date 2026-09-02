@@ -1,0 +1,15 @@
+extends:
+  - ../../_base_/cityscapes/swin_t_160k.yaml
+  - ../../_base_/losses/psd.yaml
+
+experiment:
+  name: dfm_joint_psd_cityscapes_swin_t_power2_160k
+  output_dir: /home/igarashi_25/DFM/results/cityscapes/joint_psd_cityscapes_swin_t_power2_160k
+
+flow:
+  path:
+    type: power
+    exponent: 2.0
+
+wandb:
+  name: dfm-joint-psd-cityscapes-swin-t-power2-160k

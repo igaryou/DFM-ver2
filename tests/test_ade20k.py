@@ -29,7 +29,7 @@ from trainer import (
 
 
 ROOT = Path(__file__).parents[1]
-ADE_CONFIG = ROOT / "configs" / "joint_psd_ade20k.yaml"
+ADE_CONFIG = ROOT / "configs" / "_base_" / "ade20k" / "joint_psd.yaml"
 ADE_ROOT = Path("/home/igarashi_25/datasets/ADEChallengeData2016")
 
 

@@ -8,7 +8,7 @@ import torch
 import torch.nn.functional as F
 from torch.func import jvp
 
-from discrete_flow_maps import flow_map
+from discrete_flow_maps import flow_map, path_coefficient, path_derivative
 from state_space import resize_continuous
 
 
@@ -243,6 +243,7 @@ def _psd_loss(
     t: torch.Tensor,
     time_eps: float,
     probability_eps: float,
+    path_config: dict | None,
     flow: Callable = flow_map,
     valid_mask: torch.Tensor | None = None,
     loss_resolution: str = "state",
@@ -259,15 +260,22 @@ def _psd_loss(
         probability_su = _normalize_probability(
             torch.softmax(logits_su.float(), dim=1), probability_eps
         )
-        x_su = flow(x_s.float(), probability_su, s, u, time_eps)
+        x_su = flow(
+            x_s.float(), probability_su, s, u, time_eps, path_config
+        )
         logits_ut = _forward_logits(
             model, x_su, image, u, t, image_feat=teacher_image_feat
         )
         probability_ut = _normalize_probability(
             torch.softmax(logits_ut.float(), dim=1), probability_eps
         )
-        numerator = (1.0 - t) * (u - s)
-        denominator = (1.0 - u).clamp_min(time_eps) * (t - s).clamp_min(time_eps)
+        alpha_s = path_coefficient(s, path_config)
+        alpha_u = path_coefficient(u, path_config)
+        alpha_t = path_coefficient(t, path_config)
+        numerator = (1.0 - alpha_t) * (alpha_u - alpha_s)
+        denominator = (1.0 - alpha_u).clamp_min(time_eps) * (
+            alpha_t - alpha_s
+        ).clamp_min(time_eps)
         mixture = (numerator / denominator).clamp(0.0, 1.0)
         teacher = (
             mixture[:, None, None, None] * probability_su
@@ -358,6 +366,7 @@ def _csd_loss(
     t: torch.Tensor,
     time_eps: float,
     probability_eps: float,
+    path_config: dict | None,
     jvp_dtype: str,
     flow: Callable = flow_map,
     valid_mask: torch.Tensor | None = None,
@@ -377,7 +386,9 @@ def _csd_loss(
             )
             logits = logits.to(dtype=target_dtype)
             probability = torch.softmax(logits, dim=1).to(dtype=target_dtype)
-            return flow(x_primal, probability, s32, t_in, time_eps).to(target_dtype)
+            return flow(
+                x_primal, probability, s32, t_in, time_eps, path_config
+            ).to(target_dtype)
 
         transported_before, derivative_before = jvp(
             transported_at, (t32,), (torch.ones_like(t32),)
@@ -401,10 +412,11 @@ def _csd_loss(
                 torch.softmax(teacher_logits_before.float(), dim=1), probability_eps
             ).detach()
     with _disabled_autocast(x_s):
+        alpha_t = path_coefficient(t32, path_config)
+        alpha_prime_t = path_derivative(t32, path_config)
         residual = (
-            (1.0 - t32)[:, None, None, None] * derivative
-            - teacher
-            + transported
+            (1.0 - alpha_t)[:, None, None, None] * derivative
+            - alpha_prime_t[:, None, None, None] * (teacher - transported)
         )
         residual_map = residual.square().sum(dim=1)
         loss = masked_mean(residual_map, valid_mask).float()
@@ -443,6 +455,7 @@ def _ecld_loss(
     t: torch.Tensor,
     time_eps: float,
     probability_eps: float,
+    path_config: dict | None,
     jvp_dtype: str,
     ec_weight: float,
     td_weight: float,
@@ -475,7 +488,7 @@ def _ecld_loss(
         center = (student_probability * derivative).sum(dim=1, keepdim=True)
         probability_derivative = student_probability * (derivative - center)
         transported = flow(
-            x_s.float(), student_probability, s32, t32, time_eps
+            x_s.float(), student_probability, s32, t32, time_eps, path_config
         )
     with torch.no_grad():
         teacher_input = transported.detach().to(dtype=target_dtype)
@@ -502,7 +515,9 @@ def _ecld_loss(
         endpoint_ce = masked_mean(
             endpoint_ce_map * temporal_weight[:, None, None], valid_mask
         )
-        gamma = (t32 - s32) / (1.0 - s32).clamp_min(time_eps)
+        alpha_s = path_coefficient(s32, path_config)
+        alpha_t = path_coefficient(t32, path_config)
+        gamma = (alpha_t - alpha_s) / (1.0 - alpha_s).clamp_min(time_eps)
         temporal_derivative_map = (
             gamma.square()[:, None, None]
             * probability_derivative.square().sum(dim=1)
@@ -549,6 +564,7 @@ def _esd_loss(
     s: torch.Tensor,
     t: torch.Tensor,
     time_eps: float,
+    path_config: dict | None,
     log_eps: float,
     invalid_strategy: str,
     skip_batch_threshold: float | None,
@@ -582,10 +598,14 @@ def _esd_loss(
         with _disabled_autocast(x_s):
             logits_ss = logits_ss_before.float()
             probability_ss = torch.softmax(logits_ss, dim=1)
-            denominator_s = (1.0 - s32).clamp_min(time_eps)
+            alpha_s = path_coefficient(s32, path_config)
+            alpha_prime_s = path_derivative(s32, path_config)
+            denominator_s = (1.0 - alpha_s).clamp_min(time_eps)
             drift = (
-                probability_ss - x32
-            ) / denominator_s[:, None, None, None]
+                alpha_prime_s[:, None, None, None]
+                / denominator_s[:, None, None, None]
+                * (probability_ss - x32)
+            )
 
     x_primal = x32.to(target_dtype)
     drift_primal = drift.to(target_dtype)
@@ -609,12 +629,20 @@ def _esd_loss(
         student_probability = student_log_probability.exp()
         center = (student_probability * directional).sum(dim=1, keepdim=True)
         delta = directional - center
-        one_minus_s = 1.0 - s32
-        one_minus_t = 1.0 - t32
-        delta_time = t32 - s32
+        alpha_s = path_coefficient(s32, path_config)
+        alpha_t = path_coefficient(t32, path_config)
+        alpha_prime_s = path_derivative(s32, path_config)
+        one_minus_alpha_s = 1.0 - alpha_s
+        one_minus_alpha_t = 1.0 - alpha_t
+        alpha_interval_in_raw_s_units = (
+            (alpha_t - alpha_s)
+            / alpha_prime_s.clamp_min(time_eps)
+        )
         log_arg_raw = (
-            one_minus_t[:, None, None, None]
-            - (one_minus_s * delta_time)[:, None, None, None] * delta
+            one_minus_alpha_t[:, None, None, None]
+            - (
+                one_minus_alpha_s * alpha_interval_in_raw_s_units
+            )[:, None, None, None] * delta
         )
 
         invalid_class = ~torch.isfinite(log_arg_raw) | (log_arg_raw <= log_eps)
@@ -826,6 +854,7 @@ def compute_consistency_loss(
     flow_config = config.get("flow", {})
     time_eps = float(flow_config.get("time_eps", 1.0e-5))
     probability_eps = float(flow_config.get("probability_eps", 1.0e-8))
+    path_config = flow_config.get("path")
 
     if loss_type == "psd":
         if u is None:
@@ -834,7 +863,8 @@ def compute_consistency_loss(
         result = _psd_loss(
             model=model, x_s=x_s, image=image, image_feat=image_feat,
             s=s, u=u, t=t,
-            time_eps=time_eps, probability_eps=probability_eps, flow=flow,
+            time_eps=time_eps, probability_eps=probability_eps,
+            path_config=path_config, flow=flow,
             valid_mask=valid_mask,
             loss_resolution=psd.get("loss_resolution", "state"),
             full_resolution_size=full_resolution_size,
@@ -844,13 +874,15 @@ def compute_consistency_loss(
         result = _csd_loss(
             model=model, x_s=x_s, image=image, image_feat=image_feat, s=s, t=t,
             time_eps=time_eps, probability_eps=probability_eps,
-            jvp_dtype=jvp_dtype, flow=flow, valid_mask=valid_mask,
+            path_config=path_config, jvp_dtype=jvp_dtype,
+            flow=flow, valid_mask=valid_mask,
         )
     elif loss_type == "ecld":
         ecld = consistency.get("ecld", {})
         result = _ecld_loss(
             model=model, x_s=x_s, image=image, image_feat=image_feat, s=s, t=t,
             time_eps=time_eps, probability_eps=probability_eps,
+            path_config=path_config,
             jvp_dtype=jvp_dtype,
             ec_weight=float(ecld.get("ec_weight", 4.0)),
             td_weight=float(ecld.get("td_weight", 2.0)),
@@ -863,6 +895,7 @@ def compute_consistency_loss(
         result = _esd_loss(
             model=model, x_s=x_s, image=image, image_feat=image_feat, s=s, t=t,
             time_eps=time_eps,
+            path_config=path_config,
             log_eps=float(invalid.get("log_eps", 1.0e-6)),
             invalid_strategy=invalid.get("strategy", "mask_pixel"),
             skip_batch_threshold=invalid.get("skip_batch_threshold"),
@@ -906,10 +939,11 @@ def esd_loss(
     adaptive_max_weight: float | None = 100.0,
     jvp_dtype: str = "fp32",
     image_feat: torch.Tensor | None = None,
+    path_config: dict | None = None,
 ) -> ESDResult:
     result = _esd_loss(
         model=model, x_s=x_s, image=image, image_feat=image_feat, s=s, t=t,
-        time_eps=time_eps, log_eps=log_eps,
+        time_eps=time_eps, path_config=path_config, log_eps=log_eps,
         invalid_strategy=invalid_strategy,
         skip_batch_threshold=skip_batch_threshold,
         adaptive_enabled=adaptive_enabled,

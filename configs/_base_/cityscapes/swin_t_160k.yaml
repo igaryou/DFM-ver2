@@ -1,8 +1,8 @@
-extends: joint_psd_cityscapes.yaml
+extends: joint_psd_160k.yaml
 
 experiment:
   name: dfm_joint_psd_cityscapes_swin_t_160k
-  output_dir: /home/igarashi_25/DFM/results/joint_psd_cityscapes_swin_t_160k_ver2
+  output_dir: /home/igarashi_25/DFM/results/cityscapes/joint_psd_cityscapes_swin_t_160k_ver3
 
 dataset:
   name: cityscapes
@@ -98,7 +98,7 @@ loss:
     enabled: true
     type: psd
     weight: 0.5
-    start: {unit: optimizer_step, value: 96000}
+    start: {unit: optimizer_step, value: 0}
     warmup_epochs: 0
     warmup_steps: 0
     adaptive_kl:

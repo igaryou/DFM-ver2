@@ -20,7 +20,7 @@ from state_space import prepare_state_targets, state_spatial_size
 
 
 ROOT = Path(__file__).parents[1]
-CONFIG_PATH = ROOT / "configs" / "joint_psd_cityscapes.yaml"
+CONFIG_PATH = ROOT / "configs" / "_base_" / "cityscapes" / "joint_psd_160k.yaml"
 
 
 def _config() -> dict:

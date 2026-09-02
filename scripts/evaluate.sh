@@ -8,6 +8,5 @@ checkpoint="$1"
 shift
 cd "$(dirname "$0")/.."
 uv run python src/evaluate.py \
-  --config configs/stage2_esd_cityscapes.yaml \
+  --config configs/cityscapes/esd/stage2.yaml \
   --checkpoint "$checkpoint" "$@"
-

@@ -1,0 +1,9 @@
+loss:
+  consistency:
+    enabled: true
+    type: csd
+    precision:
+      jvp_dtype: bf16
+      numerical_dtype: fp32
+      debug_assertions: false
+

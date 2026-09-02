@@ -1,4 +1,4 @@
-extends: joint_esd_cityscapes_swin_t_dfm_recipe_resume.yaml
+extends: swin_t_dfm_recipe_resume.yaml
 
 experiment:
   name: dfm_joint_esd_cityscapes_swin_t_core_resume_160k

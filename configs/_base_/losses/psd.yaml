@@ -1,0 +1,10 @@
+loss:
+  consistency:
+    enabled: true
+    type: psd
+    weight: 0.5
+    precision:
+      jvp_dtype: null
+      numerical_dtype: fp32
+      debug_assertions: false
+

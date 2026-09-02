@@ -8,7 +8,7 @@ from config import load_config
 from trainer import build_scheduler
 
 
-CONFIG = Path(__file__).parents[1] / "configs" / "joint_ecld_cityscapes.yaml"
+CONFIG = Path(__file__).parents[1] / "configs" / "cityscapes" / "ecld" / "joint.yaml"
 
 
 def _config():

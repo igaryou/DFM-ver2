@@ -40,7 +40,7 @@ def _step(endpoint, source, weight, optimizer, scheduler):
 
 
 def _config(tmp_path):
-    config = load_config("configs/joint_psd_cityscapes_swin_t_dfm_recipe.yaml")
+    config = load_config("configs/cityscapes/psd/swin_t_dfm_recipe.yaml")
     config["checkpoint"]["resume"] = str(tmp_path / "resume.pt")
     return config
 

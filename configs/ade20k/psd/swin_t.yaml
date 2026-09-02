@@ -1,4 +1,4 @@
-extends: joint_psd_ade20k.yaml
+extends: ../../_base_/ade20k/joint_psd.yaml
 
 model:
   image_encoder:

@@ -152,6 +152,24 @@ def test_jvp_losses_use_requested_dtype_then_compute_in_fp32(
     assert gradients and all(torch.isfinite(gradient).all() for gradient in gradients)
 
 
+@pytest.mark.parametrize("loss_type", ["csd", "ecld", "esd"])
+def test_jvp_losses_are_finite_with_power_two_path(loss_type):
+    model = TinyFlowModel()
+    x, image, s, _, t = _inputs()
+    config = _config(loss_type, "fp32")
+    config["flow"]["path"] = {"type": "power", "exponent": 2.0}
+    result = compute_consistency_loss(
+        loss_type, model=model, x_s=x, image=image, s=s, t=t,
+        precision=config["loss"]["consistency"]["precision"], config=config,
+    )
+    assert torch.isfinite(result.loss)
+    result.loss.backward()
+    assert all(
+        parameter.grad is None or torch.isfinite(parameter.grad).all()
+        for parameter in model.parameters()
+    )
+
+
 def test_ecld_exact_softmax_jvp_matches_autograd_formula():
     model = TinyFlowModel()
     x, image, s, _, t = _inputs()

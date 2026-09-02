@@ -9,7 +9,7 @@ from trainer import build_scheduler
 
 
 ROOT = Path(__file__).parents[1]
-CONFIG = ROOT / "configs" / "joint_esd_cityscapes_swin_t_dfm_recipe_resume.yaml"
+CONFIG = ROOT / "configs" / "cityscapes" / "esd" / "swin_t_dfm_recipe_resume.yaml"
 
 
 def _config(tmp_path):
@@ -114,7 +114,7 @@ def test_esd_weight_checkpoint_strict_round_trip(tmp_path):
 
 def test_new_psd_payload_also_emits_legacy_weight_key():
     config = load_config(
-        ROOT / "configs" / "joint_psd_cityscapes_swin_t_dfm_recipe.yaml"
+        ROOT / "configs" / "cityscapes" / "psd" / "swin_t_dfm_recipe.yaml"
     )
     endpoint = torch.nn.Linear(3, 2)
     source = torch.nn.Linear(3, 2)
