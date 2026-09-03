@@ -1,0 +1,44 @@
+extends: ../../_base_/cityscapes/swin_t_160k.yaml
+
+experiment:
+  name: dfm_joint_psd_cityscapes_swin_t_b1_standard_ce_160k
+  output_dir: /home/igarashi_25/DFM/results/cityscapes/joint_psd_cityscapes_swin_t_b1_standard_ce_160k
+
+source:
+  type: trainable_segformer
+  prior_type: image_gaussian
+  backbone: segformer
+  segformer_variant: b1
+  segformer_decoder: standard
+  pretrained: true
+  checkpoint: null
+  freeze: false
+  freeze_encoder: false
+  learned_logvar: false
+  fixed_std: 1.0
+  mu_tanh_scale: 0.0
+  input_already_normalized: true
+  use_loss_align: false
+  supervision:
+    type: cross_entropy
+    weight: 0.20
+    include_void: true
+
+training:
+  max_optimizer_steps: 160000
+
+checkpoint:
+  init_from: null
+  resume: null
+
+wandb:
+  name: dfm-joint-psd-cityscapes-swin-t-b1-standard-ce-160k
+  tags:
+    - cityscapes
+    - joint
+    - psd
+    - swin-t
+    - segformer-b1
+    - standard-head
+    - source-ce
+    - 160k

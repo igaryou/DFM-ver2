@@ -54,6 +54,21 @@ defaultは`custom`であり、引数を持たない既存configとcheckpointと�
 維持します。標準headはよりcanonicalなsemantic segmentation decoderですが、精度差は
 実験で評価する必要があります。
 
+Joint trainingでもstandard headとsource CEを組み合わせられます。
+
+```yaml
+source:
+  segformer_variant: b1
+  segformer_decoder: standard
+  supervision:
+    type: cross_entropy
+    weight: 0.20
+    include_void: true
+```
+
+CE is applied to the source mean logits `mu(x)`, not to the stochastic sample
+`x0`. CEとAlignではloss scaleが異なるため、`weight: 0.20`が最適とは限りません。
+
 教師ありsource lossは排他的に選びます。
 
 ```yaml
