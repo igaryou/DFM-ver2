@@ -1193,6 +1193,21 @@ def run_training(config: dict, *, joint_entrypoint: bool = False) -> dict:
             config, context, local_batch_size
         )
         endpoint, source = build_models(config, context.device)
+        if context.is_main_process and source is not None:
+            from model_inspection import inspect_source_parameters
+            parameter_report = inspect_source_parameters(source)
+            source_decoder = parameter_report["source_decoder"]
+            source_projections = parameter_report["source_projections"]
+            logger.info(
+                "Source parameters: total=%d trainable=%d encoder=%d/%d "
+                "decoder_or_head=%d/%d",
+                parameter_report["source"]["total"],
+                parameter_report["source"]["trainable"],
+                parameter_report["source_encoder"]["trainable"],
+                parameter_report["source_encoder"]["total"],
+                source_decoder["trainable"] + source_projections["trainable"],
+                source_decoder["total"] + source_projections["total"],
+            )
         adapter = DDPCompatibleTrainingModel(endpoint, source, config).to(context.device)
         optimizer = build_optimizer(config, adapter)
         max_iterations = config["training"]["max_iterations"]

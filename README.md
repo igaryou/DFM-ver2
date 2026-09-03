@@ -38,6 +38,22 @@ resizeしてconcatします。軽量UNet sourceもstride-2 convolutionを2段使
 Gaussian sampling `x0 = mu + exp(0.5*logvar)*epsilon`、fixed std、learned
 logvar、variance loss、`mu_tanh_scale`は維持しています。
 
+`source.segformer_decoder`でSegFormer sourceのheadを選択できます。
+
+```yaml
+source:
+  backbone: segformer
+  segformer_variant: b1
+  segformer_decoder: standard  # custom | standard
+```
+
+`custom`は既存DFM-ver2 source decoder、`standard`はTransformersの標準
+SegFormer semantic segmentation decode headです。標準modeでもpretrained weightは
+ImageNet MiT encoderだけに読み込み、decode headはrandom initializationです。
+defaultは`custom`であり、引数を持たない既存configとcheckpointとの後方互換性を
+維持します。標準headはよりcanonicalなsemantic segmentation decoderですが、精度差は
+実験で評価する必要があります。
+
 教師ありsource lossは排他的に選びます。
 
 ```yaml

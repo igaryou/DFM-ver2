@@ -1,0 +1,22 @@
+extends: source_segformer_b1_32k.yaml
+
+experiment:
+  name: cityscapes_source_segformer_b1_standard_32k
+  output_dir: /home/igarashi_25/DFM/results/cityscapes/source_segformer_b1_standard_32k
+
+source:
+  type: trainable_segformer
+  backbone: segformer
+  segformer_variant: b1
+  segformer_decoder: standard
+  pretrained: true
+  freeze: false
+  freeze_encoder: false
+
+training:
+  train_endpoint: false
+  max_optimizer_steps: 32000
+
+wandb:
+  name: cityscapes-source-segformer-b1-standard-32k
+  tags: [cityscapes, stage1, source-only, segformer-b1, standard-head, 32k]

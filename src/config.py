@@ -125,6 +125,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "prior_noise_std": 1.0,
         "backbone": "segformer",
         "segformer_variant": "b0",
+        "segformer_decoder": "custom",
         "pretrained": True,
         "checkpoint": None,
         "freeze": False,
@@ -615,6 +616,10 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
         )
     if config["source"]["backbone"] not in {"segformer", "unet"}:
         raise ValueError("source.backbone must be segformer or unet")
+    if config["source"]["segformer_decoder"] not in {"custom", "standard"}:
+        raise ValueError(
+            "source.segformer_decoder must be custom or standard"
+        )
     if config["source"]["representation"] not in {"probability", "logits"}:
         raise ValueError("source.representation must be probability or logits")
     supervision = config["source"]["supervision"]

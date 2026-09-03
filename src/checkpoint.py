@@ -44,6 +44,9 @@ def model_signature(config: dict) -> dict[str, Any]:
         key: copy.deepcopy(config["source"][key])
         for key in source_keys
     }
+    decoder_type = config["source"].get("segformer_decoder", "custom")
+    if decoder_type != "custom":
+        source_signature["segformer_decoder"] = decoder_type
     # Omit the new false default so checkpoints created before include_void
     # existed retain exactly the same architecture signature.
     supervision = source_signature.get("supervision")
@@ -54,6 +57,33 @@ def model_signature(config: dict) -> dict[str, Any]:
         "model": model_config,
         "source": source_signature,
     }
+
+
+def _configured_source_decoder(config: dict) -> str | None:
+    source = config.get("source", {})
+    if (
+        source.get("type", "trainable_segformer") == "trainable_segformer"
+        and source.get("backbone") == "segformer"
+    ):
+        return source.get("segformer_decoder", "custom")
+    return None
+
+
+def validate_source_decoder_checkpoint(
+    checkpoint: dict, config: dict, path: str | Path
+) -> None:
+    """Reject cross-decoder loads before state-dict shape/key failures."""
+    current = _configured_source_decoder(config)
+    saved_config = checkpoint.get("config")
+    if current is None or not isinstance(saved_config, dict):
+        return
+    saved = _configured_source_decoder(saved_config)
+    if saved is not None and saved != current:
+        raise RuntimeError(
+            "SegFormer source decoder mismatch: "
+            f"checkpoint={saved!r}, config={current!r}, path={path}. "
+            "Custom and standard decoder checkpoints are not interchangeable."
+        )
 
 
 def checkpoint_payload(
@@ -171,6 +201,7 @@ def _validate_joint_stage1_boundary(
 def _validate_stage2_init_checkpoint(
     checkpoint: dict, config: dict, path: str | Path
 ) -> None:
+    validate_source_decoder_checkpoint(checkpoint, config, path)
     saved_stage = checkpoint.get("stage")
     if saved_stage == "joint_training":
         _validate_joint_stage1_boundary(checkpoint, path)
@@ -419,6 +450,7 @@ def initialize_or_resume(
         )
     if resume:
         checkpoint = torch.load(resume, map_location="cpu", weights_only=False)
+        validate_source_decoder_checkpoint(checkpoint, config, resume)
         if not _resume_stage_compatible(checkpoint, config):
             raise RuntimeError(
                 f"Resume stage mismatch: checkpoint={checkpoint.get('stage')} "

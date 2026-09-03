@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import math
 
 import torch
@@ -75,16 +76,23 @@ class SegFormerSourceGenerator(nn.Module):
         "b2": [64, 128, 320, 512], "b3": [64, 128, 320, 512],
         "b4": [64, 128, 320, 512], "b5": [64, 128, 320, 512],
     }
+    DECODER_HIDDEN = {
+        "b0": 256, "b1": 256, "b2": 768, "b3": 768,
+        "b4": 768, "b5": 768,
+    }
 
     def __init__(
         self, num_classes: int, variant: str, pretrained: bool, decoder_channels: int,
         freeze_encoder: bool, learned_logvar: bool, fixed_std, mu_tanh_scale: float,
         input_already_normalized: bool = False,
         state_downsample_factor: int = 4,
+        decoder_type: str = "custom",
     ) -> None:
         super().__init__()
         if variant not in self.MODEL_NAMES:
             raise ValueError(f"Unknown SegFormer variant: {variant}")
+        if decoder_type not in {"custom", "standard"}:
+            raise ValueError("decoder_type must be custom or standard")
         try:
             from transformers import SegformerConfig, SegformerModel
         except ImportError as exc:
@@ -106,18 +114,37 @@ class SegFormerSourceGenerator(nn.Module):
         self.mu_tanh_scale = mu_tanh_scale
         self.input_already_normalized = input_already_normalized
         self.state_downsample_factor = state_downsample_factor
-        hidden_sizes = list(self.encoder.config.hidden_sizes)
-        self.projections = nn.ModuleList(
-            nn.Conv2d(size, decoder_channels, 1) for size in hidden_sizes
-        )
+        self.segformer_decoder = decoder_type
         output_channels = num_classes * 2 if self.fixed_std is None else num_classes
-        self.decoder = nn.Sequential(
-            nn.Conv2d(decoder_channels * 4, decoder_channels, 3, padding=1),
-            group_norm(decoder_channels), nn.SiLU(),
-            nn.Conv2d(decoder_channels, decoder_channels, 3, padding=1),
-            group_norm(decoder_channels), nn.SiLU(),
-            nn.Conv2d(decoder_channels, output_channels, 1),
-        )
+        if decoder_type == "custom":
+            hidden_sizes = list(self.encoder.config.hidden_sizes)
+            self.projections = nn.ModuleList(
+                nn.Conv2d(size, decoder_channels, 1) for size in hidden_sizes
+            )
+            self.decoder = nn.Sequential(
+                nn.Conv2d(decoder_channels * 4, decoder_channels, 3, padding=1),
+                group_norm(decoder_channels), nn.SiLU(),
+                nn.Conv2d(decoder_channels, decoder_channels, 3, padding=1),
+                group_norm(decoder_channels), nn.SiLU(),
+                nn.Conv2d(decoder_channels, output_channels, 1),
+            )
+        else:
+            try:
+                from transformers.models.segformer.modeling_segformer import (
+                    SegformerDecodeHead,
+                )
+            except ImportError as exc:
+                raise RuntimeError(
+                    "The installed transformers version does not expose "
+                    "SegformerDecodeHead"
+                ) from exc
+            head_config = copy.deepcopy(self.encoder.config)
+            head_config.decoder_hidden_size = self.DECODER_HIDDEN[variant]
+            head_config.num_labels = output_channels
+            self.decode_head = SegformerDecodeHead(head_config)
+            # Match SegformerForSemanticSegmentation.post_init() while avoiding
+            # construction of a second, immediately discarded MiT encoder.
+            self.decode_head.apply(self.encoder._init_weights)
         self.register_buffer(
             "mean", torch.tensor([0.485, 0.456, 0.406])[None, :, None, None],
             persistent=False,
@@ -138,11 +165,21 @@ class SegFormerSourceGenerator(nn.Module):
             pixel_values=normalized, output_hidden_states=True, return_dict=True
         ).hidden_states[-4:]
         target_size = state_spatial_size(image, self.state_downsample_factor)
-        features = [
-            F.interpolate(projection(hidden), target_size, mode="bilinear", align_corners=False)
-            for hidden, projection in zip(hidden_states, self.projections)
-        ]
-        output = self.decoder(torch.cat(features, dim=1))
+        if getattr(self, "segformer_decoder", "custom") == "standard":
+            output = self.decode_head(hidden_states)
+            if output.shape[-2:] != target_size:
+                output = F.interpolate(
+                    output, size=target_size, mode="bilinear", align_corners=False
+                )
+        else:
+            features = [
+                F.interpolate(
+                    projection(hidden), target_size,
+                    mode="bilinear", align_corners=False,
+                )
+                for hidden, projection in zip(hidden_states, self.projections)
+            ]
+            output = self.decoder(torch.cat(features, dim=1))
         if self.fixed_std is None:
             mu, logvar = output.chunk(2, dim=1)
         else:
@@ -315,9 +352,15 @@ def build_source_model(config: dict):
             source["learned_logvar"], fixed_std, source["mu_tanh_scale"],
             source["input_already_normalized"],
             config["model"].get("state_downsample_factor", 4),
+            source["segformer_decoder"],
         )
     if source["checkpoint"]:
         checkpoint = torch.load(source["checkpoint"], map_location="cpu", weights_only=False)
+        if isinstance(checkpoint, dict) and "config" in checkpoint:
+            from checkpoint import validate_source_decoder_checkpoint
+            validate_source_decoder_checkpoint(
+                checkpoint, config, source["checkpoint"]
+            )
         state = checkpoint.get("source_model", checkpoint.get("model", checkpoint))
         model.load_state_dict(state, strict=True)
     if source["freeze"]:
