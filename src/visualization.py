@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 from pathlib import Path
+import math
 
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 
 CITYSCAPES_PALETTE = np.asarray([
@@ -112,11 +114,13 @@ def save_prediction(
 
 def save_adaptive_path_debug(
     image: torch.Tensor,
+    target: torch.Tensor,
     debug: dict[str, torch.Tensor | tuple[float, ...]],
     path: str | Path,
     *,
     imagenet_normalize: bool = False,
     dataset_name: str = "cityscapes",
+    num_classes: int = 20,
 ) -> None:
     """Save source prediction, entropy, difficulty, and configured lambda maps."""
     image = image.detach().cpu()
@@ -124,31 +128,107 @@ def save_adaptive_path_debug(
         mean = image.new_tensor([0.485, 0.456, 0.406])[:, None, None]
         std = image.new_tensor([0.229, 0.224, 0.225])[:, None, None]
         image = image * std + mean
-    prediction = debug["source_prediction"][0].detach().cpu()
-    entropy = debug["entropy"][0].detach().float().cpu()
-    difficulty = debug["difficulty"][0].detach().float().cpu()
-    lambdas = debug["lambdas"][0].detach().float().cpu()
+    target = target.detach().cpu()
+    display_size = tuple(target.shape[-2:])
+    source_mean = debug["source_mean"][0:1].detach().float()
+    prediction = F.interpolate(
+        source_mean, display_size, mode="bilinear", align_corners=False
+    )[0].argmax(dim=0).cpu()
+    entropy = F.interpolate(
+        debug["entropy"][0:1, None].detach().float(),
+        display_size, mode="bilinear", align_corners=False,
+    )[0, 0].cpu()
+    difficulty = F.interpolate(
+        debug["difficulty"][0:1, None].detach().float(),
+        display_size, mode="bilinear", align_corners=False,
+    )[0, 0].cpu()
+    lambdas = F.interpolate(
+        debug["lambdas"][0].detach().float()[:, None],
+        display_size, mode="bilinear", align_corners=False,
+    )[:, 0].cpu()
     times = debug["times"]
-    panels = 4 + len(times)
+    semantic_mask = F.interpolate(
+        debug["source_semantic_mask"][0:1, None].detach().float(),
+        display_size, mode="nearest",
+    )[0, 0].bool().cpu()
+    panels = 6 + len(times)
     columns = 4
     rows = (panels + columns - 1) // columns
     figure, axes = plt.subplots(rows, columns, figsize=(4 * columns, 4 * rows))
     axes = np.asarray(axes).reshape(-1)
     axes[0].imshow(image.clamp(0, 1).permute(1, 2, 0))
     axes[0].set_title("image")
-    axes[1].imshow(colorize(prediction, dataset_name))
-    axes[1].set_title("source prediction")
-    axes[2].imshow(entropy, cmap="magma")
-    axes[2].set_title("source entropy")
-    axes[3].imshow(difficulty, cmap="coolwarm", vmin=-1.0, vmax=1.0)
-    axes[3].set_title("difficulty")
+    axes[1].imshow(colorize(target, dataset_name))
+    axes[1].set_title("ground truth")
+    axes[2].imshow(colorize(prediction, dataset_name))
+    axes[2].set_title("source prediction")
+    entropy_image = axes[3].imshow(
+        entropy, cmap="magma", vmin=0.0, vmax=math.log(num_classes)
+    )
+    axes[3].set_title(
+        f"entropy\nmin={entropy.min():.3f} mean={entropy.mean():.3f} "
+        f"max={entropy.max():.3f}"
+    )
+    figure.colorbar(entropy_image, ax=axes[3], fraction=0.046, pad=0.04)
+    axes[4].imshow(~semantic_mask, cmap="gray", vmin=0, vmax=1)
+    axes[4].set_title("source-predicted void")
+    difficulty_image = axes[5].imshow(
+        difficulty, cmap="coolwarm", vmin=-1.0, vmax=1.0
+    )
+    axes[5].set_title("difficulty (easy / neutral / hard)")
+    figure.colorbar(difficulty_image, ax=axes[5], fraction=0.046, pad=0.04)
     for index, value in enumerate(times):
-        axes[4 + index].imshow(lambdas[index], cmap="viridis", vmin=0.0, vmax=1.0)
-        axes[4 + index].set_title(f"lambda(t={value:g})")
+        axes[6 + index].imshow(lambdas[index], cmap="viridis", vmin=0.0, vmax=1.0)
+        axes[6 + index].set_title(f"lambda(t={value:g})")
     for axis in axes:
         axis.axis("off")
     for axis in axes[panels:]:
         axis.set_visible(False)
+    destination = Path(path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    figure.tight_layout()
+    figure.savefig(destination, bbox_inches="tight")
+    plt.close(figure)
+
+
+def save_source_diagnostics(
+    image: torch.Tensor,
+    target: torch.Tensor,
+    prediction: torch.Tensor,
+    entropy: torch.Tensor,
+    path: str | Path,
+    *,
+    num_classes: int,
+    imagenet_normalize: bool = False,
+    dataset_name: str = "cityscapes",
+) -> None:
+    """Save the source-only validation view with a fixed entropy scale."""
+    image = image.detach().float().cpu()
+    if imagenet_normalize:
+        mean = image.new_tensor([0.485, 0.456, 0.406])[:, None, None]
+        std = image.new_tensor([0.229, 0.224, 0.225])[:, None, None]
+        image = image * std + mean
+    target = target.detach().cpu()
+    prediction = prediction.detach().cpu()
+    entropy = entropy.detach().float().cpu()
+    figure, axes = plt.subplots(2, 2, figsize=(12, 9))
+    axes = axes.reshape(-1)
+    axes[0].imshow(image.clamp(0, 1).permute(1, 2, 0))
+    axes[0].set_title("input image")
+    axes[1].imshow(colorize(target, dataset_name))
+    axes[1].set_title("ground truth")
+    axes[2].imshow(colorize(prediction, dataset_name))
+    axes[2].set_title("source mean prediction")
+    entropy_image = axes[3].imshow(
+        entropy, cmap="magma", vmin=0.0, vmax=math.log(num_classes)
+    )
+    axes[3].set_title(
+        f"entropy\nmin={entropy.min():.3f} mean={entropy.mean():.3f} "
+        f"max={entropy.max():.3f}"
+    )
+    figure.colorbar(entropy_image, ax=axes[3], fraction=0.046, pad=0.04)
+    for axis in axes:
+        axis.axis("off")
     destination = Path(path)
     destination.parent.mkdir(parents=True, exist_ok=True)
     figure.tight_layout()

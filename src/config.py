@@ -144,6 +144,13 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "supervision": {
             "type": None,
             "weight": None,
+            "include_void": False,
+        },
+        "diagnostics": {
+            "enabled": False,
+            "visualization": False,
+            "max_visualizations": 16,
+            "entropy_bins": 10,
         },
     },
     "flow": {
@@ -159,6 +166,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
                 "image_wise": True,
                 "zscore_clip": 3.0,
                 "exclude_ignore": True,
+                "exclude_predicted_void": False,
             },
             "scheduler": {
                 "type": "mean_preserving_additive",
@@ -285,6 +293,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "strict_model": True,
     },
     "evaluation": {
+        "source_only": False,
         "split": "val",
         "batch_size": 4,
         "num_steps": 15,
@@ -615,6 +624,19 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
         )
     if supervision["weight"] is not None and supervision["weight"] < 0:
         raise ValueError("source.supervision.weight must be non-negative")
+    if not isinstance(supervision.get("include_void", False), bool):
+        raise ValueError("source.supervision.include_void must be boolean")
+    source_diagnostics = config["source"]["diagnostics"]
+    if not isinstance(source_diagnostics["enabled"], bool) or not isinstance(
+        source_diagnostics["visualization"], bool
+    ):
+        raise ValueError("source diagnostic flags must be boolean")
+    if source_diagnostics["max_visualizations"] < 0:
+        raise ValueError("source.diagnostics.max_visualizations must be non-negative")
+    if source_diagnostics["entropy_bins"] <= 0:
+        raise ValueError("source.diagnostics.entropy_bins must be positive")
+    if not isinstance(config["evaluation"]["source_only"], bool):
+        raise ValueError("evaluation.source_only must be boolean")
     if config["source"]["type"] == "task_finetuned_segformer":
         if config["source"]["prior_type"] != "image_gaussian":
             raise ValueError(
@@ -634,6 +656,9 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
             raise ValueError(
                 "Frozen task_finetuned_segformer requires source.supervision.type=none"
             )
+    if supervision.get("include_void", False) is False:
+        # Preserve the exact legacy resolved supervision mapping.
+        supervision.pop("include_void", None)
     if config["flow"]["time_eps"] <= 0:
         raise ValueError("flow.time_eps must be positive")
     path = config["flow"]["path"]
@@ -655,6 +680,8 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
             raise ValueError("entropy normalization currently requires image_wise=true")
         if not isinstance(entropy["exclude_ignore"], bool):
             raise ValueError("entropy exclude_ignore must be boolean")
+        if not isinstance(entropy["exclude_predicted_void"], bool):
+            raise ValueError("entropy exclude_predicted_void must be boolean")
         path_scheduler = path["scheduler"]
         if path_scheduler["type"] != "mean_preserving_additive":
             raise ValueError("unsupported flow.path.scheduler.type")
@@ -821,6 +848,7 @@ def apply_overrides(config: dict[str, Any], overrides: Iterable[str]) -> dict[st
         result["source"]["supervision"] = {
             "type": "align" if result["source"]["use_loss_align"] else "none",
             "weight": result["source"]["align_weight"],
+            "include_void": False,
         }
     if {
         "model.image_encoder.type", "model.image_encoder.variant"
@@ -918,6 +946,7 @@ def load_config(path: str | Path, overrides: Iterable[str] = ()) -> dict[str, An
         config["source"]["supervision"] = {
             "type": "align" if config["source"]["use_loss_align"] else "none",
             "weight": config["source"]["align_weight"],
+            "include_void": False,
         }
     if select(raw, "loss.consistency.start", None) is None:
         config["loss"]["consistency"]["start"] = {

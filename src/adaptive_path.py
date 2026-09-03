@@ -39,21 +39,6 @@ def shannon_entropy(
     return -(probability * probability.clamp_min(eps).log()).sum(dim=1)
 
 
-def _center_and_scale(
-    values: torch.Tensor, valid: torch.Tensor, eps: float
-) -> torch.Tensor:
-    count = valid.sum().to(values.dtype)
-    mean = (values * valid).sum() / count.clamp_min(1.0)
-    centered = torch.where(valid, values - mean, torch.zeros_like(values))
-    scale = centered.abs().max().clamp_min(eps)
-    result = centered / scale
-    # A second centering makes the mean-zero invariant robust to rounding.
-    mean = (result * valid).sum() / count.clamp_min(1.0)
-    result = torch.where(valid, result - mean, torch.zeros_like(result))
-    scale = result.abs().max().clamp_min(1.0)
-    return (result / scale).clamp(-1.0, 1.0)
-
-
 def _average_rank(values: torch.Tensor) -> torch.Tensor:
     """Zero-based average ranks for one 1-D tensor, including stable ties."""
     if values.numel() <= 1:
@@ -77,6 +62,7 @@ def normalize_entropy(
     valid_mask: torch.Tensor | None = None,
     eps: float = 1.0e-8,
     zscore_clip: float = 3.0,
+    num_classes: int = 20,
 ) -> torch.Tensor:
     """Normalize entropy image-wise to mean-zero difficulty in ``[-1,1]``."""
     if entropy.ndim != 3:
@@ -87,6 +73,8 @@ def normalize_entropy(
         raise ValueError("entropy eps must be positive")
     if zscore_clip <= 0.0:
         raise ValueError("entropy zscore_clip must be positive")
+    if num_classes <= 1:
+        raise ValueError("num_classes must be greater than one")
     valid_mask = (
         torch.ones_like(entropy, dtype=torch.bool)
         if valid_mask is None
@@ -103,22 +91,32 @@ def normalize_entropy(
         if values.numel() == 0:
             continue
         if normalization == "mean":
-            transformed = values - values.mean()
+            normalized = (values - values.mean()) / torch.log(
+                values.new_tensor(float(num_classes))
+            )
         elif normalization == "zscore":
-            transformed = (values - values.mean()) / values.std(
-                unbiased=False
-            ).clamp_min(eps)
-            transformed = transformed.clamp(-zscore_clip, zscore_clip) / zscore_clip
+            standard_deviation = values.std(unbiased=False)
+            if standard_deviation <= eps:
+                normalized = torch.zeros_like(values)
+            else:
+                zscore = (values - values.mean()) / (standard_deviation + eps)
+                clipped = zscore.clamp(-zscore_clip, zscore_clip)
+                clipped_mean = clipped.mean()
+                normalized = (clipped - clipped_mean) / (
+                    zscore_clip + clipped_mean.abs() + eps
+                )
         elif normalization == "minmax":
-            transformed = (values - values.min()) / (
-                values.max() - values.min()
-            ).clamp_min(eps)
+            value_range = values.max() - values.min()
+            if value_range <= eps:
+                normalized = torch.zeros_like(values)
+            else:
+                percentile = (values - values.min()) / (value_range + eps)
+                normalized = percentile - percentile.mean()
         else:
-            transformed = 2.0 * _average_rank(values) - 1.0
-        normalized = _center_and_scale(
-            transformed, torch.ones_like(transformed, dtype=torch.bool), eps
-        )
-        output[index][valid] = normalized
+            normalized = 2.0 * _average_rank(values) - 1.0
+            # Average ranks are analytically centered; remove fp roundoff only.
+            normalized = normalized - normalized.mean()
+        output[index][valid] = normalized.clamp(-1.0, 1.0)
     return output
 
 
@@ -146,14 +144,35 @@ def source_entropy_difficulty(
             entropy[:, None], size=spatial_size, mode="bilinear", align_corners=False
         )[:, 0]
     mask = valid_mask if entropy_config.get("exclude_ignore", True) else None
+    if entropy_config.get("exclude_predicted_void", False):
+        semantic_mask = source_predicted_semantic_mask(source_state, config)
+        if semantic_mask.shape[-2:] != entropy.shape[-2:]:
+            semantic_mask = F.interpolate(
+                semantic_mask[:, None].float(), entropy.shape[-2:], mode="nearest"
+            )[:, 0].bool()
+        mask = semantic_mask if mask is None else mask & semantic_mask
     difficulty = normalize_entropy(
         entropy,
         entropy_config["normalization"],
         valid_mask=mask,
         eps=float(entropy_config["eps"]),
         zscore_clip=float(entropy_config["zscore_clip"]),
+        num_classes=int(config["dataset"]["num_classes"]),
     )
     return entropy, difficulty
+
+
+def source_predicted_semantic_mask(
+    source_state: torch.Tensor, config: dict
+) -> torch.Tensor:
+    """Mask pixels whose source argmax is not the configured void class."""
+    void_index = config["dataset"].get("void_class_index")
+    if void_index is None:
+        return torch.ones(
+            source_state.shape[0], *source_state.shape[-2:],
+            dtype=torch.bool, device=source_state.device,
+        )
+    return source_state.argmax(dim=1) != int(void_index)
 
 
 def adaptive_lambda(

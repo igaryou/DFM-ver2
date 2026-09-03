@@ -145,8 +145,15 @@ CUDA_VISIBLE_DEVICES=0 uv run python src/train_joint.py \
 \partial_t\lambda_i(t)=1-\beta(1-2t)d_i
 \]
 
-を使います。ignore/void は normalization 統計から除外でき、sampling 中は画像から
-一度計算した `d` を再利用します。`beta=0` は従来線形経路と一致します。
+を使います。推奨configではGT maskをdifficulty生成に使わず、source自身がvoid=19と
+予測したpixelをnormalizationから除外して`d=0`（したがって`lambda=t`）にします。
+sampling中は画像から一度計算した`d`を再利用します。`beta=0`は従来線形経路と一致します。
+
+各normalizationの定義は、`mean: (H-mean(H))/log(K)`、
+`minmax: r-mean(r)`、`zscore: (clip(z)-mean(clip(z)))/(c+|mean(clip(z))|+eps)`、
+`rank: 2*average_rank/(N-1)-1`です。方式差を保つため共通max-abs rescaleは行いません。
+Stage1 exampleは`source.supervision.include_void=true`なのでsource CEのみclass 19も学習し、
+Flow Maps側の`loss.ignore_index=19`は変更しません。
 
 SegFormer-B0 source-only CE 32k → frozen-source PSD 128k の例:
 
@@ -176,6 +183,13 @@ uv run python src/train.py \
 `flow.path.diagnostics.visualization=true` にすると各 epoch の先頭 batch について
 source prediction、entropy、difficulty、設定した時刻の lambda map を
 `<output_dir>/adaptive_path/` に保存します。
+
+Stage1 exampleの`evaluation.source_only=true`はendpoint/Flow Mapを呼ばずsource meanを
+直接評価します。19-class mIoU、non-void pixel accuracy、mean class accuracy、void
+IoU/precision/recall、predicted/GT void ratio、entropy percentile 10-bin accuracy、
+correct/incorrect entropy meanを記録し、`source.diagnostics.visualization=true`なら
+入力・GT・source prediction・固定`[0,log(K)]` entropy heatmapを
+`<output_dir>/source_diagnostics/`へ保存します。
 
 学習方式は2つです。
 

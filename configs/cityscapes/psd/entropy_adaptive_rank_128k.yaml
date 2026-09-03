@@ -13,7 +13,7 @@ source:
   freeze: true
   # Kept identical to Stage 1 for checkpoint signature safety. Frozen adaptive
   # Stage 2 bypasses source supervision and uses this model only for x0/entropy.
-  supervision: {type: cross_entropy, weight: 1.0}
+  supervision: {type: cross_entropy, weight: 1.0, include_void: true}
 
 flow:
   path:
@@ -23,7 +23,8 @@ flow:
       eps: 1.0e-8
       image_wise: true
       zscore_clip: 3.0
-      exclude_ignore: true
+      exclude_ignore: false
+      exclude_predicted_void: true
     scheduler:
       type: mean_preserving_additive
       beta: 0.5

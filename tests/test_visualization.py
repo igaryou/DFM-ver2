@@ -7,7 +7,9 @@ from visualization import (
     ADE20K_PALETTE,
     CITYSCAPES_PALETTE,
     colorize,
+    save_adaptive_path_debug,
     save_prediction,
+    save_source_diagnostics,
 )
 
 
@@ -95,3 +97,34 @@ def test_save_prediction_supports_ade20k_classes_above_19(tmp_path):
         assert saved.format == "PNG"
         assert saved.width > 0
         assert saved.height > 0
+
+
+def test_source_and_adaptive_diagnostic_visualizations_are_png(tmp_path):
+    image = torch.rand(3, 8, 12)
+    target = torch.randint(0, 20, (8, 12))
+    prediction = torch.randint(0, 20, (8, 12))
+    entropy = torch.rand(8, 12) * np.log(20)
+    source_path = tmp_path / "source.png"
+    save_source_diagnostics(
+        image, target, prediction, entropy, source_path, num_classes=20
+    )
+    adaptive_path = tmp_path / "adaptive.png"
+    save_adaptive_path_debug(
+        image, target,
+        {
+            "source_mean": torch.nn.functional.one_hot(
+                prediction, 20
+            ).permute(2, 0, 1)[None].float(),
+            "entropy": entropy[None],
+            "difficulty": torch.linspace(-1, 1, 96).reshape(1, 8, 12),
+            "source_semantic_mask": (prediction != 19)[None],
+            "lambdas": torch.rand(1, 4, 8, 12),
+            "times": (0.2, 0.4, 0.6, 0.8),
+        },
+        adaptive_path,
+        num_classes=20,
+    )
+    for path in (source_path, adaptive_path):
+        assert path.is_file()
+        with Image.open(path) as saved:
+            assert saved.format == "PNG"

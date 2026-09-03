@@ -9,7 +9,12 @@ source:
   type: trainable_segformer
   segformer_variant: b0
   freeze: false
-  supervision: {type: cross_entropy, weight: 1.0}
+  supervision: {type: cross_entropy, weight: 1.0, include_void: true}
+  diagnostics:
+    enabled: true
+    visualization: true
+    max_visualizations: 16
+    entropy_bins: 10
 
 training:
   train_endpoint: false
@@ -24,6 +29,7 @@ loss:
     weight: 0.0
 
 evaluation:
+  source_only: true
   interval: {unit: optimizer_step, value: 32000}
 
 wandb:

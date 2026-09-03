@@ -45,7 +45,7 @@ class UNetSourceGenerator(nn.Module):
         ))
         self.network = nn.Sequential(*layers)
 
-    def forward(self, image: torch.Tensor):
+    def forward_statistics(self, image: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         output = self.network(image)
         assert output.shape[-2:] == state_spatial_size(
             image, self.state_downsample_factor
@@ -55,6 +55,10 @@ class UNetSourceGenerator(nn.Module):
         else:
             mu = output
             logvar = torch.full_like(mu, math.log(float(self.fixed_std) ** 2))
+        return mu, logvar
+
+    def forward(self, image: torch.Tensor):
+        mu, logvar = self.forward_statistics(image)
         return mu + torch.exp(0.5 * logvar) * torch.randn_like(mu), mu, logvar
 
 
@@ -126,7 +130,7 @@ class SegFormerSourceGenerator(nn.Module):
             for parameter in self.encoder.parameters():
                 parameter.requires_grad = False
 
-    def forward(self, image: torch.Tensor):
+    def forward_statistics(self, image: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         normalized = image if self.input_already_normalized else (
             image - self.mean.to(image)
         ) / self.std.to(image)
@@ -146,6 +150,10 @@ class SegFormerSourceGenerator(nn.Module):
             logvar = torch.full_like(mu, math.log(float(self.fixed_std) ** 2))
         if self.mu_tanh_scale > 0:
             mu = torch.tanh(mu) * self.mu_tanh_scale
+        return mu, logvar
+
+    def forward(self, image: torch.Tensor):
+        mu, logvar = self.forward_statistics(image)
         return mu + torch.exp(0.5 * logvar) * torch.randn_like(mu), mu, logvar
 
 
@@ -229,7 +237,7 @@ class TaskFinetunedSegFormerSourceGenerator(nn.Module):
             return super().train(False)
         return super().train(mode)
 
-    def forward(self, image: torch.Tensor):
+    def forward_statistics(self, image: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         normalized = image if self.input_already_normalized else (
             image - self.mean.to(image)
         ) / self.std.to(image)
@@ -255,10 +263,23 @@ class TaskFinetunedSegFormerSourceGenerator(nn.Module):
             self.void_channel_value,
         ).index_copy(1, self.semantic_indices, semantic)
         logvar = torch.full_like(mu, math.log(self.fixed_std**2))
+        assert mu.shape[1:] == (self.num_classes, *target_size)
+        return mu, logvar
+
+    def forward(self, image: torch.Tensor):
+        mu, logvar = self.forward_statistics(image)
         x0 = mu + torch.exp(0.5 * logvar) * torch.randn_like(mu)
         assert x0.shape == mu.shape == logvar.shape
-        assert mu.shape[1:] == (self.num_classes, *target_size)
         return x0, mu, logvar
+
+
+def source_statistics(source_model: nn.Module, image: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return source mean/log-variance without sampling x0 when supported."""
+    forward_statistics = getattr(source_model, "forward_statistics", None)
+    if forward_statistics is not None:
+        return forward_statistics(image)
+    _, mean, log_variance = source_model(image)
+    return mean, log_variance
 
 
 def build_source_model(config: dict):

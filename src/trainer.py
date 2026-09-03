@@ -7,6 +7,7 @@ from pathlib import Path
 
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from tqdm.auto import tqdm
@@ -16,6 +17,7 @@ from checkpoint import (
     initialize_or_resume,
     save_checkpoint,
 )
+from adaptive_path import shannon_entropy
 from config import save_resolved_config
 from dataset import ade20k_eval_collate, build_dataset
 from dfm_stabilization import GradientSurgeryAccumulator
@@ -37,9 +39,14 @@ from distributed import (
     validate_global_batch_size,
     wrap_ddp,
 )
-from inference import sample_segmentation, terminal_state_to_original_prediction
+from inference import (
+    sample_segmentation,
+    state_to_original_continuous,
+    terminal_state_to_original_prediction,
+)
 from metrics import SegmentationMetrics
 from model_factory import build_models
+from source_model import source_statistics
 from training_objectives import (
     DDPCompatibleTrainingModel,
     run_model_training_objectives,
@@ -52,7 +59,11 @@ from utils import (
     seed_everything,
     setup_logger,
 )
-from visualization import save_adaptive_path_debug, save_prediction
+from visualization import (
+    save_adaptive_path_debug,
+    save_prediction,
+    save_source_diagnostics,
+)
 
 
 MAX_REDUCTION_KEYS = {
@@ -716,6 +727,211 @@ def _build_loaders(
     return train_loader, val_loader, train_sampler
 
 
+def _accumulate_entropy_percentiles(
+    entropy: torch.Tensor,
+    correct: torch.Tensor,
+    valid: torch.Tensor,
+    counts: torch.Tensor,
+    correct_counts: torch.Tensor,
+    entropy_sums: torch.Tensor,
+) -> None:
+    """Accumulate image-wise entropy percentile diagnostics on non-void GT."""
+    bins = counts.numel()
+    for sample_entropy, sample_correct, sample_valid in zip(
+        entropy, correct, valid, strict=True
+    ):
+        values = sample_entropy[sample_valid].double()
+        correctness = sample_correct[sample_valid].double()
+        if not values.numel():
+            continue
+        order = torch.argsort(values, stable=True)
+        bin_indices = torch.div(
+            torch.arange(values.numel(), device=values.device) * bins,
+            values.numel(), rounding_mode="floor",
+        ).clamp_max(bins - 1)
+        ones = torch.ones_like(values, dtype=counts.dtype)
+        counts.scatter_add_(0, bin_indices, ones)
+        correct_counts.scatter_add_(0, bin_indices, correctness.to(counts.dtype)[order])
+        entropy_sums.scatter_add_(0, bin_indices, values[order])
+
+
+@torch.no_grad()
+def validate_source_only(
+    config: dict,
+    training_model,
+    loader,
+    context: DistributedContext,
+    output_dir: Path,
+) -> dict:
+    """Validate the source mean directly, without endpoint or Flow Map inference."""
+    adapter = unwrap_model(training_model)
+    endpoint, source = adapter.endpoint_model, adapter.source_model
+    if source is None:
+        raise RuntimeError("source-only validation requires a source model")
+    endpoint.eval()
+    source.eval()
+    classes = config["dataset"]["num_classes"]
+    void_index = config["dataset"]["void_class_index"]
+    semantic_metrics = SegmentationMetrics(
+        classes, void_index, device=context.device,
+        evaluated_class_indices=[
+            index for index in range(classes) if index != void_index
+        ],
+        prediction_void_retained=True,
+    )
+    full_confusion = torch.zeros(
+        classes, classes, dtype=torch.int64, device=context.device
+    )
+    diagnostic_config = config["source"]["diagnostics"]
+    bins = int(diagnostic_config["entropy_bins"])
+    bin_counts = torch.zeros(bins, dtype=torch.float64, device=context.device)
+    bin_correct = torch.zeros_like(bin_counts)
+    bin_entropy = torch.zeros_like(bin_counts)
+    correct_entropy = torch.zeros(2, dtype=torch.float64, device=context.device)
+    incorrect_entropy = torch.zeros(2, dtype=torch.float64, device=context.device)
+    visualized = 0
+    maximum_batches = config["evaluation"]["max_batches"]
+    representation = (
+        config["source"]["representation"]
+        if config["source"].get("type") == "task_finetuned_segformer"
+        else "logits"
+    )
+
+    for batch_index, batch in enumerate(loader):
+        if maximum_batches is not None and batch_index >= maximum_batches:
+            break
+        samples = batch if isinstance(batch, list) else [
+            {"image": image, "target": target}
+            for image, target in zip(*batch, strict=True)
+        ]
+        for sample in samples:
+            image = sample["image"].unsqueeze(0).to(context.device, non_blocking=True)
+            target = sample["target"].unsqueeze(0).to(context.device, non_blocking=True)
+            with autocast_context(config, context.device):
+                mean, _ = source_statistics(source, image)
+            entropy_state = shannon_entropy(
+                mean, representation=representation,
+                eps=config["flow"]["probability_eps"],
+            )
+            if "original_shape" in sample:
+                mean_full = state_to_original_continuous(
+                    mean.float(), sample["model_shape"], sample["original_shape"],
+                    padded_shape=sample["padded_shape"],
+                    align_corners=config["evaluation"]["align_corners"],
+                )
+                entropy_full = state_to_original_continuous(
+                    entropy_state[:, None], sample["model_shape"],
+                    sample["original_shape"], padded_shape=sample["padded_shape"],
+                    align_corners=config["evaluation"]["align_corners"],
+                )[:, 0]
+                model_height, model_width = (int(v) for v in sample["model_shape"])
+                display_image = F.interpolate(
+                    image[..., :model_height, :model_width].float(),
+                    size=target.shape[-2:], mode="bilinear", align_corners=False,
+                )[0]
+            else:
+                mean_full = F.interpolate(
+                    mean.float(), target.shape[-2:], mode="bilinear", align_corners=False
+                )
+                entropy_full = F.interpolate(
+                    entropy_state[:, None], target.shape[-2:],
+                    mode="bilinear", align_corners=False,
+                )[:, 0]
+                display_image = image[0]
+            prediction = mean_full.argmax(dim=1)
+            semantic_metrics.update(prediction, target)
+            valid_all = (
+                (target >= 0) & (target < classes)
+                & (prediction >= 0) & (prediction < classes)
+            )
+            indices = target[valid_all] * classes + prediction[valid_all]
+            full_confusion += torch.bincount(
+                indices, minlength=classes**2
+            ).reshape(classes, classes)
+            semantic_valid = valid_all & (target != void_index)
+            correct = prediction == target
+            if diagnostic_config["enabled"]:
+                _accumulate_entropy_percentiles(
+                    entropy_full, correct, semantic_valid,
+                    bin_counts, bin_correct, bin_entropy,
+                )
+                correct_values = entropy_full[semantic_valid & correct].double()
+                incorrect_values = entropy_full[semantic_valid & ~correct].double()
+                correct_entropy[0] += correct_values.sum()
+                correct_entropy[1] += correct_values.numel()
+                incorrect_entropy[0] += incorrect_values.sum()
+                incorrect_entropy[1] += incorrect_values.numel()
+            if (
+                context.is_main_process
+                and diagnostic_config["enabled"]
+                and diagnostic_config["visualization"]
+                and visualized < diagnostic_config["max_visualizations"]
+            ):
+                save_source_diagnostics(
+                    display_image, target[0], prediction[0], entropy_full[0],
+                    output_dir / "source_diagnostics"
+                    / f"source_val_{visualized:04d}.png",
+                    num_classes=classes,
+                    imagenet_normalize=(
+                        config["augmentation"]["imagenet_normalize"]
+                        or config["augmentation"]["normalize"]["enabled"]
+                    ),
+                    dataset_name=config["dataset"]["name"],
+                )
+                visualized += 1
+
+    semantic_metrics.confusion_matrix = all_reduce_confusion_matrix(
+        semantic_metrics.confusion_matrix, context
+    )
+    full_confusion = all_reduce_confusion_matrix(full_confusion, context)
+    if context.distributed:
+        for tensor in (
+            bin_counts, bin_correct, bin_entropy,
+            correct_entropy, incorrect_entropy,
+        ):
+            dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+    semantic = semantic_metrics.compute()
+    true_positive = full_confusion.diag().double()
+    gt_count = full_confusion.sum(dim=1).double()
+    predicted_count = full_confusion.sum(dim=0).double()
+    total = full_confusion.sum().double().clamp_min(1.0)
+    void_union = gt_count[void_index] + predicted_count[void_index] - true_positive[void_index]
+    result = {
+        **semantic,
+        "source_mIoU": semantic["mIoU"],
+        "source_pixel_acc": semantic["pixel_acc"],
+        "source_mAcc": semantic["mAcc"],
+        "source_void_iou": float(true_positive[void_index] / void_union.clamp_min(1.0)),
+        "source_predicted_void_ratio": float(predicted_count[void_index] / total),
+        "source_gt_void_ratio": float(gt_count[void_index] / total),
+        "source_void_precision": float(
+            true_positive[void_index] / predicted_count[void_index].clamp_min(1.0)
+        ),
+        "source_void_recall": float(
+            true_positive[void_index] / gt_count[void_index].clamp_min(1.0)
+        ),
+        "source_entropy_correct_mean": float(
+            correct_entropy[0] / correct_entropy[1].clamp_min(1.0)
+        ),
+        "source_entropy_incorrect_mean": float(
+            incorrect_entropy[0] / incorrect_entropy[1].clamp_min(1.0)
+        ),
+    }
+    for index in range(bins):
+        count = bin_counts[index].clamp_min(1.0)
+        accuracy = bin_correct[index] / count
+        has_values = bool(bin_counts[index] > 0)
+        result[f"source_entropy_bin_{index}_count"] = int(bin_counts[index])
+        result[f"source_entropy_bin_{index}_accuracy"] = float(accuracy)
+        result[f"source_entropy_bin_{index}_error_rate"] = float(
+            1.0 - accuracy if has_values else 0.0
+        )
+        result[f"source_entropy_bin_{index}_mean"] = float(bin_entropy[index] / count)
+    endpoint.train(config["training"].get("train_endpoint", True))
+    source.train(not config["source"]["freeze"])
+    return result
+
+
 @torch.no_grad()
 def validate(
     config: dict,
@@ -724,6 +940,10 @@ def validate(
     context: DistributedContext,
     output_dir: Path,
 ) -> dict:
+    if config["evaluation"].get("source_only", False):
+        return validate_source_only(
+            config, training_model, loader, context, output_dir
+        )
     adapter = unwrap_model(training_model)
     endpoint = adapter.endpoint_model
     source = adapter.source_model
@@ -1053,11 +1273,19 @@ def run_training(config: dict, *, joint_entrypoint: bool = False) -> dict:
                     result["mIoU"], result["pixel_acc"], result["mAcc"],
                 )
                 if wandb_run is not None:
-                    wandb_run.log({
+                    wandb_payload = {
                         "validation/mIoU": result["mIoU"],
                         "validation/pixel_acc": result["pixel_acc"],
                         "validation/mAcc": result["mAcc"],
-                    }, step=state.global_step)
+                    }
+                    if config["evaluation"].get("source_only", False):
+                        wandb_payload.update({
+                            f"validation/{key}": value
+                            for key, value in result.items()
+                            if key.startswith("source_")
+                            and isinstance(value, (int, float))
+                        })
+                    wandb_run.log(wandb_payload, step=state.global_step)
             if is_new_best and trigger in {
                 "optimizer_step_interval", "final_optimizer_step"
             }:
@@ -1187,6 +1415,7 @@ def run_training(config: dict, *, joint_entrypoint: bool = False) -> dict:
                     ):
                         save_adaptive_path_debug(
                             image[0],
+                            target[0],
                             objectives["path_debug"],
                             output_dir / "adaptive_path"
                             / f"epoch_{epoch_index + 1:04d}.png",
@@ -1195,6 +1424,7 @@ def run_training(config: dict, *, joint_entrypoint: bool = False) -> dict:
                                 or config["augmentation"]["normalize"]["enabled"]
                             ),
                             dataset_name=config["dataset"]["name"],
+                            num_classes=config["dataset"]["num_classes"],
                         )
 
                     grad_norm = None

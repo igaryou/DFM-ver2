@@ -10,6 +10,7 @@ from adaptive_path import (
     adaptive_path_stats,
     entropy_adaptive_enabled,
     source_entropy_difficulty,
+    source_predicted_semantic_mask,
 )
 from dfm_stabilization import (
     ESDTimeWeightNetwork,
@@ -88,6 +89,11 @@ def compute_model_training_objectives(
         ignore_index=ignore_index,
         mask_pixel_losses=config["loss"].get("mask_pixel_losses", False),
     )
+    source_only_stage1 = (
+        operation == "stage1_objectives"
+        and not training.get("train_endpoint", True)
+        and float(config["loss"]["primary"]["weight"]) == 0.0
+    )
     x0, source_stats = sample_prior(
         config,
         image,
@@ -95,7 +101,43 @@ def compute_model_training_objectives(
         source,
         target_full=targets.target_full,
         valid_mask_full=targets.valid_mask_full,
+        sample_state=not source_only_stage1,
     )
+    if source_only_stage1:
+        zero = _zero(image)
+        source_objective = source_stats.get(
+            "weighted_source_supervision", source_stats["weighted_align"]
+        ).float()
+        stats = {
+            "loss_total": source_objective.detach(),
+            "loss_diagonal": zero.detach(),
+            "loss_diagonal_raw": zero.detach(),
+            "loss_consistency": zero.detach(),
+            "consistency_base_weight": zero.detach(),
+            "consistency_schedule_weight": zero.detach(),
+            "consistency_effective_weight": zero.detach(),
+            "diagonal_time_mean": zero.detach(),
+            "valid_pixel_ratio": targets.valid_mask_full.float().mean().detach()
+            if targets.valid_mask_full is not None else zero.new_tensor(1.0),
+            "valid_state_pixel_ratio": targets.valid_mask_state.float().mean().detach()
+            if targets.valid_mask_state is not None else zero.new_tensor(1.0),
+            "state_height": zero.new_tensor(state_size[0]),
+            "state_width": zero.new_tensor(state_size[1]),
+        }
+        stats.update({
+            key: value.detach()
+            for key, value in source_stats.items()
+            if torch.is_tensor(value) and value.numel() == 1
+        })
+        return {
+            "loss": source_objective,
+            "diagonal_objective": zero,
+            "psd_objective": zero,
+            "source_objective": source_objective,
+            "stats": stats,
+            "operation": operation,
+            "consistency_type": "none",
+        }
     path_entropy = None
     path_difficulty = None
     if entropy_adaptive_enabled(config):
@@ -105,7 +147,11 @@ def compute_model_training_objectives(
         path_entropy, path_difficulty = source_entropy_difficulty(
             source_state,
             config,
-            valid_mask=targets.valid_mask_state,
+            valid_mask=(
+                targets.valid_mask_state
+                if config["flow"]["path"]["entropy"]["exclude_ignore"]
+                else None
+            ),
             spatial_size=state_size,
         )
     image_feat = endpoint.encode_image(image)
@@ -323,7 +369,8 @@ def compute_model_training_objectives(
             path_difficulty,
             diagonal_time,
             coefficient,
-            targets.valid_mask_state,
+            targets.valid_mask_state
+            if config["flow"]["path"]["entropy"]["exclude_ignore"] else None,
         ))
     for key, value in source_stats.items():
         if key not in stats and torch.is_tensor(value) and value.numel() == 1:
@@ -354,9 +401,12 @@ def compute_model_training_objectives(
     ]:
         selected_times = config["flow"]["path"]["diagnostics"]["times"]
         result["path_debug"] = {
-            "source_prediction": source_stats["_path_source_state"].argmax(dim=1).detach(),
+            "source_mean": source_stats["_path_source_state"].detach(),
             "entropy": path_entropy.detach(),
             "difficulty": path_difficulty.detach(),
+            "source_semantic_mask": source_predicted_semantic_mask(
+                source_stats["_path_source_state"], config
+            ).detach(),
             "lambdas": torch.stack([
                 path_coefficient(
                     diagonal_time.new_full(diagonal_time.shape, float(value)),

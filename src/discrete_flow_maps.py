@@ -12,6 +12,7 @@ from adaptive_path import (
     path_config as _path_config,
 )
 from state_space import resize_continuous, state_spatial_size
+from source_model import source_statistics
 
 
 def _time_view(time: torch.Tensor, ndim: int = 4) -> torch.Tensor:
@@ -248,6 +249,7 @@ def sample_prior(
     *,
     target_full: torch.Tensor | None = None,
     valid_mask_full: torch.Tensor | None = None,
+    sample_state: bool = True,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Sample state-resolution x0 and compute optional full-resolution supervision."""
     factor = config.get("model", {}).get("state_downsample_factor", 1)
@@ -302,7 +304,11 @@ def sample_prior(
     adaptive_frozen = entropy_adaptive_enabled(config) and source.get("freeze", False)
     source_context = torch.no_grad() if adaptive_frozen else nullcontext()
     with source_context:
-        x0, mu, logvar = source_model(image)
+        if sample_state:
+            x0, mu, logvar = source_model(image)
+        else:
+            mu, logvar = source_statistics(source_model, image)
+            x0 = mu
     assert x0.shape == mu.shape == logvar.shape
     assert x0.shape[:2] == (batch, classes)
     assert x0.shape[-2:] == (height, width), (
@@ -366,18 +372,22 @@ def sample_prior(
             )
     elif supervision_type == "cross_entropy" and target_full is not None:
         mu_full = resize_continuous(mu, target_full.shape[-2:])
-        ignore_index = config.get("loss", {}).get("ignore_index")
+        include_void = bool(supervision.get("include_void", False))
+        ignore_index = (
+            None if include_void else config.get("loss", {}).get("ignore_index")
+        )
         loss_map = F.cross_entropy(
             mu_full,
             target_full,
             reduction="none",
             ignore_index=-100 if ignore_index is None else ignore_index,
         )
-        if valid_mask_full is None:
+        source_valid_mask = None if include_void else valid_mask_full
+        if source_valid_mask is None:
             loss_ce = loss_map.mean()
         else:
-            assert valid_mask_full.shape == target_full.shape
-            weights = valid_mask_full.to(loss_map)
+            assert source_valid_mask.shape == target_full.shape
+            weights = source_valid_mask.to(loss_map)
             loss_ce = (loss_map * weights).sum() / weights.sum().clamp_min(1.0)
     loss_supervision = loss_align if supervision_type == "align" else loss_ce
     weighted_supervision = supervision_weight * loss_supervision

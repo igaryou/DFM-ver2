@@ -40,13 +40,19 @@ def model_signature(config: dict) -> dict[str, Any]:
         source_keys.extend((
             "type", "model_id", "representation", "void_channel_value",
         ))
+    source_signature = {
+        key: copy.deepcopy(config["source"][key])
+        for key in source_keys
+    }
+    # Omit the new false default so checkpoints created before include_void
+    # existed retain exactly the same architecture signature.
+    supervision = source_signature.get("supervision")
+    if isinstance(supervision, dict) and not supervision.get("include_void", False):
+        supervision.pop("include_void", None)
     return {
         "num_classes": config["dataset"]["num_classes"],
         "model": model_config,
-        "source": {
-            key: copy.deepcopy(config["source"][key])
-            for key in source_keys
-        },
+        "source": source_signature,
     }
 
 
