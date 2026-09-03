@@ -1,0 +1,31 @@
+extends: ../../_base_/cityscapes/swin_t_160k.yaml
+
+experiment:
+  name: cityscapes_source_segformer_b0_32k
+  output_dir: /home/igarashi_25/DFM/results/cityscapes/source_segformer_b0_32k
+  stage: diagonal_pretrain
+
+source:
+  type: trainable_segformer
+  segformer_variant: b0
+  freeze: false
+  supervision: {type: cross_entropy, weight: 1.0}
+
+training:
+  train_endpoint: false
+  max_optimizer_steps: 32000
+  checkpoint_interval_steps: 32000
+
+loss:
+  primary:
+    weight: 0.0
+  consistency:
+    enabled: false
+    weight: 0.0
+
+evaluation:
+  interval: {unit: optimizer_step, value: 32000}
+
+wandb:
+  name: cityscapes-source-segformer-b0-32k
+  tags: [cityscapes, stage1, source-only, segformer-b0, 32k]

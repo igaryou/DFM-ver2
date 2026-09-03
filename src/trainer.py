@@ -52,7 +52,7 @@ from utils import (
     seed_everything,
     setup_logger,
 )
-from visualization import save_prediction
+from visualization import save_adaptive_path_debug, save_prediction
 
 
 MAX_REDUCTION_KEYS = {
@@ -66,6 +66,9 @@ MAX_REDUCTION_KEYS = {
     "source_mu_max",
     "s_max",
     "t_max",
+    "path_entropy_max",
+    "path_difficulty_max",
+    "path_lambda_max",
 }
 
 MIN_REDUCTION_KEYS = {
@@ -80,6 +83,9 @@ MIN_REDUCTION_KEYS = {
     "esd_adaptive_weight_min",
     "esd_weight_logit_min",
     "esd_effective_multiplier_min",
+    "path_entropy_min",
+    "path_difficulty_min",
+    "path_lambda_min",
 }
 
 MAX_REDUCTION_KEYS.update({
@@ -1173,6 +1179,23 @@ def run_training(config: dict, *, joint_entrypoint: bool = False) -> dict:
                             )
                         else:
                             scaler.scale(scaled_loss).backward()
+
+                    if (
+                        context.is_main_process
+                        and batch_index == 0
+                        and "path_debug" in objectives
+                    ):
+                        save_adaptive_path_debug(
+                            image[0],
+                            objectives["path_debug"],
+                            output_dir / "adaptive_path"
+                            / f"epoch_{epoch_index + 1:04d}.png",
+                            imagenet_normalize=(
+                                config["augmentation"]["imagenet_normalize"]
+                                or config["augmentation"]["normalize"]["enabled"]
+                            ),
+                            dataset_name=config["dataset"]["name"],
+                        )
 
                     grad_norm = None
                     if should_step:

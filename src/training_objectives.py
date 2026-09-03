@@ -6,6 +6,11 @@ import torch
 import torch.nn as nn
 
 import losses
+from adaptive_path import (
+    adaptive_path_stats,
+    entropy_adaptive_enabled,
+    source_entropy_difficulty,
+)
 from dfm_stabilization import (
     ESDTimeWeightNetwork,
     PSDTimeWeightNetwork,
@@ -16,6 +21,7 @@ from dfm_stabilization import (
 )
 from discrete_flow_maps import (
     linear_path,
+    path_coefficient,
     sample_consistency_times,
     sample_prior,
     sample_stage1_times,
@@ -90,6 +96,18 @@ def compute_model_training_objectives(
         target_full=targets.target_full,
         valid_mask_full=targets.valid_mask_full,
     )
+    path_entropy = None
+    path_difficulty = None
+    if entropy_adaptive_enabled(config):
+        source_state = source_stats.get("_path_source_state")
+        if source_state is None:
+            raise RuntimeError("adaptive path requires source model output")
+        path_entropy, path_difficulty = source_entropy_difficulty(
+            source_state,
+            config,
+            valid_mask=targets.valid_mask_state,
+            spatial_size=state_size,
+        )
     image_feat = endpoint.encode_image(image)
     assert x0.shape == targets.one_hot_state.shape
     assert image_feat.shape[-2:] == state_size
@@ -105,7 +123,7 @@ def compute_model_training_objectives(
             time_config["min_time"], time_config["max_time"],
         )
         diagonal_state = linear_path(
-            x0, targets.one_hot_state, diagonal_time, config
+            x0, targets.one_hot_state, diagonal_time, config, path_difficulty
         )
         schedule_weight = 0.0
         effective_weight = 0.0
@@ -116,7 +134,7 @@ def compute_model_training_objectives(
             time_config["min_gap"],
         )
         consistency_state = linear_path(
-            x0, targets.one_hot_state, consistency_s, config
+            x0, targets.one_hot_state, consistency_s, config, path_difficulty
         )
         if operation == "joint_objectives":
             # Joint training intentionally samples an independent diagonal time.
@@ -125,7 +143,7 @@ def compute_model_training_objectives(
                 time_config["min_time"], time_config["max_time"],
             )
             diagonal_state = linear_path(
-                x0, targets.one_hot_state, diagonal_time, config
+                x0, targets.one_hot_state, diagonal_time, config, path_difficulty
             )
         else:
             # Preserve the original Stage 2 diagonal-at-s behavior.
@@ -198,6 +216,7 @@ def compute_model_training_objectives(
             valid_mask=targets.valid_mask_state,
             full_resolution_size=tuple(targets.target_full.shape[-2:]),
             valid_mask_full=targets.valid_mask_full,
+            path_difficulty=path_difficulty,
         )
         consistency_loss = consistency_result.loss
     else:
@@ -295,6 +314,17 @@ def compute_model_training_objectives(
         "state_width": total.new_tensor(state_size[1]),
     }
     stats.update(diagonal_stats)
+    if path_difficulty is not None and config["flow"]["path"]["diagnostics"]["enabled"]:
+        coefficient = path_coefficient(
+            diagonal_time, config, path_difficulty
+        )
+        stats.update(adaptive_path_stats(
+            path_entropy,
+            path_difficulty,
+            diagonal_time,
+            coefficient,
+            targets.valid_mask_state,
+        ))
     for key, value in source_stats.items():
         if key not in stats and torch.is_tensor(value) and value.numel() == 1:
             stats[key] = value.detach()
@@ -308,7 +338,7 @@ def compute_model_training_objectives(
     # then deliberately define the optimizer-facing loss_consistency value.
     stats.update(learnable_stats)
     stats["loss_consistency"] = consistency_loss.detach()
-    return {
+    result = {
         "loss": total,
         "diagonal_objective": primary_objective,
         "psd_objective": psd_objective,
@@ -319,6 +349,25 @@ def compute_model_training_objectives(
             consistency_config["type"] if operation != "stage1_objectives" else "none"
         ),
     }
+    if path_difficulty is not None and config["flow"]["path"]["diagnostics"][
+        "visualization"
+    ]:
+        selected_times = config["flow"]["path"]["diagnostics"]["times"]
+        result["path_debug"] = {
+            "source_prediction": source_stats["_path_source_state"].argmax(dim=1).detach(),
+            "entropy": path_entropy.detach(),
+            "difficulty": path_difficulty.detach(),
+            "lambdas": torch.stack([
+                path_coefficient(
+                    diagonal_time.new_full(diagonal_time.shape, float(value)),
+                    config,
+                    path_difficulty,
+                ).detach()
+                for value in selected_times
+            ], dim=1),
+            "times": tuple(float(value) for value in selected_times),
+        }
+    return result
 
 
 class DDPCompatibleTrainingModel(nn.Module):
@@ -364,6 +413,14 @@ class DDPCompatibleTrainingModel(nn.Module):
         return compute_model_training_objectives(
             self, operation=operation, **kwargs
         )
+
+    def train(self, mode: bool = True):
+        super().train(mode)
+        if self.source_model is not None and self.config["source"]["freeze"]:
+            self.source_model.eval()
+        if not self.config.get("training", {}).get("train_endpoint", True):
+            self.endpoint_model.eval()
+        return self
 
 
 def run_model_training_objectives(model: nn.Module, *, operation: str, **kwargs):

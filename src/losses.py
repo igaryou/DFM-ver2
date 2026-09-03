@@ -65,6 +65,32 @@ def masked_mean(loss_map: torch.Tensor, valid_mask: torch.Tensor | None) -> torc
     return (loss_map * weights).sum() / weights.sum().clamp_min(1.0)
 
 
+def _coefficient_view(value: torch.Tensor) -> torch.Tensor:
+    """Convert [B] or [B,H,W] path values to state broadcast shape."""
+    if value.ndim == 1:
+        return value[:, None, None, None]
+    if value.ndim == 3:
+        return value[:, None]
+    raise ValueError(f"invalid path coefficient shape: {tuple(value.shape)}")
+
+
+def _flow_with_difficulty(
+    flow: Callable,
+    x: torch.Tensor,
+    endpoint: torch.Tensor,
+    s: torch.Tensor,
+    t: torch.Tensor,
+    time_eps: float,
+    path_config: dict | None,
+    difficulty: torch.Tensor | None,
+) -> torch.Tensor:
+    if difficulty is None:
+        return flow(x, endpoint, s, t, time_eps, path_config)
+    return flow(
+        x, endpoint, s, t, time_eps, path_config, difficulty=difficulty
+    )
+
+
 def diagonal_cross_entropy(
     logits: torch.Tensor,
     target: torch.Tensor,
@@ -249,6 +275,7 @@ def _psd_loss(
     loss_resolution: str = "state",
     full_resolution_size: tuple[int, int] | None = None,
     valid_mask_full: torch.Tensor | None = None,
+    path_difficulty: torch.Tensor | None = None,
 ) -> ConsistencyResult:
     if not bool(((s < u) & (u < t)).all()):
         raise ValueError("PSD requires s < u < t")
@@ -260,8 +287,9 @@ def _psd_loss(
         probability_su = _normalize_probability(
             torch.softmax(logits_su.float(), dim=1), probability_eps
         )
-        x_su = flow(
-            x_s.float(), probability_su, s, u, time_eps, path_config
+        x_su = _flow_with_difficulty(
+            flow, x_s.float(), probability_su, s, u, time_eps, path_config,
+            path_difficulty,
         )
         logits_ut = _forward_logits(
             model, x_su, image, u, t, image_feat=teacher_image_feat
@@ -269,17 +297,17 @@ def _psd_loss(
         probability_ut = _normalize_probability(
             torch.softmax(logits_ut.float(), dim=1), probability_eps
         )
-        alpha_s = path_coefficient(s, path_config)
-        alpha_u = path_coefficient(u, path_config)
-        alpha_t = path_coefficient(t, path_config)
+        alpha_s = path_coefficient(s, path_config, path_difficulty)
+        alpha_u = path_coefficient(u, path_config, path_difficulty)
+        alpha_t = path_coefficient(t, path_config, path_difficulty)
         numerator = (1.0 - alpha_t) * (alpha_u - alpha_s)
         denominator = (1.0 - alpha_u).clamp_min(time_eps) * (
             alpha_t - alpha_s
         ).clamp_min(time_eps)
         mixture = (numerator / denominator).clamp(0.0, 1.0)
         teacher = (
-            mixture[:, None, None, None] * probability_su
-            + (1.0 - mixture[:, None, None, None]) * probability_ut
+            _coefficient_view(mixture) * probability_su
+            + (1.0 - _coefficient_view(mixture)) * probability_ut
         )
         teacher = _normalize_probability(teacher, probability_eps).detach()
 
@@ -370,6 +398,7 @@ def _csd_loss(
     jvp_dtype: str,
     flow: Callable = flow_map,
     valid_mask: torch.Tensor | None = None,
+    path_difficulty: torch.Tensor | None = None,
 ) -> ConsistencyResult:
     target_dtype = _torch_jvp_dtype(jvp_dtype)
     s32, t32 = s.float(), t.float()
@@ -386,8 +415,9 @@ def _csd_loss(
             )
             logits = logits.to(dtype=target_dtype)
             probability = torch.softmax(logits, dim=1).to(dtype=target_dtype)
-            return flow(
-                x_primal, probability, s32, t_in, time_eps, path_config
+            return _flow_with_difficulty(
+                flow, x_primal, probability, s32, t_in, time_eps, path_config,
+                path_difficulty,
             ).to(target_dtype)
 
         transported_before, derivative_before = jvp(
@@ -412,11 +442,11 @@ def _csd_loss(
                 torch.softmax(teacher_logits_before.float(), dim=1), probability_eps
             ).detach()
     with _disabled_autocast(x_s):
-        alpha_t = path_coefficient(t32, path_config)
-        alpha_prime_t = path_derivative(t32, path_config)
+        alpha_t = path_coefficient(t32, path_config, path_difficulty)
+        alpha_prime_t = path_derivative(t32, path_config, path_difficulty)
         residual = (
-            (1.0 - alpha_t)[:, None, None, None] * derivative
-            - alpha_prime_t[:, None, None, None] * (teacher - transported)
+            _coefficient_view(1.0 - alpha_t) * derivative
+            - _coefficient_view(alpha_prime_t) * (teacher - transported)
         )
         residual_map = residual.square().sum(dim=1)
         loss = masked_mean(residual_map, valid_mask).float()
@@ -462,6 +492,7 @@ def _ecld_loss(
     time_weighting: str,
     flow: Callable = flow_map,
     valid_mask: torch.Tensor | None = None,
+    path_difficulty: torch.Tensor | None = None,
 ) -> ConsistencyResult:
     target_dtype = _torch_jvp_dtype(jvp_dtype)
     s32, t32 = s.float(), t.float()
@@ -487,8 +518,9 @@ def _ecld_loss(
         student_probability = student_log_probability.exp()
         center = (student_probability * derivative).sum(dim=1, keepdim=True)
         probability_derivative = student_probability * (derivative - center)
-        transported = flow(
-            x_s.float(), student_probability, s32, t32, time_eps, path_config
+        transported = _flow_with_difficulty(
+            flow, x_s.float(), student_probability, s32, t32, time_eps,
+            path_config, path_difficulty,
         )
     with torch.no_grad():
         teacher_input = transported.detach().to(dtype=target_dtype)
@@ -515,11 +547,11 @@ def _ecld_loss(
         endpoint_ce = masked_mean(
             endpoint_ce_map * temporal_weight[:, None, None], valid_mask
         )
-        alpha_s = path_coefficient(s32, path_config)
-        alpha_t = path_coefficient(t32, path_config)
+        alpha_s = path_coefficient(s32, path_config, path_difficulty)
+        alpha_t = path_coefficient(t32, path_config, path_difficulty)
         gamma = (alpha_t - alpha_s) / (1.0 - alpha_s).clamp_min(time_eps)
         temporal_derivative_map = (
-            gamma.square()[:, None, None]
+            (gamma.square()[:, None, None] if gamma.ndim == 1 else gamma.square())
             * probability_derivative.square().sum(dim=1)
         )
         temporal_derivative = masked_mean(temporal_derivative_map, valid_mask)
@@ -575,6 +607,7 @@ def _esd_loss(
     adaptive_max_weight: float | None,
     jvp_dtype: str,
     valid_mask: torch.Tensor | None = None,
+    path_difficulty: torch.Tensor | None = None,
 ) -> ConsistencyResult:
     if invalid_strategy not in {"clamp", "mask_pixel", "skip_batch"}:
         raise ValueError(f"Unknown invalid teacher strategy: {invalid_strategy}")
@@ -598,12 +631,12 @@ def _esd_loss(
         with _disabled_autocast(x_s):
             logits_ss = logits_ss_before.float()
             probability_ss = torch.softmax(logits_ss, dim=1)
-            alpha_s = path_coefficient(s32, path_config)
-            alpha_prime_s = path_derivative(s32, path_config)
+            alpha_s = path_coefficient(s32, path_config, path_difficulty)
+            alpha_prime_s = path_derivative(s32, path_config, path_difficulty)
             denominator_s = (1.0 - alpha_s).clamp_min(time_eps)
             drift = (
-                alpha_prime_s[:, None, None, None]
-                / denominator_s[:, None, None, None]
+                _coefficient_view(alpha_prime_s)
+                / _coefficient_view(denominator_s)
                 * (probability_ss - x32)
             )
 
@@ -629,9 +662,9 @@ def _esd_loss(
         student_probability = student_log_probability.exp()
         center = (student_probability * directional).sum(dim=1, keepdim=True)
         delta = directional - center
-        alpha_s = path_coefficient(s32, path_config)
-        alpha_t = path_coefficient(t32, path_config)
-        alpha_prime_s = path_derivative(s32, path_config)
+        alpha_s = path_coefficient(s32, path_config, path_difficulty)
+        alpha_t = path_coefficient(t32, path_config, path_difficulty)
+        alpha_prime_s = path_derivative(s32, path_config, path_difficulty)
         one_minus_alpha_s = 1.0 - alpha_s
         one_minus_alpha_t = 1.0 - alpha_t
         alpha_interval_in_raw_s_units = (
@@ -639,10 +672,10 @@ def _esd_loss(
             / alpha_prime_s.clamp_min(time_eps)
         )
         log_arg_raw = (
-            one_minus_alpha_t[:, None, None, None]
-            - (
+            _coefficient_view(one_minus_alpha_t)
+            - _coefficient_view(
                 one_minus_alpha_s * alpha_interval_in_raw_s_units
-            )[:, None, None, None] * delta
+            ) * delta
         )
 
         invalid_class = ~torch.isfinite(log_arg_raw) | (log_arg_raw <= log_eps)
@@ -818,6 +851,7 @@ def compute_consistency_loss(
     valid_mask: torch.Tensor | None = None,
     full_resolution_size: tuple[int, int] | None = None,
     valid_mask_full: torch.Tensor | None = None,
+    path_difficulty: torch.Tensor | None = None,
 ) -> ConsistencyResult:
     if loss_type not in {"psd", "csd", "ecld", "esd"}:
         raise ValueError(f"Unknown consistency loss: {loss_type}")
@@ -869,6 +903,7 @@ def compute_consistency_loss(
             loss_resolution=psd.get("loss_resolution", "state"),
             full_resolution_size=full_resolution_size,
             valid_mask_full=valid_mask_full,
+            path_difficulty=path_difficulty,
         )
     elif loss_type == "csd":
         result = _csd_loss(
@@ -876,6 +911,7 @@ def compute_consistency_loss(
             time_eps=time_eps, probability_eps=probability_eps,
             path_config=path_config, jvp_dtype=jvp_dtype,
             flow=flow, valid_mask=valid_mask,
+            path_difficulty=path_difficulty,
         )
     elif loss_type == "ecld":
         ecld = consistency.get("ecld", {})
@@ -888,6 +924,7 @@ def compute_consistency_loss(
             td_weight=float(ecld.get("td_weight", 2.0)),
             time_weighting=ecld.get("time_weighting", "none"),
             flow=flow, valid_mask=valid_mask,
+            path_difficulty=path_difficulty,
         )
     else:
         invalid = consistency.get("invalid_teacher", {})
@@ -905,6 +942,7 @@ def compute_consistency_loss(
             adaptive_normalize_mean=bool(adaptive.get("normalize_mean", True)),
             adaptive_max_weight=adaptive.get("max_weight", 100.0),
             jvp_dtype=jvp_dtype, valid_mask=valid_mask,
+            path_difficulty=path_difficulty,
         )
     if precision.get("debug_assertions", False):
         expected = None if loss_type == "psd" else _torch_jvp_dtype(jvp_dtype)

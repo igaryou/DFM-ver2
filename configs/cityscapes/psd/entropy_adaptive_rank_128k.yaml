@@ -1,0 +1,61 @@
+extends:
+  - ../../_base_/cityscapes/swin_t_160k.yaml
+  - ../../_base_/losses/psd.yaml
+
+experiment:
+  name: cityscapes_psd_entropy_adaptive_rank_128k
+  output_dir: /home/igarashi_25/DFM/results/cityscapes/psd_entropy_adaptive_rank_128k
+  stage: consistency_distillation
+
+source:
+  type: trainable_segformer
+  segformer_variant: b0
+  freeze: true
+  # Kept identical to Stage 1 for checkpoint signature safety. Frozen adaptive
+  # Stage 2 bypasses source supervision and uses this model only for x0/entropy.
+  supervision: {type: cross_entropy, weight: 1.0}
+
+flow:
+  path:
+    type: entropy_adaptive
+    entropy:
+      normalization: rank
+      eps: 1.0e-8
+      image_wise: true
+      zscore_clip: 3.0
+      exclude_ignore: true
+    scheduler:
+      type: mean_preserving_additive
+      beta: 0.5
+    diagnostics:
+      enabled: true
+      visualization: false
+      times: [0.2, 0.4, 0.6, 0.8]
+
+training:
+  train_endpoint: true
+  max_optimizer_steps: 128000
+  checkpoint_interval_steps: 16000
+
+loss:
+  primary:
+    weight: 1.0
+  consistency:
+    enabled: true
+    type: psd
+    weight: 0.5
+    start: {unit: optimizer_step, value: 0}
+    warmup_steps: 0
+
+checkpoint:
+  init_from: /home/igarashi_25/DFM/results/cityscapes/source_segformer_b0_32k/latest.pt
+  resume: null
+  load_optimizer: false
+  load_scheduler: false
+
+evaluation:
+  interval: {unit: optimizer_step, value: 16000}
+
+wandb:
+  name: cityscapes-psd-entropy-adaptive-rank-128k
+  tags: [cityscapes, stage2, frozen-source, psd, entropy-adaptive, rank, 128k]

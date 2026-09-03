@@ -133,6 +133,50 @@ CUDA_VISIBLE_DEVICES=0 uv run python src/train_joint.py \
   --config configs/cityscapes/psd/swin_t_power2_160k.yaml
 ```
 
+### Source entropy adaptive path（opt-in）
+
+既存 config は引き続き `flow.path.type: power`、`exponent: 1.0` の線形経路です。
+新機能は `flow.path.type: entropy_adaptive` のときだけ有効になります。frozen source
+の class probability entropy を画像ごとに mean / zscore / minmax / average-rank の
+いずれかで平均0・範囲 `[-1,1]` の difficulty `d` に変換し、学習と推論で同じ
+
+\[
+\lambda_i(t)=t-\beta t(1-t)d_i,\qquad
+\partial_t\lambda_i(t)=1-\beta(1-2t)d_i
+\]
+
+を使います。ignore/void は normalization 統計から除外でき、sampling 中は画像から
+一度計算した `d` を再利用します。`beta=0` は従来線形経路と一致します。
+
+SegFormer-B0 source-only CE 32k → frozen-source PSD 128k の例:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 uv run torchrun --standalone --nproc_per_node=2 \
+  src/train.py --config configs/cityscapes/diagonal/source_segformer_b0_32k.yaml
+
+CUDA_VISIBLE_DEVICES=0,1 uv run torchrun --standalone --nproc_per_node=2 \
+  src/train.py --config configs/cityscapes/psd/entropy_adaptive_rank_128k.yaml
+```
+
+normalization と beta は config を複製せず切り替えられます。
+
+```bash
+# normalization: mean / zscore / minmax / rank
+uv run python src/train.py \
+  --config configs/cityscapes/psd/entropy_adaptive_rank_128k.yaml \
+  --set flow.path.entropy.normalization=zscore
+
+# beta: 0 / 0.25 / 0.5 / 0.75 / 1.0
+uv run python src/train.py \
+  --config configs/cityscapes/psd/entropy_adaptive_rank_128k.yaml \
+  --set flow.path.scheduler.beta=0.75
+```
+
+`flow.path.diagnostics.enabled` は scalar statistics を記録します。
+`flow.path.diagnostics.visualization=true` にすると各 epoch の先頭 batch について
+source prediction、entropy、difficulty、設定した時刻の lambda map を
+`<output_dir>/adaptive_path/` に保存します。
+
 学習方式は2つです。
 
 | 方式 | entrypoint | 初期値 | iterationの損失 |

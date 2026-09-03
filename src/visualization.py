@@ -108,3 +108,49 @@ def save_prediction(
     figure.tight_layout()
     figure.savefig(destination, bbox_inches="tight")
     plt.close(figure)
+
+
+def save_adaptive_path_debug(
+    image: torch.Tensor,
+    debug: dict[str, torch.Tensor | tuple[float, ...]],
+    path: str | Path,
+    *,
+    imagenet_normalize: bool = False,
+    dataset_name: str = "cityscapes",
+) -> None:
+    """Save source prediction, entropy, difficulty, and configured lambda maps."""
+    image = image.detach().cpu()
+    if imagenet_normalize:
+        mean = image.new_tensor([0.485, 0.456, 0.406])[:, None, None]
+        std = image.new_tensor([0.229, 0.224, 0.225])[:, None, None]
+        image = image * std + mean
+    prediction = debug["source_prediction"][0].detach().cpu()
+    entropy = debug["entropy"][0].detach().float().cpu()
+    difficulty = debug["difficulty"][0].detach().float().cpu()
+    lambdas = debug["lambdas"][0].detach().float().cpu()
+    times = debug["times"]
+    panels = 4 + len(times)
+    columns = 4
+    rows = (panels + columns - 1) // columns
+    figure, axes = plt.subplots(rows, columns, figsize=(4 * columns, 4 * rows))
+    axes = np.asarray(axes).reshape(-1)
+    axes[0].imshow(image.clamp(0, 1).permute(1, 2, 0))
+    axes[0].set_title("image")
+    axes[1].imshow(colorize(prediction, dataset_name))
+    axes[1].set_title("source prediction")
+    axes[2].imshow(entropy, cmap="magma")
+    axes[2].set_title("source entropy")
+    axes[3].imshow(difficulty, cmap="coolwarm", vmin=-1.0, vmax=1.0)
+    axes[3].set_title("difficulty")
+    for index, value in enumerate(times):
+        axes[4 + index].imshow(lambdas[index], cmap="viridis", vmin=0.0, vmax=1.0)
+        axes[4 + index].set_title(f"lambda(t={value:g})")
+    for axis in axes:
+        axis.axis("off")
+    for axis in axes[panels:]:
+        axis.set_visible(False)
+    destination = Path(path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    figure.tight_layout()
+    figure.savefig(destination, bbox_inches="tight")
+    plt.close(figure)

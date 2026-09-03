@@ -150,7 +150,26 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "time_eps": 1.0e-5,
         "probability_eps": 1.0e-8,
         "start_time": 0.0,
-        "path": {"type": "power", "exponent": 1.0},
+        "path": {
+            "type": "power",
+            "exponent": 1.0,
+            "entropy": {
+                "normalization": "rank",
+                "eps": 1.0e-8,
+                "image_wise": True,
+                "zscore_clip": 3.0,
+                "exclude_ignore": True,
+            },
+            "scheduler": {
+                "type": "mean_preserving_additive",
+                "beta": 0.5,
+            },
+            "diagnostics": {
+                "enabled": True,
+                "visualization": False,
+                "times": [0.2, 0.4, 0.6, 0.8],
+            },
+        },
     },
     "time_sampling": {
         "distribution": "uniform_sorted",
@@ -159,6 +178,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "min_gap": 1.0e-5,
     },
     "training": {
+        "train_endpoint": True,
         "epochs": 150,
         "max_iterations": None,
         "max_optimizer_steps": None,
@@ -617,14 +637,52 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
     if config["flow"]["time_eps"] <= 0:
         raise ValueError("flow.time_eps must be positive")
     path = config["flow"]["path"]
-    if path["type"] != "power":
-        raise ValueError("flow.path.type must be power")
-    if (
+    if path["type"] not in {"power", "linear", "entropy_adaptive"}:
+        raise ValueError("flow.path.type must be power, linear, or entropy_adaptive")
+    if path["type"] == "power" and (
         isinstance(path["exponent"], bool)
         or not isinstance(path["exponent"], (int, float))
         or path["exponent"] <= 0
     ):
         raise ValueError("flow.path.exponent must be positive")
+    if path["type"] == "entropy_adaptive":
+        entropy = path["entropy"]
+        if entropy["normalization"] not in {"mean", "zscore", "minmax", "rank"}:
+            raise ValueError("flow.path.entropy.normalization is invalid")
+        if entropy["eps"] <= 0 or entropy["zscore_clip"] <= 0:
+            raise ValueError("entropy eps and zscore_clip must be positive")
+        if entropy["image_wise"] is not True:
+            raise ValueError("entropy normalization currently requires image_wise=true")
+        if not isinstance(entropy["exclude_ignore"], bool):
+            raise ValueError("entropy exclude_ignore must be boolean")
+        path_scheduler = path["scheduler"]
+        if path_scheduler["type"] != "mean_preserving_additive":
+            raise ValueError("unsupported flow.path.scheduler.type")
+        beta = path_scheduler["beta"]
+        if (
+            isinstance(beta, bool)
+            or not isinstance(beta, (int, float))
+            or not 0 <= beta <= 1
+        ):
+            raise ValueError("flow.path.scheduler.beta must be in [0,1]")
+        diagnostics = path["diagnostics"]
+        if not isinstance(diagnostics["enabled"], bool) or not isinstance(
+            diagnostics["visualization"], bool
+        ):
+            raise ValueError("path diagnostic flags must be boolean")
+        if any(not 0 <= value <= 1 for value in diagnostics["times"]):
+            raise ValueError("path diagnostic times must be in [0,1]")
+        if stage == "diagonal_pretrain" and config["source"]["freeze"]:
+            raise ValueError("entropy-adaptive Stage 1 requires a trainable source")
+        if stage != "diagonal_pretrain" and not config["source"]["freeze"]:
+            raise ValueError("entropy-adaptive Stage 2/joint paths require source.freeze=true")
+        if config["source"]["prior_type"] != "image_gaussian":
+            raise ValueError("entropy-adaptive path requires source.prior_type=image_gaussian")
+    else:
+        # Keep legacy resolved path mappings byte-for-byte shaped as before.
+        path.pop("entropy", None)
+        path.pop("scheduler", None)
+        path.pop("diagnostics", None)
     ts = config["time_sampling"]
     if ts["distribution"] != "uniform_sorted":
         raise ValueError("time_sampling.distribution must be uniform_sorted")

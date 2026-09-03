@@ -1,8 +1,16 @@
 from __future__ import annotations
 
+from contextlib import nullcontext
+
 import torch
 import torch.nn.functional as F
 
+from adaptive_path import (
+    adaptive_lambda,
+    adaptive_lambda_derivative,
+    entropy_adaptive_enabled,
+    path_config as _path_config,
+)
 from state_space import resize_continuous, state_spatial_size
 
 
@@ -12,33 +20,55 @@ def _time_view(time: torch.Tensor, ndim: int = 4) -> torch.Tensor:
     return time.reshape(time.shape[0], *([1] * (ndim - 1)))
 
 
-def _path_config(config: dict | None) -> dict:
-    if config is None:
-        return {"type": "power", "exponent": 1.0}
-    if "flow" in config:
-        config = config["flow"]
-    if "path" in config:
-        config = config["path"]
-    return config
-
-
-def path_coefficient(time: torch.Tensor, config: dict | None = None) -> torch.Tensor:
+def path_coefficient(
+    time: torch.Tensor,
+    config: dict | None = None,
+    difficulty: torch.Tensor | None = None,
+) -> torch.Tensor:
     """Return alpha(t) while keeping raw model time inputs unchanged."""
     path = _path_config(config)
     path_type = path.get("type", "power")
-    if path_type != "power":
-        raise ValueError(f"Unknown flow path type: {path_type}")
-    return time.pow(float(path.get("exponent", 1.0)))
+    if path_type == "power":
+        return time.pow(float(path.get("exponent", 1.0)))
+    if path_type == "linear":
+        return time
+    if path_type == "entropy_adaptive":
+        if difficulty is None:
+            raise ValueError("entropy_adaptive path requires pixel difficulty")
+        return adaptive_lambda(
+            time, difficulty, beta=float(path["scheduler"]["beta"])
+        )
+    raise ValueError(f"Unknown flow path type: {path_type}")
 
 
-def path_derivative(time: torch.Tensor, config: dict | None = None) -> torch.Tensor:
+def path_derivative(
+    time: torch.Tensor,
+    config: dict | None = None,
+    difficulty: torch.Tensor | None = None,
+) -> torch.Tensor:
     """Return d alpha(t) / dt for the configured path."""
     path = _path_config(config)
     path_type = path.get("type", "power")
-    if path_type != "power":
-        raise ValueError(f"Unknown flow path type: {path_type}")
-    exponent = float(path.get("exponent", 1.0))
-    return exponent * time.pow(exponent - 1.0)
+    if path_type == "power":
+        exponent = float(path.get("exponent", 1.0))
+        return exponent * time.pow(exponent - 1.0)
+    if path_type == "linear":
+        return torch.ones_like(time)
+    if path_type == "entropy_adaptive":
+        if difficulty is None:
+            raise ValueError("entropy_adaptive path requires pixel difficulty")
+        return adaptive_lambda_derivative(
+            time, difficulty, beta=float(path["scheduler"]["beta"])
+        )
+    raise ValueError(f"Unknown flow path type: {path_type}")
+
+
+def _state_view(value: torch.Tensor, ndim: int) -> torch.Tensor:
+    if value.ndim == 1:
+        return _time_view(value, ndim)
+    if value.ndim == ndim - 1:
+        return value.unsqueeze(1)
+    raise ValueError(f"path coefficient has incompatible shape {tuple(value.shape)}")
 
 
 def linear_path(
@@ -46,11 +76,14 @@ def linear_path(
     x1: torch.Tensor,
     time: torch.Tensor,
     config: dict | None = None,
+    difficulty: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Backward-compatible name for the configurable interpolation path."""
     if x0.shape != x1.shape:
         raise ValueError("x0 and x1 must have the same shape")
-    alpha = _time_view(path_coefficient(time, config), x0.ndim).to(dtype=x0.dtype)
+    alpha = _state_view(
+        path_coefficient(time, config, difficulty), x0.ndim
+    ).to(dtype=x0.dtype)
     return (1.0 - alpha) * x0 + alpha * x1
 
 
@@ -61,16 +94,17 @@ def flow_map(
     t: torch.Tensor,
     time_eps: float = 1.0e-5,
     path_config: dict | None = None,
+    difficulty: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Generalized X_{s,t} using progress alpha(t), with raw s/t inputs."""
     if x_s.shape != mean_denoiser.shape:
         raise ValueError("x_s and mean_denoiser must have identical shapes")
     if s.shape != t.shape or s.ndim != 1:
         raise ValueError("s and t must both have shape [B]")
-    alpha_s = path_coefficient(s, path_config)
-    alpha_t = path_coefficient(t, path_config)
+    alpha_s = path_coefficient(s, path_config, difficulty)
+    alpha_t = path_coefficient(t, path_config, difficulty)
     denominator = (1.0 - alpha_s).clamp_min(time_eps)
-    gamma = _time_view(
+    gamma = _state_view(
         (alpha_t - alpha_s) / denominator, x_s.ndim
     ).to(dtype=x_s.dtype)
     return x_s + gamma * (mean_denoiser - x_s)
@@ -265,7 +299,10 @@ def sample_prior(
     if source_model is None:
         raise RuntimeError("source.prior_type=image_gaussian requires a source model")
 
-    x0, mu, logvar = source_model(image)
+    adaptive_frozen = entropy_adaptive_enabled(config) and source.get("freeze", False)
+    source_context = torch.no_grad() if adaptive_frozen else nullcontext()
+    with source_context:
+        x0, mu, logvar = source_model(image)
     assert x0.shape == mu.shape == logvar.shape
     assert x0.shape[:2] == (batch, classes)
     assert x0.shape[-2:] == (height, width), (
@@ -279,11 +316,15 @@ def sample_prior(
     )
     source_zero = image.new_zeros(()) if frozen_task_without_supervision else zero
     loss_var = (
-        source_zero if fixed_std is not None
+        source_zero if fixed_std is not None or adaptive_frozen
         else 0.5 * torch.mean(torch.exp(logvar) - logvar - 1.0)
     )
     supervision = source.get("supervision")
-    if supervision is not None and supervision.get("type") is not None:
+    if adaptive_frozen:
+        # Stage 2 uses the checkpointed source only as x0/entropy conditioning.
+        supervision_type = "none"
+        supervision_weight = 0.0
+    elif supervision is not None and supervision.get("type") is not None:
         supervision_type = supervision["type"]
         supervision_weight = (
             source["align_weight"]
@@ -360,6 +401,9 @@ def sample_prior(
     if target_one_hot_state is not None:
         stats["target_x1_abs"] = target_one_hot_state.detach().abs().mean()
         assert x0.shape == target_one_hot_state.shape
+    if entropy_adaptive_enabled(config):
+        # Internal non-scalar payload consumed by training/inference in this batch.
+        stats["_path_source_state"] = mu.detach()
     return x0, stats
 
 

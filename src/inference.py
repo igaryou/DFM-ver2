@@ -3,6 +3,7 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
+from adaptive_path import entropy_adaptive_enabled, source_entropy_difficulty
 from discrete_flow_maps import flow_map, make_time_grid, sample_prior
 from state_space import resize_continuous, state_spatial_size
 
@@ -44,6 +45,7 @@ def run_flow_from_state(
     config: dict,
     num_steps: int,
     return_trajectory: bool = False,
+    path_difficulty: torch.Tensor | None = None,
 ):
     """Run the production Flow Map update from a caller-provided state."""
     model.eval()
@@ -61,7 +63,8 @@ def run_flow_from_state(
         assert logits.shape == x.shape
         probability = torch.softmax(logits.float(), dim=1).to(x.dtype)
         x = flow_map(
-            x, probability, s, t, config["flow"]["time_eps"], config["flow"]
+            x, probability, s, t, config["flow"]["time_eps"], config["flow"],
+            difficulty=path_difficulty,
         )
         trajectory.append(x.argmax(dim=1))
     if return_trajectory:
@@ -78,11 +81,13 @@ def sample_segmentation_from_x0(
     num_steps: int | None = None,
     return_trajectory: bool = False,
     return_terminal_state: bool = False,
+    path_difficulty: torch.Tensor | None = None,
 ):
     """Production segmentation inference starting from a deterministic x0."""
     steps = num_steps or config["evaluation"]["num_steps"]
     flow_result = run_flow_from_state(
-        model, image, x0, config, steps, return_trajectory=return_trajectory
+        model, image, x0, config, steps, return_trajectory=return_trajectory,
+        path_difficulty=path_difficulty,
     )
     if return_trajectory:
         x, trajectory = flow_result
@@ -115,7 +120,15 @@ def sample_segmentation(
     model.eval()
     if source_model is not None:
         source_model.eval()
-    x0, _ = sample_prior(config, image, None, source_model)
+    x0, source_stats = sample_prior(config, image, None, source_model)
+    path_difficulty = None
+    if entropy_adaptive_enabled(config):
+        source_state = source_stats.get("_path_source_state")
+        if source_state is None:
+            raise RuntimeError("adaptive inference requires source model output")
+        _, path_difficulty = source_entropy_difficulty(
+            source_state, config, spatial_size=x0.shape[-2:]
+        )
     return sample_segmentation_from_x0(
         model,
         image,
@@ -124,6 +137,7 @@ def sample_segmentation(
         num_steps=num_steps,
         return_trajectory=return_trajectory,
         return_terminal_state=return_terminal_state,
+        path_difficulty=path_difficulty,
     )
 
 
