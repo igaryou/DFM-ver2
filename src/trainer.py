@@ -735,12 +735,22 @@ def _build_loaders(
     return train_loader, val_loader, train_sampler
 
 
-def _unpack_training_batch(batch):
+def _unpack_training_batch(batch, config: dict):
     """Accept legacy pairs while production datasets provide an explicit mask."""
     if len(batch) == 3:
         return batch
     if len(batch) == 2:
         image, target = batch
+        consistency = config["loss"]["consistency"]
+        if (
+            consistency["type"] == "psd"
+            and not consistency.get("psd", {}).get("ignore_void", True)
+        ):
+            raise ValueError(
+                "PSD ignore_void=false requires an explicit spatial_valid_mask; "
+                "legacy 2-tensor training batches cannot distinguish real void "
+                "from padding"
+            )
         return image, target, torch.ones_like(target, dtype=torch.bool)
     raise ValueError(f"training batch must contain 2 or 3 tensors, got {len(batch)}")
 
@@ -1407,7 +1417,9 @@ def run_training(config: dict, *, joint_entrypoint: bool = False) -> dict:
                 for batch_index, batch in enumerate(train_loader):
                     if batch_index >= epoch_total_iterations:
                         break
-                    image, target, spatial_valid_mask = _unpack_training_batch(batch)
+                    image, target, spatial_valid_mask = _unpack_training_batch(
+                        batch, config
+                    )
                     image = image.to(context.device, non_blocking=True)
                     target = target.to(context.device, non_blocking=True)
                     spatial_valid_mask = spatial_valid_mask.to(

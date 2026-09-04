@@ -34,4 +34,4 @@ evaluation:
 
 wandb:
   name: cityscapes-source-segformer-b1-32k
-  tags: [cityscapes, stage1, source-only, segformer-b0, 32k]
+  tags: [cityscapes, stage1, source-only, segformer-b1, 32k]

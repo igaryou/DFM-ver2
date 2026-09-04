@@ -5,7 +5,10 @@ experiment:
   output_dir: /home/igarashi_25/DFM/results/cityscapes/psd_simplex_source_rank_128k
 
 source:
+  type: trainable_segformer
+  segformer_variant: b1
   prior_type: image_simplex_mixture
+  freeze: true
   var_weight: 0.0
   simplex_prior:
     training:
@@ -17,6 +20,12 @@ source:
       temperature: 1.0
       dirichlet_alpha: 1.0
 
+checkpoint:
+  init_from: /home/igarashi_25/DFM/results/cityscapes/source_segformer_b1_32k/best.pt
+  resume: null
+  load_optimizer: false
+  load_scheduler: false
+
 wandb:
   name: cityscapes-psd-simplex-source-rank-128k
-  tags: [cityscapes, stage2, frozen-source, psd, simplex-source, entropy-adaptive, rank, 128k]
+  tags: [cityscapes, stage2, frozen-source, segformer-b1, psd, simplex-source, entropy-adaptive, rank, 128k]
