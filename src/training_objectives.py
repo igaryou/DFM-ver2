@@ -102,6 +102,7 @@ def compute_model_training_objectives(
         target_full=targets.target_full,
         valid_mask_full=targets.valid_mask_full,
         sample_state=not source_only_stage1,
+        sampling_mode="training",
     )
     if source_only_stage1:
         zero = _zero(image)

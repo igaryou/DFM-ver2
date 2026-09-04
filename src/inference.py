@@ -120,7 +120,9 @@ def sample_segmentation(
     model.eval()
     if source_model is not None:
         source_model.eval()
-    x0, source_stats = sample_prior(config, image, None, source_model)
+    x0, source_stats = sample_prior(
+        config, image, None, source_model, sampling_mode="inference"
+    )
     path_difficulty = None
     if entropy_adaptive_enabled(config):
         source_state = source_stats.get("_path_source_state")

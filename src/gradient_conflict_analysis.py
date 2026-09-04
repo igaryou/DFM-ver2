@@ -181,6 +181,7 @@ def build_diagnostic_graph(
         image,
         targets.one_hot_state,
         source_model,
+        sampling_mode="training",
         target_full=targets.target_full,
         valid_mask_full=targets.valid_mask_full,
     )

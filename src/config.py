@@ -153,6 +153,18 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "max_visualizations": 16,
             "entropy_bins": 10,
         },
+        "simplex_prior": {
+            "training": {
+                "lambda": 0.8,
+                "temperature": 1.0,
+                "dirichlet_alpha": 1.0,
+            },
+            "inference": {
+                "lambda": 0.8,
+                "temperature": 1.0,
+                "dirichlet_alpha": 1.0,
+            },
+        },
     },
     "flow": {
         "time_eps": 1.0e-5,
@@ -606,8 +618,40 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
         or state_factor & (state_factor - 1)
     ):
         raise ValueError("model.state_downsample_factor must be a positive power of two")
-    if config["source"]["prior_type"] not in {"gaussian", "dirichlet", "image_gaussian"}:
-        raise ValueError("source.prior_type must be gaussian, dirichlet, or image_gaussian")
+    if config["source"]["prior_type"] not in {
+        "gaussian", "dirichlet", "image_gaussian", "image_simplex_mixture"
+    }:
+        raise ValueError(
+            "source.prior_type must be gaussian, dirichlet, image_gaussian, "
+            "or image_simplex_mixture"
+        )
+    simplex_prior = config["source"]["simplex_prior"]
+    for sampling_mode in ("training", "inference"):
+        parameters = simplex_prior[sampling_mode]
+        lambda_value = parameters["lambda"]
+        if (
+            isinstance(lambda_value, bool)
+            or not isinstance(lambda_value, (int, float))
+            or not 0 <= lambda_value <= 1
+        ):
+            raise ValueError(
+                f"source.simplex_prior.{sampling_mode}.lambda must be in [0,1]"
+            )
+        for key in ("temperature", "dirichlet_alpha"):
+            value = parameters[key]
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or value <= 0
+            ):
+                raise ValueError(
+                    f"source.simplex_prior.{sampling_mode}.{key} must be positive"
+                )
+    if (
+        config["source"]["prior_type"] == "image_simplex_mixture"
+        and config["source"]["var_weight"] != 0
+    ):
+        raise ValueError("image_simplex_mixture requires source.var_weight=0")
     if config["source"]["type"] not in {
         "trainable_segformer", "task_finetuned_segformer"
     }:
@@ -708,8 +752,12 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
             raise ValueError("entropy-adaptive Stage 1 requires a trainable source")
         if stage != "diagonal_pretrain" and not config["source"]["freeze"]:
             raise ValueError("entropy-adaptive Stage 2/joint paths require source.freeze=true")
-        if config["source"]["prior_type"] != "image_gaussian":
-            raise ValueError("entropy-adaptive path requires source.prior_type=image_gaussian")
+        if config["source"]["prior_type"] not in {
+            "image_gaussian", "image_simplex_mixture"
+        }:
+            raise ValueError(
+                "entropy-adaptive path requires an image-conditioned source prior"
+            )
     else:
         # Keep legacy resolved path mappings byte-for-byte shaped as before.
         path.pop("entropy", None)

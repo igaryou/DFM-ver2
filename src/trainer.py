@@ -1175,6 +1175,14 @@ def run_training(config: dict, *, joint_entrypoint: bool = False) -> dict:
             config["loss"]["consistency"]["start"]["value"],
             config["loss"]["consistency"]["warmup_steps"],
         )
+        if config["source"]["prior_type"] == "image_simplex_mixture":
+            simplex = config["source"]["simplex_prior"]["training"]
+            logger.info(
+                "Simplex source prior: mode=training lambda=%s temperature=%s "
+                "dirichlet_alpha=%s",
+                simplex["lambda"], simplex["temperature"],
+                simplex["dirichlet_alpha"],
+            )
         if (
             context.is_main_process
             and stage in {

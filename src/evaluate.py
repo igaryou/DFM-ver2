@@ -33,6 +33,16 @@ def evaluate(config: dict, checkpoint_path: str | Path) -> dict:
     try:
         assert_config_equal_across_ranks(config, context)
         device = context.device
+        if (
+            context.is_main_process
+            and config["source"]["prior_type"] == "image_simplex_mixture"
+        ):
+            simplex = config["source"]["simplex_prior"]["inference"]
+            print(
+                "Simplex source prior: mode=inference "
+                f"lambda={simplex['lambda']} temperature={simplex['temperature']} "
+                f"dirichlet_alpha={simplex['dirichlet_alpha']}"
+            )
         seed_everything(
             config["experiment"]["seed"], config["runtime"]["deterministic"]
         )

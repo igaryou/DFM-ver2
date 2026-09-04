@@ -44,6 +44,11 @@ def model_signature(config: dict) -> dict[str, Any]:
         key: copy.deepcopy(config["source"][key])
         for key in source_keys
     }
+    # Sampling on the simplex uses the exact same source network as
+    # image_gaussian. Normalize the sampling-only choice so Stage-1 Gaussian
+    # checkpoints remain architecture-compatible with simplex Stage 2.
+    if source_signature["prior_type"] == "image_simplex_mixture":
+        source_signature["prior_type"] = "image_gaussian"
     decoder_type = config["source"].get("segformer_decoder", "custom")
     if decoder_type != "custom":
         source_signature["segformer_decoder"] = decoder_type

@@ -260,7 +260,7 @@ class _LogitSource(nn.Module):
 
 
 def test_source_ce_include_void_trains_class_19() -> None:
-    config = load_config("configs/cityscapes/diagonal/source_segformer_b0_32k.yaml")
+    config = load_config("configs/cityscapes/diagonal/source_segformer_b1_32k.yaml")
     source = _LogitSource()
     image = torch.zeros(1, 3, 8, 12)
     target_full = torch.full((1, 8, 12), 19, dtype=torch.long)
@@ -291,7 +291,7 @@ class _ForbiddenEndpoint(nn.Module):
 
 
 def test_source_only_stage1_skips_endpoint_and_path() -> None:
-    config = load_config("configs/cityscapes/diagonal/source_segformer_b0_32k.yaml")
+    config = load_config("configs/cityscapes/diagonal/source_segformer_b1_32k.yaml")
     source = _LogitSource()
     adapter = DDPCompatibleTrainingModel(_ForbiddenEndpoint(), source, config)
     result = adapter(
@@ -308,7 +308,7 @@ def test_source_only_stage1_skips_endpoint_and_path() -> None:
 
 
 def test_source_only_validation_metrics_entropy_bins_and_png(tmp_path) -> None:
-    config = load_config("configs/cityscapes/diagonal/source_segformer_b0_32k.yaml")
+    config = load_config("configs/cityscapes/diagonal/source_segformer_b1_32k.yaml")
     config["source"]["diagnostics"]["max_visualizations"] = 1
     source = _LogitSource()
     adapter = DDPCompatibleTrainingModel(_ForbiddenEndpoint(), source, config)

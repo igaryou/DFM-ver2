@@ -241,6 +241,41 @@ def source_alignment_map_from_indices(
     ) / num_classes
 
 
+def _sample_image_simplex_mixture(
+    mu: torch.Tensor,
+    parameters: dict,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Sample lambda*softmax(mu/T) + (1-lambda)*Dirichlet(alpha)."""
+    lambda_value = float(parameters["lambda"])
+    temperature = float(parameters["temperature"])
+    dirichlet_alpha = float(parameters["dirichlet_alpha"])
+    probability = torch.softmax(mu.float() / temperature, dim=1)
+    if lambda_value == 1.0:
+        x0_fp32 = probability
+    else:
+        batch, classes, height, width = mu.shape
+        concentration = torch.full(
+            (classes,), dirichlet_alpha, device=mu.device, dtype=torch.float32
+        )
+        noise = torch.distributions.Dirichlet(concentration).sample(
+            (batch, height, width)
+        ).permute(0, 3, 1, 2)
+        x0_fp32 = lambda_value * probability + (1.0 - lambda_value) * noise
+    entropy = -(
+        probability * probability.clamp_min(torch.finfo(torch.float32).tiny).log()
+    ).sum(dim=1)
+    stats = {
+        "source_prior_lambda": mu.new_tensor(lambda_value),
+        "source_prior_temperature": mu.new_tensor(temperature),
+        "source_prior_dirichlet_alpha": mu.new_tensor(dirichlet_alpha),
+        "source_x0_sum_error": (x0_fp32.sum(dim=1) - 1.0).abs().amax(),
+        "source_x0_min": x0_fp32.amin(),
+        "source_x0_max": x0_fp32.amax(),
+        "source_probability_entropy": entropy.mean(),
+    }
+    return x0_fp32.to(dtype=mu.dtype), stats
+
+
 def sample_prior(
     config: dict,
     image: torch.Tensor,
@@ -250,8 +285,11 @@ def sample_prior(
     target_full: torch.Tensor | None = None,
     valid_mask_full: torch.Tensor | None = None,
     sample_state: bool = True,
+    sampling_mode: str = "training",
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Sample state-resolution x0 and compute optional full-resolution supervision."""
+    if sampling_mode not in {"training", "inference"}:
+        raise ValueError("sampling_mode must be training or inference")
     factor = config.get("model", {}).get("state_downsample_factor", 1)
     expected_size = state_spatial_size(image, factor)
     batch, _, height, width = (
@@ -299,16 +337,30 @@ def sample_prior(
             stats["target_x1_abs"] = target_one_hot_state.detach().abs().mean()
         return x0, stats
     if source_model is None:
-        raise RuntimeError("source.prior_type=image_gaussian requires a source model")
+        raise RuntimeError(
+            f"source.prior_type={source['prior_type']} requires a source model"
+        )
 
     adaptive_frozen = entropy_adaptive_enabled(config) and source.get("freeze", False)
     source_context = torch.no_grad() if adaptive_frozen else nullcontext()
+    simplex_stats: dict[str, torch.Tensor] = {}
     with source_context:
-        if sample_state:
+        if sample_state and source["prior_type"] == "image_gaussian":
             x0, mu, logvar = source_model(image)
         else:
+            if (
+                source["prior_type"] == "image_simplex_mixture"
+                and getattr(source_model, "forward_statistics", None) is None
+            ):
+                raise RuntimeError(
+                    "image_simplex_mixture requires source_model.forward_statistics"
+                )
             mu, logvar = source_statistics(source_model, image)
             x0 = mu
+        if sample_state and source["prior_type"] == "image_simplex_mixture":
+            x0, simplex_stats = _sample_image_simplex_mixture(
+                mu, source["simplex_prior"][sampling_mode]
+            )
     assert x0.shape == mu.shape == logvar.shape
     assert x0.shape[:2] == (batch, classes)
     assert x0.shape[-2:] == (height, width), (
@@ -322,7 +374,10 @@ def sample_prior(
     )
     source_zero = image.new_zeros(()) if frozen_task_without_supervision else zero
     loss_var = (
-        source_zero if fixed_std is not None or adaptive_frozen
+        source_zero
+        if source["prior_type"] == "image_simplex_mixture"
+        or fixed_std is not None
+        or adaptive_frozen
         else 0.5 * torch.mean(torch.exp(logvar) - logvar - 1.0)
     )
     supervision = source.get("supervision")
@@ -408,6 +463,11 @@ def sample_prior(
         "source_sigma_mean": sigma.mean(),
         "source_x0_abs": x0.detach().abs().mean(),
     }
+    stats.update({key: value.detach() for key, value in simplex_stats.items()})
+    if simplex_stats:
+        stats["source_prior_mode"] = mu.new_tensor(
+            0.0 if sampling_mode == "training" else 1.0
+        )
     if target_one_hot_state is not None:
         stats["target_x1_abs"] = target_one_hot_state.detach().abs().mean()
         assert x0.shape == target_one_hot_state.shape

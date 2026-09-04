@@ -462,7 +462,9 @@ def _phase_b(
             target = sample["target"].unsqueeze(0).to(device, non_blocking=True)
             x1 = _model_target_state(sample, image, target, config)
             with autocast_context(config, device):
-                x0, _ = sample_prior(config, image, None, source)
+                x0, _ = sample_prior(
+                    config, image, None, source, sampling_mode="inference"
+                )
                 image_feat = endpoint.encode_image(image)
             for t_value in PI0T_GRID:
                 probability = _original_probability(

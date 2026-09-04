@@ -369,7 +369,9 @@ def _load_models(config: dict, checkpoint_path: Path, device: torch.device):
         strict=config["checkpoint"]["strict_model"],
     )
     if source_model is None:
-        raise RuntimeError("Source diagnostics require source.prior_type=image_gaussian")
+        raise RuntimeError(
+            "Source diagnostics require an image-conditioned source prior"
+        )
     if checkpoint.get("source_model") is None:
         raise RuntimeError("Checkpoint has no source_model state")
     source_state = _without_module_prefix(checkpoint["source_model"])

@@ -87,6 +87,69 @@ integer GT classに対する`gather`から数学的に等価な値を求めま�
 へ拡大し、softmaxせずCEへ渡します。旧`use_loss_align/align_weight`だけを持つ
 configもload時に新形式へ変換されます。
 
+### Image-conditioned simplex source
+
+`source.prior_type: image_simplex_mixture`ではsource network自体とCEを変えず、
+Stage 2の初期状態だけを確率単体上でsamplingします。
+
+\[
+z_0=\lambda\,\mathrm{softmax}(\mu(x)/T)+(1-\lambda)\epsilon,
+\qquad \epsilon\sim\mathrm{Dirichlet}(\alpha\mathbf 1_K).
+\]
+
+`lambda`、`temperature`、`dirichlet_alpha`は
+`source.simplex_prior.training`と`source.simplex_prior.inference`へ独立に指定します。
+学習例は`configs/cityscapes/psd/simplex_source_rank_128k.yaml`です。
+
+```bash
+uv run python src/train.py \
+  --config configs/cityscapes/psd/simplex_source_rank_128k.yaml
+```
+
+Temperature sweep:
+
+```bash
+for T in 0.5 1.0 2.0; do
+  uv run python src/train.py \
+    --config configs/cityscapes/psd/simplex_source_rank_128k.yaml \
+    --set "source.simplex_prior.training.temperature=${T}" \
+    --set "experiment.output_dir=results/simplex_T_${T}"
+done
+```
+
+Dirichlet alpha sweep:
+
+```bash
+for alpha in 0.1 0.5 1.0 2.0 10.0; do
+  uv run python src/train.py \
+    --config configs/cityscapes/psd/simplex_source_rank_128k.yaml \
+    --set "source.simplex_prior.training.dirichlet_alpha=${alpha}" \
+    --set "experiment.output_dir=results/simplex_alpha_${alpha}"
+done
+```
+
+Lambda sweep:
+
+```bash
+for lam in 0.0 0.25 0.5 0.75 1.0; do
+  uv run python src/train.py \
+    --config configs/cityscapes/psd/simplex_source_rank_128k.yaml \
+    --set "source.simplex_prior.training.lambda=${lam}" \
+    --set "experiment.output_dir=results/simplex_lambda_${lam}"
+done
+```
+
+評価時だけsampling parameterを変更する例:
+
+```bash
+uv run python src/evaluate.py \
+  --config configs/cityscapes/psd/simplex_source_rank_128k.yaml \
+  --checkpoint /path/to/checkpoint.pt \
+  --set source.simplex_prior.inference.temperature=0.7 \
+  --set source.simplex_prior.inference.dirichlet_alpha=0.5 \
+  --set source.simplex_prior.inference.lambda=0.9
+```
+
 ### GT、loss、推論
 
 `target_full`とnearest-resizeした`target_state`を明示的に分離します。

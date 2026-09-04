@@ -1,0 +1,22 @@
+extends: entropy_adaptive_rank_128k.yaml
+
+experiment:
+  name: cityscapes_psd_simplex_source_rank_128k
+  output_dir: /home/igarashi_25/DFM/results/cityscapes/psd_simplex_source_rank_128k
+
+source:
+  prior_type: image_simplex_mixture
+  var_weight: 0.0
+  simplex_prior:
+    training:
+      lambda: 0.8
+      temperature: 1.0
+      dirichlet_alpha: 1.0
+    inference:
+      lambda: 0.8
+      temperature: 1.0
+      dirichlet_alpha: 1.0
+
+wandb:
+  name: cityscapes-psd-simplex-source-rank-128k
+  tags: [cityscapes, stage2, frozen-source, psd, simplex-source, entropy-adaptive, rank, 128k]
