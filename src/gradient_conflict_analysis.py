@@ -29,6 +29,7 @@ from discrete_flow_maps import (
 )
 from model_factory import build_models
 from state_space import prepare_state_targets, resize_continuous, state_spatial_size
+from training_objectives import build_psd_valid_masks
 from dataset import build_dataset
 from utils import autocast_context, seed_everything
 
@@ -160,6 +161,7 @@ def build_diagnostic_graph(
     source_model: torch.nn.Module | None,
     image: torch.Tensor,
     target: torch.Tensor,
+    spatial_valid_mask: torch.Tensor | None = None,
     consistency_times: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
 ) -> DiagnosticGraph:
     """Build one production-equivalent joint graph while bypassing PSD schedule."""
@@ -174,6 +176,16 @@ def build_diagnostic_graph(
         state_size=state_size,
         ignore_index=ignore_index,
         mask_pixel_losses=config["loss"].get("mask_pixel_losses", False),
+        spatial_valid_mask_full=spatial_valid_mask,
+    )
+    psd_masks = build_psd_valid_masks(
+        targets,
+        void_class_index=config["dataset"].get(
+            "void_class_index", ignore_index
+        ),
+        ignore_void=config["loss"]["consistency"].get("psd", {}).get(
+            "ignore_void", True
+        ),
     )
     # Exactly one source/noise sample and one image feature graph per batch.
     x0, source_stats = sample_prior(
@@ -241,9 +253,9 @@ def build_diagnostic_graph(
         t=t,
         precision=config["loss"]["consistency"]["precision"],
         config=config,
-        valid_mask=targets.valid_mask_state,
+        valid_mask=psd_masks.psd_state,
         full_resolution_size=tuple(targets.target_full.shape[-2:]),
-        valid_mask_full=targets.valid_mask_full,
+        valid_mask_full=psd_masks.psd_full,
     )
     if consistency.teacher_prob is None or consistency.student_prob is None:
         raise RuntimeError("PSD diagnostic requires teacher and student probabilities")
@@ -254,9 +266,7 @@ def build_diagnostic_graph(
         "loss_source_supervision", source_stats["loss_source_align"]
     ).float()
     valid_ratio = (
-        targets.valid_mask_full.float().mean()
-        if targets.valid_mask_full is not None
-        else image.new_ones(())
+        psd_masks.psd_full.float().mean()
     )
     return DiagnosticGraph(
         primary=primary.float(),
@@ -272,8 +282,8 @@ def build_diagnostic_graph(
         student_prob_state=consistency.student_prob,
         target_state=targets.target_state,
         target_full=targets.target_full,
-        valid_mask_state=targets.valid_mask_state,
-        valid_mask_full=targets.valid_mask_full,
+        valid_mask_state=psd_masks.psd_state,
+        valid_mask_full=psd_masks.psd_full,
     )
 
 
@@ -680,7 +690,10 @@ def run_gradient_conflict_analysis(
     parameters = [parameter for _, parameter in named_parameters]
     groups = module_groups(names)
 
-    dataset = build_dataset(config, config["dataset"]["train_split"], augment=True)
+    dataset = build_dataset(
+        config, config["dataset"]["train_split"], augment=True,
+        return_spatial_valid_mask=True,
+    )
     workers = config["dataset"]["num_workers"] if num_workers is None else num_workers
     loader = DataLoader(
         dataset,
@@ -694,13 +707,16 @@ def run_gradient_conflict_analysis(
     module_rows: list[dict[str, Any]] = []
     parameter_rows: list[dict[str, Any]] = []
 
-    for batch_index, (image, target) in enumerate(loader):
+    for batch_index, (image, target, spatial_valid_mask) in enumerate(loader):
         if batch_index >= num_batches:
             break
         image = image.to(device, non_blocking=True)
         target = target.to(device, non_blocking=True)
+        spatial_valid_mask = spatial_valid_mask.to(device, non_blocking=True)
         with autocast_context(config, device):
-            graph = build_diagnostic_graph(config, endpoint, source, image, target)
+            graph = build_diagnostic_graph(
+                config, endpoint, source, image, target, spatial_valid_mask
+            )
         primary_gradient = _autograd(graph.primary, parameters, retain=True)
         psd_gradient = _autograd(graph.psd, parameters, retain=True)
         source_gradient = _autograd(graph.source_weighted, parameters, retain=False)

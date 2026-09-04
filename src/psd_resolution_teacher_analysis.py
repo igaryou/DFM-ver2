@@ -371,7 +371,10 @@ def run_psd_resolution_teacher_analysis(
     names = [name for name, _ in named_parameters]
     parameters = [parameter for _, parameter in named_parameters]
     groups = module_groups(names)
-    dataset = build_dataset(config, config["dataset"]["train_split"], augment=True)
+    dataset = build_dataset(
+        config, config["dataset"]["train_split"], augment=True,
+        return_spatial_valid_mask=True,
+    )
     workers = config["dataset"]["num_workers"] if num_workers is None else num_workers
     loader = DataLoader(
         dataset, batch_size=batch_size, shuffle=True, drop_last=True,
@@ -387,13 +390,16 @@ def run_psd_resolution_teacher_analysis(
     teacher_rows: list[dict[str, Any]] = []
     threshold_rows: list[dict[str, Any]] = []
 
-    for batch_index, (image, target) in enumerate(loader):
+    for batch_index, (image, target, spatial_valid_mask) in enumerate(loader):
         if batch_index >= num_batches:
             break
         image = image.to(device, non_blocking=True)
         target = target.to(device, non_blocking=True)
+        spatial_valid_mask = spatial_valid_mask.to(device, non_blocking=True)
         with autocast_context(config, device):
-            graph = build_diagnostic_graph(config, endpoint, source, image, target)
+            graph = build_diagnostic_graph(
+                config, endpoint, source, image, target, spatial_valid_mask
+            )
         psd_full_loss, teacher_full, student_full = full_resolution_psd(
             graph.teacher_prob_state,
             graph.student_prob_state,

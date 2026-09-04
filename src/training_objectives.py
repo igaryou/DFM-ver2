@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any
 
 import torch
@@ -34,6 +35,68 @@ def _zero(reference: torch.Tensor) -> torch.Tensor:
     return reference.float().sum() * 0.0
 
 
+@dataclass(frozen=True)
+class PSDValidMasks:
+    semantic_full: torch.Tensor
+    semantic_state: torch.Tensor
+    spatial_full: torch.Tensor
+    spatial_state: torch.Tensor
+    psd_full: torch.Tensor
+    psd_state: torch.Tensor
+
+
+def build_psd_valid_masks(
+    targets,
+    *,
+    void_class_index: int | None,
+    ignore_void: bool,
+) -> PSDValidMasks:
+    """Separate semantic void masking from artificial-padding masking."""
+    if not isinstance(ignore_void, bool):
+        raise ValueError("PSD ignore_void must be a boolean")
+    if void_class_index is None:
+        semantic_full = (
+            targets.valid_mask_full
+            if targets.valid_mask_full is not None
+            else torch.ones_like(targets.target_full, dtype=torch.bool)
+        )
+        semantic_state = (
+            targets.valid_mask_state
+            if targets.valid_mask_state is not None
+            else torch.ones_like(targets.target_state, dtype=torch.bool)
+        )
+    else:
+        semantic_full = targets.target_full != void_class_index
+        semantic_state = targets.target_state != void_class_index
+    spatial_full = targets.spatial_valid_mask_full
+    spatial_state = targets.spatial_valid_mask_state
+    if spatial_full is None or spatial_state is None:
+        if not ignore_void:
+            raise ValueError(
+                "PSD ignore_void=false requires an explicit spatial valid mask "
+                "so real void and artificial padding remain distinguishable"
+            )
+        spatial_full = torch.ones_like(targets.target_full, dtype=torch.bool)
+        spatial_state = torch.ones_like(targets.target_state, dtype=torch.bool)
+    psd_full = spatial_full & semantic_full if ignore_void else spatial_full
+    psd_state = spatial_state & semantic_state if ignore_void else spatial_state
+    return PSDValidMasks(
+        semantic_full=semantic_full,
+        semantic_state=semantic_state,
+        spatial_full=spatial_full,
+        spatial_state=spatial_state,
+        psd_full=psd_full,
+        psd_state=psd_state,
+    )
+
+
+def _safe_mask_ratio(numerator: torch.Tensor, denominator: torch.Tensor) -> torch.Tensor:
+    return (
+        numerator.float().sum()
+        / denominator.float().sum().clamp_min(1.0)
+    )
+
+
 def consistency_schedule_weight(
     consistency_config: dict, *, epoch_index: int,
     progress_in_epoch: float, optimizer_step: int,
@@ -63,6 +126,7 @@ def compute_model_training_objectives(
     operation: str,
     image: torch.Tensor,
     target: torch.Tensor,
+    spatial_valid_mask: torch.Tensor | None = None,
     epoch_index: int,
     progress_in_epoch: float,
     optimizer_step: int = 0,
@@ -88,7 +152,19 @@ def compute_model_training_objectives(
         state_size=state_size,
         ignore_index=ignore_index,
         mask_pixel_losses=config["loss"].get("mask_pixel_losses", False),
+        spatial_valid_mask_full=spatial_valid_mask,
     )
+    psd_masks = None
+    if consistency_config["type"] == "psd":
+        psd_masks = build_psd_valid_masks(
+            targets,
+            void_class_index=config["dataset"].get(
+                "void_class_index", ignore_index
+            ),
+            ignore_void=consistency_config.get("psd", {}).get(
+                "ignore_void", True
+            ),
+        )
     source_only_stage1 = (
         operation == "stage1_objectives"
         and not training.get("train_endpoint", True)
@@ -249,6 +325,14 @@ def compute_model_training_objectives(
         ):
             with torch.autocast(device_type=image.device.type, enabled=False):
                 consistency_image_feat = endpoint.encode_image(image.float())
+        consistency_valid_mask = (
+            psd_masks.psd_state if psd_masks is not None
+            else targets.valid_mask_state
+        )
+        consistency_valid_mask_full = (
+            psd_masks.psd_full if psd_masks is not None
+            else targets.valid_mask_full
+        )
         consistency_result = losses.compute_consistency_loss(
             consistency_config["type"],
             model=endpoint,
@@ -260,9 +344,9 @@ def compute_model_training_objectives(
             t=consistency_t,
             precision=consistency_config["precision"],
             config=config,
-            valid_mask=targets.valid_mask_state,
+            valid_mask=consistency_valid_mask,
             full_resolution_size=tuple(targets.target_full.shape[-2:]),
-            valid_mask_full=targets.valid_mask_full,
+            valid_mask_full=consistency_valid_mask_full,
             path_difficulty=path_difficulty,
         )
         consistency_loss = consistency_result.loss
@@ -360,6 +444,30 @@ def compute_model_training_objectives(
         "state_height": total.new_tensor(state_size[0]),
         "state_width": total.new_tensor(state_size[1]),
     }
+    if psd_masks is not None:
+        psd_config = consistency_config.get("psd", {})
+        use_full = psd_config.get("loss_resolution", "state") == "full"
+        semantic_mask = (
+            psd_masks.semantic_full if use_full else psd_masks.semantic_state
+        )
+        spatial_mask = (
+            psd_masks.spatial_full if use_full else psd_masks.spatial_state
+        )
+        psd_mask = psd_masks.psd_full if use_full else psd_masks.psd_state
+        real_void = spatial_mask & ~semantic_mask
+        stats.update({
+            "psd_ignore_void": total.new_tensor(
+                float(psd_config.get("ignore_void", True))
+            ),
+            "psd_valid_pixel_ratio": psd_mask.float().mean().detach(),
+            "psd_spatial_valid_pixel_ratio": spatial_mask.float().mean().detach(),
+            "psd_semantic_valid_pixel_ratio": _safe_mask_ratio(
+                spatial_mask & semantic_mask, spatial_mask
+            ).detach(),
+            "psd_real_void_included_ratio": _safe_mask_ratio(
+                psd_mask & real_void, psd_mask
+            ).detach(),
+        })
     stats.update(diagonal_stats)
     if path_difficulty is not None and config["flow"]["path"]["diagnostics"]["enabled"]:
         coefficient = path_coefficient(

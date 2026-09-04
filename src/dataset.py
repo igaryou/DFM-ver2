@@ -63,8 +63,20 @@ def _pad_to(
 def _random_resize_pair(
     image: torch.Tensor, mask: torch.Tensor, config: dict
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    image, mask, _ = _random_resize_triplet(
+        image, mask, torch.ones_like(mask, dtype=torch.bool), config
+    )
+    return image, mask
+
+
+def _random_resize_triplet(
+    image: torch.Tensor,
+    mask: torch.Tensor,
+    spatial_valid_mask: torch.Tensor,
+    config: dict,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     if not config["enabled"]:
-        return image, mask
+        return image, mask, spatial_valid_mask
     ratio = float(torch.empty(()).uniform_(*config["ratio_range"]))
     target_width = config["base_scale"]["width"] * ratio
     target_height = config["base_scale"]["height"] * ratio
@@ -80,7 +92,10 @@ def _random_resize_pair(
     mask = TF.resize(
         mask[None], size, TF.InterpolationMode.NEAREST
     )[0].long()
-    return image, mask
+    spatial_valid_mask = TF.resize(
+        spatial_valid_mask[None], size, TF.InterpolationMode.NEAREST
+    )[0].bool()
+    return image, mask, spatial_valid_mask
 
 
 def _crop_has_acceptable_class_ratio(
@@ -102,8 +117,30 @@ def _random_crop_pair(
     image_pad_value: float = 0.0,
     mask_pad_value: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    image, mask, _ = _random_crop_triplet(
+        image,
+        mask,
+        torch.ones_like(mask, dtype=torch.bool),
+        config,
+        ensure_crop_size=ensure_crop_size,
+        image_pad_value=image_pad_value,
+        mask_pad_value=mask_pad_value,
+    )
+    return image, mask
+
+
+def _random_crop_triplet(
+    image: torch.Tensor,
+    mask: torch.Tensor,
+    spatial_valid_mask: torch.Tensor,
+    config: dict,
+    *,
+    ensure_crop_size: bool = False,
+    image_pad_value: float = 0.0,
+    mask_pad_value: int = 0,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     if not config["enabled"]:
-        return image, mask
+        return image, mask, spatial_valid_mask
     crop_h, crop_w = config["size"]
     if ensure_crop_size:
         # Safety padding precedes photometric distortion and normalization.
@@ -113,6 +150,12 @@ def _random_crop_pair(
         )
         assert padded_mask is not None
         mask = padded_mask
+        spatial_valid_mask = F.pad(
+            spatial_valid_mask,
+            (0, image.shape[-1] - spatial_valid_mask.shape[-1],
+             0, image.shape[-2] - spatial_valid_mask.shape[-2]),
+            value=False,
+        )
     height, width = mask.shape
     out_h, out_w = min(crop_h, height), min(crop_w, width)
     selected = (0, 0)
@@ -131,6 +174,7 @@ def _random_crop_pair(
     return (
         image[:, top:top + out_h, left:left + out_w],
         mask[top:top + out_h, left:left + out_w],
+        spatial_valid_mask[top:top + out_h, left:left + out_w],
     )
 
 
@@ -211,12 +255,14 @@ class Cityscapes20ClassDataset(Dataset):
         split: str = "train",
         config: dict | None = None,
         augment: bool = False,
+        return_spatial_valid_mask: bool = False,
     ) -> None:
         if config is None:
             raise ValueError("Cityscapes20ClassDataset requires config")
         self.config = config
         self.split = split
         self.augment = augment and split == config["dataset"]["train_split"]
+        self.return_spatial_valid_mask = return_spatial_valid_mask
         photo_config = config["augmentation"]["photometric_distortion"]
         self.photo_distortion = PhotoMetricDistortion(photo_config)
         jitter = config["augmentation"]["color_jitter"]
@@ -240,10 +286,19 @@ class Cityscapes20ClassDataset(Dataset):
     def _legacy_train_item(
         self, image: torch.Tensor, mask: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        image, mask, _ = self._legacy_train_item_with_spatial_mask(image, mask)
+        return image, mask
+
+    def _legacy_train_item_with_spatial_mask(
+        self, image: torch.Tensor, mask: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         augmentation = self.config["augmentation"]
+        spatial_valid_mask = torch.ones_like(mask, dtype=torch.bool)
         flip = augmentation["horizontal_flip"]
         if flip["enabled"] and torch.rand(()) < flip["probability"]:
-            image, mask = torch.flip(image, (2,)), torch.flip(mask, (1,))
+            image = torch.flip(image, (2,))
+            mask = torch.flip(mask, (1,))
+            spatial_valid_mask = torch.flip(spatial_valid_mask, (1,))
         image_size = self.config["dataset"]["image_size"]
         if image_size is not None:
             image = TF.resize(
@@ -253,17 +308,23 @@ class Cityscapes20ClassDataset(Dataset):
             mask = TF.resize(
                 mask[None], image_size, interpolation=TF.InterpolationMode.NEAREST
             )[0].long()
+            spatial_valid_mask = TF.resize(
+                spatial_valid_mask[None], image_size,
+                interpolation=TF.InterpolationMode.NEAREST,
+            )[0].bool()
         crop_size = self.config["dataset"]["crop_size"]
         if crop_size is not None:
             if crop_size[0] > mask.shape[0] or crop_size[1] > mask.shape[1]:
                 raise ValueError("dataset.crop_size exceeds the resized image")
-            image, mask = _random_crop_pair(image, mask, {
-                "enabled": True,
-                "size": crop_size,
-                "cat_max_ratio": 1.01,
-                "ignore_index": self.config["dataset"]["void_class_index"],
-                "max_attempts": 1,
-            })
+            image, mask, spatial_valid_mask = _random_crop_triplet(
+                image, mask, spatial_valid_mask, {
+                    "enabled": True,
+                    "size": crop_size,
+                    "cat_max_ratio": 1.01,
+                    "ignore_index": self.config["dataset"]["void_class_index"],
+                    "max_attempts": 1,
+                }
+            )
         if augmentation["color_jitter"]["enabled"]:
             image = self.jitter(image).clamp(0.0, 1.0)
         if augmentation["imagenet_normalize"]:
@@ -272,12 +333,19 @@ class Cityscapes20ClassDataset(Dataset):
                 "mean": [0.485, 0.456, 0.406],
                 "std": [0.229, 0.224, 0.225],
             })
-        return image, mask
+        return image, mask, spatial_valid_mask
 
     def _train_item(
         self, image: torch.Tensor, mask: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        image, mask, _ = self._train_item_with_spatial_mask(image, mask)
+        return image, mask
+
+    def _train_item_with_spatial_mask(
+        self, image: torch.Tensor, mask: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         augmentation = self.config["augmentation"]
+        spatial_valid_mask = torch.ones_like(mask, dtype=torch.bool)
         modern_pipeline = any(
             augmentation[name]["enabled"]
             for name in (
@@ -286,13 +354,14 @@ class Cityscapes20ClassDataset(Dataset):
             )
         )
         if not modern_pipeline:
-            return self._legacy_train_item(image, mask)
-        image, mask = _random_resize_pair(
-            image, mask, augmentation["random_resize"]
+            return self._legacy_train_item_with_spatial_mask(image, mask)
+        image, mask, spatial_valid_mask = _random_resize_triplet(
+            image, mask, spatial_valid_mask, augmentation["random_resize"]
         )
-        image, mask = _random_crop_pair(
+        image, mask, spatial_valid_mask = _random_crop_triplet(
             image,
             mask,
+            spatial_valid_mask,
             augmentation["random_crop"],
             ensure_crop_size=True,
             image_pad_value=0.0,
@@ -300,7 +369,9 @@ class Cityscapes20ClassDataset(Dataset):
         )
         flip = augmentation["horizontal_flip"]
         if flip["enabled"] and torch.rand(()) < flip["probability"]:
-            image, mask = torch.flip(image, (2,)), torch.flip(mask, (1,))
+            image = torch.flip(image, (2,))
+            mask = torch.flip(mask, (1,))
+            spatial_valid_mask = torch.flip(spatial_valid_mask, (1,))
         photo = augmentation["photometric_distortion"]
         if photo["enabled"]:
             image = self.photo_distortion(image)
@@ -315,6 +386,12 @@ class Cityscapes20ClassDataset(Dataset):
             )
             assert padded_mask is not None
             mask = padded_mask
+            spatial_valid_mask = F.pad(
+                spatial_valid_mask,
+                (0, image.shape[-1] - spatial_valid_mask.shape[-1],
+                 0, image.shape[-2] - spatial_valid_mask.shape[-2]),
+                value=False,
+            )
         expected = tuple(self.config["dataset"]["image_size"])
         enforce_expected = (
             augmentation["random_crop"]["enabled"]
@@ -328,7 +405,7 @@ class Cityscapes20ClassDataset(Dataset):
                 f"image={tuple(image.shape[-2:])}, mask={tuple(mask.shape)}, "
                 f"expected={expected}"
             )
-        return image, mask
+        return image, mask, spatial_valid_mask
 
     def _validation_item(
         self, image: torch.Tensor, mask: torch.Tensor, index: int
@@ -388,11 +465,11 @@ class Cityscapes20ClassDataset(Dataset):
         image = TF.pil_to_tensor(image).float() / 255.0
         mask = self._map_target(target)
 
-        return (
-            self._train_item(image, mask)
-            if self.augment
-            else self._validation_item(image, mask, index)
-        )
+        if not self.augment:
+            return self._validation_item(image, mask, index)
+        if self.return_spatial_valid_mask:
+            return self._train_item_with_spatial_mask(image, mask)
+        return self._train_item(image, mask)
 
 
 class ADE20KDataset(Dataset):
@@ -401,13 +478,17 @@ class ADE20KDataset(Dataset):
     SPLITS = {"train": "training", "training": "training", "val": "validation", "validation": "validation"}
     EXPECTED_COUNTS = {"training": 20210, "validation": 2000}
 
-    def __init__(self, root: str, split: str, config: dict, augment: bool) -> None:
+    def __init__(
+        self, root: str, split: str, config: dict, augment: bool,
+        return_spatial_valid_mask: bool = False,
+    ) -> None:
         self.root = Path(root)
         if split not in self.SPLITS:
             raise ValueError(f"Unknown ADE20K split: {split}")
         self.split = self.SPLITS[split]
         self.config = config
         self.augment = augment and self.split == "training"
+        self.return_spatial_valid_mask = return_spatial_valid_mask
         image_dir = self.root / "images" / self.split
         annotation_dir = self.root / "annotations" / self.split
         if not image_dir.is_dir() or not annotation_dir.is_dir():
@@ -453,11 +534,26 @@ class ADE20KDataset(Dataset):
         )
 
     def _train_item(self, image: torch.Tensor, mask: torch.Tensor):
-        image, mask = self._random_resize(image, mask)
-        image, mask = self._random_crop(image, mask)
+        image, mask, _ = self._train_item_with_spatial_mask(image, mask)
+        return image, mask
+
+    def _train_item_with_spatial_mask(
+        self, image: torch.Tensor, mask: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        spatial_valid_mask = torch.ones_like(mask, dtype=torch.bool)
+        image, mask, spatial_valid_mask = _random_resize_triplet(
+            image, mask, spatial_valid_mask,
+            self.config["augmentation"]["random_resize"],
+        )
+        image, mask, spatial_valid_mask = _random_crop_triplet(
+            image, mask, spatial_valid_mask,
+            self.config["augmentation"]["random_crop"],
+        )
         flip = self.config["augmentation"]["horizontal_flip"]
         if flip["enabled"] and torch.rand(()) < flip["probability"]:
-            image, mask = torch.flip(image, (2,)), torch.flip(mask, (1,))
+            image = torch.flip(image, (2,))
+            mask = torch.flip(mask, (1,))
+            spatial_valid_mask = torch.flip(spatial_valid_mask, (1,))
         photo = self.config["augmentation"]["photometric_distortion"]
         if photo["enabled"]:
             image = self.photo_distortion(image)
@@ -467,7 +563,13 @@ class ADE20KDataset(Dataset):
             image, mask = _pad_to(
                 image, mask, *pad["size"], pad["image_value"], pad["mask_value"]
             )
-        return image, mask
+            spatial_valid_mask = F.pad(
+                spatial_valid_mask,
+                (0, image.shape[-1] - spatial_valid_mask.shape[-1],
+                 0, image.shape[-2] - spatial_valid_mask.shape[-2]),
+                value=False,
+            )
+        return image, mask, spatial_valid_mask
 
     def _validation_item(self, image: torch.Tensor, mask: torch.Tensor, index: int) -> dict:
         evaluation = self.config["evaluation"]
@@ -503,6 +605,8 @@ class ADE20KDataset(Dataset):
     def __getitem__(self, index: int):
         image, mask = self._load(self.images[index], self.annotations[index])
         if self.augment:
+            if self.return_spatial_valid_mask:
+                return self._train_item_with_spatial_mask(image, mask)
             return self._train_item(image, mask)
         return self._validation_item(image, mask, index)
 
@@ -512,10 +616,18 @@ def ade20k_eval_collate(batch: list[dict]) -> list[dict]:
     return batch
 
 
-def build_dataset(config: dict, split: str, augment: bool | None = None):
+def build_dataset(
+    config: dict,
+    split: str,
+    augment: bool | None = None,
+    return_spatial_valid_mask: bool = False,
+):
     if config["dataset"]["name"] == "ade20k":
         enabled = config["augmentation"]["enabled"] if augment is None else augment
-        return ADE20KDataset(config["dataset"]["root"], split, config, enabled)
+        return ADE20KDataset(
+            config["dataset"]["root"], split, config, enabled,
+            return_spatial_valid_mask=return_spatial_valid_mask,
+        )
 
     enabled = config["augmentation"]["enabled"] if augment is None else augment
     return Cityscapes20ClassDataset(
@@ -523,4 +635,5 @@ def build_dataset(config: dict, split: str, augment: bool | None = None):
         split=split,
         config=config,
         augment=enabled and split == "train",
+        return_spatial_valid_mask=return_spatial_valid_mask,
     )

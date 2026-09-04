@@ -43,6 +43,8 @@ class StateTargets:
     one_hot_state: torch.Tensor
     valid_mask_full: torch.Tensor | None
     valid_mask_state: torch.Tensor | None
+    spatial_valid_mask_full: torch.Tensor | None
+    spatial_valid_mask_state: torch.Tensor | None
 
 
 def prepare_state_targets(
@@ -52,6 +54,7 @@ def prepare_state_targets(
     state_size: tuple[int, int] | list[int],
     ignore_index: int | None,
     mask_pixel_losses: bool,
+    spatial_valid_mask_full: torch.Tensor | None = None,
 ) -> StateTargets:
     """Separate discrete full-resolution supervision from the DFM state target."""
     if target_full.ndim != 3:
@@ -74,6 +77,20 @@ def prepare_state_targets(
     use_mask = mask_pixel_losses and ignore_index is not None
     valid_mask_full = target_full != ignore_index if use_mask else None
     valid_mask_state = target_state != ignore_index if use_mask else None
+    spatial_valid_mask_state = None
+    if spatial_valid_mask_full is not None:
+        if spatial_valid_mask_full.shape != target_full.shape:
+            raise ValueError(
+                "spatial_valid_mask_full must match target_full, got "
+                f"{tuple(spatial_valid_mask_full.shape)} and {tuple(target_full.shape)}"
+            )
+        if spatial_valid_mask_full.dtype != torch.bool:
+            raise ValueError("spatial_valid_mask_full must have dtype bool")
+        spatial_valid_mask_state = F.interpolate(
+            spatial_valid_mask_full[:, None].float(),
+            size=state_size,
+            mode="nearest",
+        )[:, 0].bool()
 
     assert target_state.shape[-2:] == state_size
     assert one_hot_state.shape[-2:] == state_size
@@ -87,4 +104,6 @@ def prepare_state_targets(
         one_hot_state=one_hot_state,
         valid_mask_full=valid_mask_full,
         valid_mask_state=valid_mask_state,
+        spatial_valid_mask_full=spatial_valid_mask_full,
+        spatial_valid_mask_state=spatial_valid_mask_state,
     )

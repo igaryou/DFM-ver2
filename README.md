@@ -150,6 +150,20 @@ uv run python src/evaluate.py \
   --set source.simplex_prior.inference.lambda=0.9
 ```
 
+学習済みB1 sourceだけを使い、simplex初期状態を可視化する例:
+
+```bash
+CUDA_VISIBLE_DEVICES=2 uv run python src/visualize_simplex_source.py \
+  --config configs/cityscapes/diagonal/source_segformer_b1_32k.yaml \
+  --checkpoint-dir results/cityscapes/source_segformer_b1_32k \
+  --output-dir results/cityscapes/source_segformer_b1_32k/simplex_visualization \
+  --split val --num-images 8 \
+  --lambda 0.8 --temperature 1.0 --dirichlet-alpha 1.0 --seed 42
+```
+
+`--lambda-values`、`--alpha-values`、`--temperature-values`を使うと、画像ごとの
+sweep比較figureも生成します。lambda sweep内では同一のDirichlet noiseを共有します。
+
 ### GT、loss、推論
 
 `target_full`とnearest-resizeした`target_state`を明示的に分離します。
@@ -362,6 +376,16 @@ precision:
 ```
 
 PSDへ`bf16`/`fp32` JVPを指定するとconfig validation errorになります。
+
+PSDでsemantic voidを除外するかは`loss.consistency.psd.ignore_void`で切り替えます。
+既定値は`true`です。`true`では実画像のnon-void pixelだけ、`false`ではreal
+voidを含む実画像pixelすべてが対象です。augmentationが追加したpaddingは、
+どちらの設定でもdataset由来のspatial valid maskによって除外されます。
+
+```bash
+--set loss.consistency.psd.ignore_void=true
+--set loss.consistency.psd.ignore_void=false
+```
 
 ### CSD
 

@@ -241,6 +241,74 @@ def source_alignment_map_from_indices(
     ) / num_classes
 
 
+def sample_symmetric_dirichlet(
+    shape: tuple[int, int, int, int],
+    alpha: float,
+    *,
+    device: torch.device,
+    seed: int | None = None,
+) -> torch.Tensor:
+    """Sample per-pixel symmetric Dirichlet noise in FP32."""
+    batch, classes, height, width = shape
+    if alpha <= 0:
+        raise ValueError("Dirichlet alpha must be positive")
+
+    def draw() -> torch.Tensor:
+        concentration = torch.full(
+            (classes,), float(alpha), device=device, dtype=torch.float32
+        )
+        return torch.distributions.Dirichlet(concentration).sample(
+            (batch, height, width)
+        ).permute(0, 3, 1, 2)
+
+    if seed is None:
+        return draw()
+    cuda_devices: list[int] = []
+    if device.type == "cuda":
+        cuda_devices = [
+            torch.cuda.current_device() if device.index is None else device.index
+        ]
+    with torch.random.fork_rng(devices=cuda_devices):
+        torch.manual_seed(int(seed))
+        return draw()
+
+
+def sample_image_simplex_components(
+    mu: torch.Tensor,
+    *,
+    lambda_value: float,
+    temperature: float,
+    dirichlet_alpha: float,
+    dirichlet_noise: torch.Tensor | None = None,
+    seed: int | None = None,
+) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
+    """Return q, Dirichlet epsilon, and their production simplex mixture."""
+    lambda_value = float(lambda_value)
+    temperature = float(temperature)
+    dirichlet_alpha = float(dirichlet_alpha)
+    if not 0 <= lambda_value <= 1:
+        raise ValueError("lambda_value must be in [0,1]")
+    if temperature <= 0:
+        raise ValueError("temperature must be positive")
+    if dirichlet_alpha <= 0:
+        raise ValueError("dirichlet_alpha must be positive")
+    probability = torch.softmax(mu.float() / temperature, dim=1)
+    if dirichlet_noise is not None:
+        if dirichlet_noise.shape != mu.shape:
+            raise ValueError("Dirichlet noise and source mean must have identical shapes")
+        noise = dirichlet_noise.float()
+    elif lambda_value == 1.0:
+        noise = None
+        x0_fp32 = probability
+    else:
+        noise = sample_symmetric_dirichlet(
+            tuple(mu.shape), dirichlet_alpha, device=mu.device, seed=seed
+        )
+    if noise is not None:
+        x0_fp32 = lambda_value * probability + (1.0 - lambda_value) * noise
+    return probability, noise, x0_fp32.to(dtype=mu.dtype)
+
+
 def _sample_image_simplex_mixture(
     mu: torch.Tensor,
     parameters: dict,
@@ -249,18 +317,13 @@ def _sample_image_simplex_mixture(
     lambda_value = float(parameters["lambda"])
     temperature = float(parameters["temperature"])
     dirichlet_alpha = float(parameters["dirichlet_alpha"])
-    probability = torch.softmax(mu.float() / temperature, dim=1)
-    if lambda_value == 1.0:
-        x0_fp32 = probability
-    else:
-        batch, classes, height, width = mu.shape
-        concentration = torch.full(
-            (classes,), dirichlet_alpha, device=mu.device, dtype=torch.float32
-        )
-        noise = torch.distributions.Dirichlet(concentration).sample(
-            (batch, height, width)
-        ).permute(0, 3, 1, 2)
-        x0_fp32 = lambda_value * probability + (1.0 - lambda_value) * noise
+    probability, _, x0 = sample_image_simplex_components(
+        mu,
+        lambda_value=lambda_value,
+        temperature=temperature,
+        dirichlet_alpha=dirichlet_alpha,
+    )
+    x0_fp32 = x0.float()
     entropy = -(
         probability * probability.clamp_min(torch.finfo(torch.float32).tiny).log()
     ).sum(dim=1)

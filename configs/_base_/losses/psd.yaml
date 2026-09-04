@@ -3,8 +3,10 @@ loss:
     enabled: true
     type: psd
     weight: 0.5
+    psd:
+      loss_resolution: state
+      ignore_void: true
     precision:
       jvp_dtype: null
       numerical_dtype: fp32
       debug_assertions: false
-

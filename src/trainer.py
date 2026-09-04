@@ -122,6 +122,11 @@ DFM_RECIPE_SUMMARY_KEYS = (
     "psd_loss_height",
     "psd_loss_width",
     "psd_loss_resolution_is_full",
+    "psd_ignore_void",
+    "psd_valid_pixel_ratio",
+    "psd_spatial_valid_pixel_ratio",
+    "psd_semantic_valid_pixel_ratio",
+    "psd_real_void_included_ratio",
     "loss_esd_raw_kl",
     "loss_esd_adaptive_kl",
     "esd_log_arg_min",
@@ -666,7 +671,10 @@ def _build_loaders(
     local_batch_size: int,
 ):
     train_dataset = build_dataset(
-        config, config["dataset"]["train_split"], augment=True
+        config,
+        config["dataset"]["train_split"],
+        augment=True,
+        return_spatial_valid_mask=True,
     )
     val_dataset = build_dataset(config, config["evaluation"]["split"], augment=False)
     train_sampler = (
@@ -725,6 +733,16 @@ def _build_loaders(
         **common,
     )
     return train_loader, val_loader, train_sampler
+
+
+def _unpack_training_batch(batch):
+    """Accept legacy pairs while production datasets provide an explicit mask."""
+    if len(batch) == 3:
+        return batch
+    if len(batch) == 2:
+        image, target = batch
+        return image, target, torch.ones_like(target, dtype=torch.bool)
+    raise ValueError(f"training batch must contain 2 or 3 tensors, got {len(batch)}")
 
 
 def _accumulate_entropy_percentiles(
@@ -1386,11 +1404,15 @@ def run_training(config: dict, *, joint_entrypoint: bool = False) -> dict:
                 is_main_process=context.is_main_process,
             )
             try:
-                for batch_index, (image, target) in enumerate(train_loader):
+                for batch_index, batch in enumerate(train_loader):
                     if batch_index >= epoch_total_iterations:
                         break
+                    image, target, spatial_valid_mask = _unpack_training_batch(batch)
                     image = image.to(context.device, non_blocking=True)
                     target = target.to(context.device, non_blocking=True)
+                    spatial_valid_mask = spatial_valid_mask.to(
+                        context.device, non_blocking=True
+                    )
                     reaches_limit = (
                         max_iterations is not None
                         and total_iterations + 1 >= max_iterations
@@ -1412,6 +1434,7 @@ def run_training(config: dict, *, joint_entrypoint: bool = False) -> dict:
                                 operation=operation,
                                 image=image,
                                 target=target,
+                                spatial_valid_mask=spatial_valid_mask,
                                 epoch_index=epoch_index,
                                 progress_in_epoch=(
                                     batch_index / max(len(train_loader), 1)

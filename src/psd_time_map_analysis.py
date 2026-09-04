@@ -222,11 +222,12 @@ def _phase_a(
     raw_module_rows: list[dict[str, Any]] = []
     parameter_rows: list[dict[str, Any]] = []
     warning_count = 0
-    for batch_index, (image, target) in enumerate(loader):
+    for batch_index, (image, target, spatial_valid_mask) in enumerate(loader):
         if batch_index >= time_bin_batches:
             break
         image = image.to(device, non_blocking=True)
         target = target.to(device, non_blocking=True)
+        spatial_valid_mask = spatial_valid_mask.to(device, non_blocking=True)
         model_rng = _capture_rng(device)
         post_reference_rng = None
         reference_base: Gradient | None = None
@@ -239,6 +240,7 @@ def _phase_a(
             with autocast_context(config, device):
                 graph = build_diagnostic_graph(
                     config, endpoint, source, image, target,
+                    spatial_valid_mask,
                     consistency_times=times,
                 )
             if post_reference_rng is None:
@@ -581,7 +583,10 @@ def run_psd_time_map_analysis(
     seed_everything(seed)
     checkpoint, endpoint, source = _load_models(config, checkpoint_path, device)
     train_loader = DataLoader(
-        build_dataset(config, config["dataset"]["train_split"], augment=True),
+        build_dataset(
+            config, config["dataset"]["train_split"], augment=True,
+            return_spatial_valid_mask=True,
+        ),
         batch_size=batch_size, shuffle=True, drop_last=True,
         num_workers=workers, pin_memory=config["dataset"]["pin_memory"],
     )

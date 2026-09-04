@@ -256,7 +256,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
                 "numerical_dtype": "fp32",
                 "debug_assertions": False,
             },
-            "psd": {"loss_resolution": "state"},
+            "psd": {"loss_resolution": "state", "ignore_void": True},
             "gradient_surgery": {
                 "enabled": False,
                 "priority": "diagonal",
@@ -820,6 +820,8 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
     precision = consistency["precision"]
     if precision["numerical_dtype"] != "fp32":
         raise ValueError("loss.consistency.precision.numerical_dtype must be fp32")
+    if not isinstance(consistency["psd"]["ignore_void"], bool):
+        raise ValueError("loss.consistency.psd.ignore_void must be a boolean")
     if consistency["type"] == "psd":
         if consistency["psd"]["loss_resolution"] not in {"state", "full"}:
             raise ValueError(
