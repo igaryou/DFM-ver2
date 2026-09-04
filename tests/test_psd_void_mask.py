@@ -293,7 +293,11 @@ def test_explicit_spatial_mask_is_accepted_when_real_void_is_included():
 
 
 def test_production_cityscapes_train_item_returns_explicit_spatial_mask():
-    config = load_config(CONFIG)
+    config = load_config(
+        ROOT / "configs" / "cityscapes" / "psd"
+        / "joint_simplex_b1_ce_include_void_160k.yaml"
+    )
+    assert config["loss"]["consistency"]["psd"]["ignore_void"] is False
     config["dataset"]["image_size"] = [4, 8]
     config["augmentation"]["random_resize"]["enabled"] = False
     config["augmentation"]["random_crop"]["enabled"] = False

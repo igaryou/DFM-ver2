@@ -1,0 +1,23 @@
+extends: joint_swin_t_segformer_b1_standard_ce_160k.yaml
+
+source:
+  prior_type: image_simplex_mixture
+  var_weight: 0.0
+  simplex_prior:
+    training:
+      lambda: 0.8
+      temperature: 1.0
+      dirichlet_alpha: 1.0
+    inference:
+      lambda: 0.8
+      temperature: 1.0
+      dirichlet_alpha: 1.0
+
+checkpoint:
+  init_from: null
+  resume: null
+
+wandb:
+  tags:
+    [cityscapes, joint, psd, swin-t, segformer-b1, standard-head,
+     source-ce, simplex-source, 160k]
