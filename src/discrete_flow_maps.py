@@ -339,6 +339,29 @@ def _sample_image_simplex_mixture(
     return x0_fp32.to(dtype=mu.dtype), stats
 
 
+def sample_image_bounded_gaussian(
+    mu_raw: torch.Tensor,
+    *,
+    amplitude: float,
+    sigma: float,
+    epsilon: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build the bounded state mean and sample x0 without changing raw logits."""
+    amplitude = float(amplitude)
+    sigma = float(sigma)
+    if amplitude <= 0:
+        raise ValueError("amplitude must be positive")
+    if sigma < 0:
+        raise ValueError("sigma must be non-negative")
+    mu_state = amplitude * torch.tanh(mu_raw)
+    if epsilon is None:
+        epsilon = torch.randn_like(mu_raw)
+    elif epsilon.shape != mu_raw.shape:
+        raise ValueError("epsilon and mu_raw must have identical shapes")
+    x0 = mu_state + sigma * epsilon.to(device=mu_raw.device, dtype=mu_raw.dtype)
+    return mu_state, x0
+
+
 def sample_prior(
     config: dict,
     image: torch.Tensor,
@@ -407,6 +430,7 @@ def sample_prior(
     adaptive_frozen = entropy_adaptive_enabled(config) and source.get("freeze", False)
     source_context = torch.no_grad() if adaptive_frozen else nullcontext()
     simplex_stats: dict[str, torch.Tensor] = {}
+    mu_state: torch.Tensor | None = None
     with source_context:
         if sample_state and source["prior_type"] == "image_gaussian":
             x0, mu, logvar = source_model(image)
@@ -420,6 +444,16 @@ def sample_prior(
                 )
             mu, logvar = source_statistics(source_model, image)
             x0 = mu
+        if source["prior_type"] == "image_bounded_gaussian":
+            amplitude = float(source["bounded_gaussian"]["amplitude"])
+            sigma_value = float(source["fixed_std"])
+            if sample_state:
+                mu_state, x0 = sample_image_bounded_gaussian(
+                    mu, amplitude=amplitude, sigma=sigma_value
+                )
+            else:
+                mu_state = amplitude * torch.tanh(mu)
+                x0 = mu_state
         if sample_state and source["prior_type"] == "image_simplex_mixture":
             x0, simplex_stats = _sample_image_simplex_mixture(
                 mu, source["simplex_prior"][sampling_mode]
@@ -438,7 +472,9 @@ def sample_prior(
     source_zero = image.new_zeros(()) if frozen_task_without_supervision else zero
     loss_var = (
         source_zero
-        if source["prior_type"] == "image_simplex_mixture"
+        if source["prior_type"] in {
+            "image_bounded_gaussian", "image_simplex_mixture"
+        }
         or fixed_std is not None
         or adaptive_frozen
         else 0.5 * torch.mean(torch.exp(logvar) - logvar - 1.0)
@@ -526,6 +562,18 @@ def sample_prior(
         "source_sigma_mean": sigma.mean(),
         "source_x0_abs": x0.detach().abs().mean(),
     }
+    if mu_state is not None:
+        stats.update({
+            "source_mu_raw_abs": mu.detach().abs().mean(),
+            "source_mu_raw_min": mu.detach().amin(),
+            "source_mu_raw_max": mu.detach().amax(),
+            "source_mu_state_abs": mu_state.detach().abs().mean(),
+            "source_mu_state_min": mu_state.detach().amin(),
+            "source_mu_state_max": mu_state.detach().amax(),
+            "source_amplitude": mu.new_tensor(
+                float(source["bounded_gaussian"]["amplitude"])
+            ),
+        })
     stats.update({key: value.detach() for key, value in simplex_stats.items()})
     if simplex_stats:
         stats["source_prior_mode"] = mu.new_tensor(
@@ -536,7 +584,9 @@ def sample_prior(
         assert x0.shape == target_one_hot_state.shape
     if entropy_adaptive_enabled(config):
         # Internal non-scalar payload consumed by training/inference in this batch.
-        stats["_path_source_state"] = mu.detach()
+        stats["_path_source_state"] = (
+            mu_state.detach() if mu_state is not None else mu.detach()
+        )
     return x0, stats
 
 

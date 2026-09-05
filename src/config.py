@@ -165,6 +165,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
                 "dirichlet_alpha": 1.0,
             },
         },
+        "bounded_gaussian": {
+            "amplitude": 1.0,
+        },
     },
     "flow": {
         "time_eps": 1.0e-5,
@@ -623,12 +626,36 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
     ):
         raise ValueError("model.state_downsample_factor must be a positive power of two")
     if config["source"]["prior_type"] not in {
-        "gaussian", "dirichlet", "image_gaussian", "image_simplex_mixture"
+        "gaussian", "dirichlet", "image_gaussian", "image_bounded_gaussian",
+        "image_simplex_mixture",
     }:
         raise ValueError(
             "source.prior_type must be gaussian, dirichlet, image_gaussian, "
-            "or image_simplex_mixture"
+            "image_bounded_gaussian, or image_simplex_mixture"
         )
+    if config["source"]["prior_type"] == "image_bounded_gaussian":
+        amplitude = config["source"]["bounded_gaussian"]["amplitude"]
+        if (
+            isinstance(amplitude, bool)
+            or not isinstance(amplitude, (int, float))
+            or amplitude <= 0
+        ):
+            raise ValueError(
+                "source.bounded_gaussian.amplitude must be positive"
+            )
+        fixed_std = config["source"]["fixed_std"]
+        if (
+            isinstance(fixed_std, bool)
+            or not isinstance(fixed_std, (int, float))
+            or fixed_std <= 0
+        ):
+            raise ValueError(
+                "image_bounded_gaussian requires source.fixed_std > 0"
+            )
+        if config["source"]["learned_logvar"] is not False:
+            raise ValueError(
+                "image_bounded_gaussian requires source.learned_logvar=false"
+            )
     simplex_prior = config["source"]["simplex_prior"]
     for sampling_mode in ("training", "inference"):
         parameters = simplex_prior[sampling_mode]
@@ -691,9 +718,11 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(config["evaluation"]["source_only"], bool):
         raise ValueError("evaluation.source_only must be boolean")
     if config["source"]["type"] == "task_finetuned_segformer":
-        if config["source"]["prior_type"] != "image_gaussian":
+        if config["source"]["prior_type"] not in {
+            "image_gaussian", "image_bounded_gaussian"
+        }:
             raise ValueError(
-                "task_finetuned_segformer requires source.prior_type=image_gaussian"
+                "task_finetuned_segformer requires an image Gaussian source prior"
             )
         if config["source"]["backbone"] != "segformer":
             raise ValueError(
@@ -771,7 +800,7 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
         if stage != "diagonal_pretrain" and not config["source"]["freeze"]:
             raise ValueError("entropy-adaptive Stage 2/joint paths require source.freeze=true")
         if config["source"]["prior_type"] not in {
-            "image_gaussian", "image_simplex_mixture"
+            "image_gaussian", "image_bounded_gaussian", "image_simplex_mixture"
         }:
             raise ValueError(
                 "entropy-adaptive path requires an image-conditioned source prior"

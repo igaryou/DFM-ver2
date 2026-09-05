@@ -321,7 +321,9 @@ def source_statistics(source_model: nn.Module, image: torch.Tensor) -> tuple[tor
 
 def build_source_model(config: dict):
     source = config["source"]
-    if source["prior_type"] not in {"image_gaussian", "image_simplex_mixture"}:
+    if source["prior_type"] not in {
+        "image_gaussian", "image_bounded_gaussian", "image_simplex_mixture"
+    }:
         return None
     fixed_std = source["fixed_std"]
     if not source["learned_logvar"] and fixed_std is None:
