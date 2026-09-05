@@ -170,6 +170,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "time_eps": 1.0e-5,
         "probability_eps": 1.0e-8,
         "start_time": 0.0,
+        "target_smoothing": {
+            "enabled": False,
+            "p": 0.0,
+        },
         "path": {
             "type": "power",
             "exponent": 1.0,
@@ -710,6 +714,20 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
         supervision.pop("include_void", None)
     if config["flow"]["time_eps"] <= 0:
         raise ValueError("flow.time_eps must be positive")
+    target_smoothing = config["flow"]["target_smoothing"]
+    if not isinstance(target_smoothing["enabled"], bool):
+        raise ValueError("flow.target_smoothing.enabled must be a boolean")
+    smoothing_p = target_smoothing["p"]
+    if (
+        isinstance(smoothing_p, bool)
+        or not isinstance(smoothing_p, (int, float))
+        or not 0.0 <= smoothing_p < 1.0
+    ):
+        raise ValueError("flow.target_smoothing.p must satisfy 0 <= p < 1")
+    if not target_smoothing["enabled"] and float(smoothing_p) != 0.0:
+        raise ValueError(
+            "flow.target_smoothing.p must be 0 when target smoothing is disabled"
+        )
     path = config["flow"]["path"]
     if path["type"] not in {"power", "linear", "entropy_adaptive"}:
         raise ValueError("flow.path.type must be power, linear, or entropy_adaptive")

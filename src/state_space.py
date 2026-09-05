@@ -7,6 +7,43 @@ import torch
 import torch.nn.functional as F
 
 
+def smooth_categorical_target(
+    one_hot: torch.Tensor,
+    smoothing_p: float,
+) -> torch.Tensor:
+    """Move categorical vertices into the open simplex without changing argmax."""
+    if one_hot.ndim < 2:
+        raise ValueError("categorical target must have a channel dimension")
+    if isinstance(smoothing_p, bool) or not isinstance(smoothing_p, (int, float)):
+        raise TypeError("smoothing_p must be a real number")
+    smoothing_p = float(smoothing_p)
+    if not 0.0 <= smoothing_p < 1.0:
+        raise ValueError("smoothing_p must satisfy 0 <= p < 1")
+    if smoothing_p == 0.0:
+        return one_hot
+    classes = one_hot.shape[1]
+    if classes < 2:
+        raise ValueError("categorical target must contain at least two classes")
+    smoothed = (1.0 - smoothing_p) * one_hot + smoothing_p / classes
+    assert smoothed.shape == one_hot.shape
+    assert bool((smoothed >= 0).all())
+    assert torch.allclose(
+        smoothed.sum(dim=1),
+        torch.ones_like(smoothed[:, 0]),
+        rtol=1.0e-5,
+        atol=1.0e-6,
+    )
+    return smoothed
+
+
+def target_state_from_config(one_hot: torch.Tensor, config: dict) -> torch.Tensor:
+    """Resolve the configured state-space endpoint, with legacy-safe defaults."""
+    settings = config.get("flow", {}).get("target_smoothing", {})
+    enabled = settings.get("enabled", False)
+    smoothing_p = settings.get("p", 0.0) if enabled else 0.0
+    return smooth_categorical_target(one_hot, smoothing_p)
+
+
 def state_spatial_size(
     image_or_size: torch.Tensor | tuple[int, int] | list[int],
     downsample_factor: int,

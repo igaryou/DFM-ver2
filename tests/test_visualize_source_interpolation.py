@@ -113,11 +113,20 @@ def test_argument_defaults_and_validation():
     assert tuple(args.times) == diagnostic.DEFAULT_TIMES
     assert (args.lambda_value, args.temperature, args.dirichlet_alpha) == (0.1, 6.0, 1.0)
     assert (args.amplitude, args.tanh_temperature, args.sigma) == (1.0, 5.0, 1.0)
+    assert args.target_smoothing_p == 0.0
     with pytest.raises(ValueError, match="strictly increasing"):
         diagnostic.parse_args([
             "--config", "x", "--checkpoint", "y", "--output-dir", "z",
             "--times", "0.5", "0.25",
         ])
+
+
+def test_visualizer_target_smoothing_matches_shared_helper():
+    _, _, hard = _inputs()
+    assert diagnostic.smooth_categorical_target(hard, 0.0) is hard
+    actual = diagnostic.smooth_categorical_target(hard, 0.8)
+    expected = 0.2 * hard + 0.8 / hard.shape[1]
+    torch.testing.assert_close(actual, expected)
 
 
 def test_cpu_synthetic_smoke_for_both_modes():

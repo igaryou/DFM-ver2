@@ -1,0 +1,16 @@
+extends: joint_simplex_b1_ce_160k.yaml
+
+experiment:
+  name: joint_simplex_b1_ce_smoothed_target_p08_160k
+  output_dir: /home/igarashi_25/DFM/results/cityscapes/joint_simplex_b1_ce_smoothed_target_p08_160k
+
+flow:
+  target_smoothing:
+    enabled: true
+    p: 0.8
+
+wandb:
+  name: joint-simplex-b1-ce-smoothed-target-p08-160k
+  tags:
+    [cityscapes, joint, psd, simplex-source, source-ce,
+     smoothed-target, p08, 160k]

@@ -1,0 +1,16 @@
+extends: joint_simplex_b1_ce_smoothed_target_p08_160k.yaml
+
+experiment:
+  name: joint_simplex_b1_ce_smoothed_target_p08_include_void_160k
+  output_dir: /home/igarashi_25/DFM/results/cityscapes/joint_simplex_b1_ce_smoothed_target_p08_include_void_160k
+
+loss:
+  consistency:
+    psd:
+      ignore_void: false
+
+wandb:
+  name: joint-simplex-b1-ce-smoothed-target-p08-include-void-160k
+  tags:
+    [cityscapes, joint, psd, simplex-source, source-ce,
+     smoothed-target, p08, include-void, 160k]

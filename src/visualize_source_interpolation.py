@@ -15,7 +15,7 @@ from config import load_config
 from dataset import build_dataset
 from discrete_flow_maps import sample_image_simplex_components
 from source_model import source_statistics
-from state_space import prepare_state_targets
+from state_space import prepare_state_targets, smooth_categorical_target
 from utils import resolve_device
 from visualization import colorize
 from visualize_simplex_source import (
@@ -47,6 +47,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--amplitude", type=float, default=1.0)
     parser.add_argument("--tanh-temperature", type=float, default=5.0)
     parser.add_argument("--sigma", type=float, default=1.0)
+    parser.add_argument("--target-smoothing-p", type=float, default=0.0)
+    parser.add_argument("--compare-hard-target", action="store_true")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--num-images", type=int, default=16)
     parser.add_argument("--indices", type=int, nargs="+")
@@ -73,6 +75,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             raise ValueError(f"--{name.replace('_', '-')} must be positive")
     if args.sigma < 0:
         raise ValueError("--sigma must be non-negative")
+    if not 0.0 <= args.target_smoothing_p < 1.0:
+        raise ValueError("--target-smoothing-p must satisfy 0 <= p < 1")
+    if args.compare_hard_target and args.target_smoothing_p == 0.0:
+        raise ValueError("--compare-hard-target requires --target-smoothing-p > 0")
+    if args.compare_hard_target and args.mode == "bounded_gaussian":
+        raise ValueError("--compare-hard-target requires simplex or both mode")
     return args
 
 
@@ -230,9 +238,37 @@ def _save_comparison(
     figure.tight_layout(); figure.savefig(path, dpi=120, bbox_inches="tight"); plt.close(figure)
 
 
+def _save_hard_target_comparison(
+    path: Path,
+    image: torch.Tensor,
+    target: torch.Tensor,
+    states: dict[str, list[torch.Tensor]],
+    x0: torch.Tensor,
+    times: list[float],
+    sample: dict,
+) -> None:
+    labels = ("simplex_hard_target", "simplex")
+    displayed = 1 + sum(time != 0.0 for time in times)
+    figure, axes = plt.subplots(2, displayed + 2, figsize=(3.2 * (displayed + 2), 6.5))
+    for row, (key, title) in enumerate(zip(labels, ("Hard target", "Smoothed target"), strict=True)):
+        axes[row, 0].imshow(image.permute(1, 2, 0)); axes[row, 0].set_title(f"{title} / Input")
+        axes[row, 1].imshow(colorize(target, "cityscapes")); axes[row, 1].set_title("GT")
+        trajectory = [("x0", x0)] + [
+            (f"t={time:g}", state)
+            for time, state in zip(times, states[key], strict=True)
+            if time != 0.0
+        ]
+        for column, (label, state) in enumerate(trajectory, 2):
+            axes[row, column].imshow(colorize(_semantic_display(state, sample), "cityscapes"))
+            axes[row, column].set_title(label)
+        for axis in axes[row]: axis.axis("off")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    figure.tight_layout(); figure.savefig(path, dpi=120, bbox_inches="tight"); plt.close(figure)
+
+
 def _aggregate_rows(rows: list[dict[str, Any]], times: list[float]) -> list[dict[str, Any]]:
     result = []
-    for mode in MODES:
+    for mode in dict.fromkeys(row["mode"] for row in rows):
         selected_mode = [row for row in rows if row["mode"] == mode]
         if not selected_mode:
             continue
@@ -272,7 +308,7 @@ def _save_summary_plots(rows: list[dict[str, Any]], output: Path) -> None:
         ("gt_margin.png", ("mean_gt_margin",), "Mean GT margin"),
     ):
         figure, axis = plt.subplots(figsize=(8, 5))
-        for mode in MODES:
+        for mode in dict.fromkeys(row["mode"] for row in rows):
             selected = [row for row in rows if row["mode"] == mode]
             for key in keys:
                 if selected:
@@ -318,7 +354,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             state_size=mu.shape[-2:], ignore_index=config["dataset"]["void_class_index"],
             mask_pixel_losses=True,
         )
-        x1, target = targets.one_hot_state, targets.target_state
+        x1_hard, target = targets.one_hot_state, targets.target_state
+        x1 = smooth_categorical_target(x1_hard, args.target_smoothing_p)
         source_prediction = mu.argmax(dim=1)
         sample_seed = int(args.seed + dataset_index * 2)
         mode_states: dict[str, list[torch.Tensor]] = {}
@@ -337,6 +374,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             mode_states["simplex"] = [linear_interpolation(x0, x1, time) for time in times]
             mode_x0["simplex"] = x0
             mode_mu_new["simplex"] = None
+            if args.compare_hard_target:
+                mode_states["simplex_hard_target"] = [
+                    linear_interpolation(x0, x1_hard, time) for time in times
+                ]
+                mode_x0["simplex_hard_target"] = x0
+                mode_mu_new["simplex_hard_target"] = None
         if "bounded_gaussian" in modes:
             mu_new, noise, x0 = bounded_gaussian_components(
                 mu, amplitude=args.amplitude, tanh_temperature=args.tanh_temperature,
@@ -362,7 +405,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         display_image = _state_to_display(display_image[None], sample)[0].cpu()
         source_display = _semantic_display(mu, sample)
         sample_id = str(sample.get("sample_id", dataset_index))
-        for mode in modes:
+        trajectory_modes = tuple(mode_states)
+        for mode in trajectory_modes:
+            first_times.setdefault(mode, [])
             stats, first, sample_margins = interpolation_statistics(
                 mode_states[mode], times, target, source_prediction,
                 config["dataset"]["void_class_index"],
@@ -379,6 +424,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             )
         if args.mode == "both":
             _save_comparison(output / "comparison" / f"sample_{ordinal:04d}.png", display_image, display_target, mode_states, mode_x0, times, sample)
+        if args.compare_hard_target:
+            _save_hard_target_comparison(
+                output / "comparison" / f"hard_vs_smoothed_sample_{ordinal:04d}.png",
+                display_image, display_target, mode_states, mode_x0["simplex"],
+                times, sample,
+            )
         shapes = {"mu": list(mu.shape), "x1": list(x1.shape), "state_resolution": list(mu.shape[-2:])}
 
     aggregate = _aggregate_rows(rows, times)
@@ -429,6 +480,13 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "parameters": {"lambda": args.lambda_value, "temperature": args.temperature,
                        "dirichlet_alpha": args.dirichlet_alpha, "amplitude": args.amplitude,
                        "tanh_temperature": args.tanh_temperature, "sigma": args.sigma, "seed": args.seed},
+        "target_smoothing_enabled": args.target_smoothing_p > 0.0,
+        "target_smoothing_p": args.target_smoothing_p,
+        "x1_min": float(x1.min()), "x1_max": float(x1.max()),
+        "x1_sum_error": float((x1.sum(dim=1) - 1.0).abs().max()),
+        "x1_gt_value": 1.0 - args.target_smoothing_p + args.target_smoothing_p / x1.shape[1],
+        "x1_non_gt_value": args.target_smoothing_p / x1.shape[1],
+        "x1_gt_margin": 1.0 - args.target_smoothing_p,
         "trajectory": aggregate, "simplex_diagnostics": simplex, "bounded_gaussian_diagnostics": gaussian,
         "first_gt_argmax_time": {mode: {str(time): values.count(time) for time in (*times, None)} for mode, values in first_times.items()},
     }

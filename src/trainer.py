@@ -198,6 +198,15 @@ SOURCE_SUMMARY_ALIASES = (
     ("sigma_mean", "source_sigma_mean"),
     ("x0_abs", "source_x0_abs"),
     ("x1_abs", "target_x1_abs"),
+    ("target_smoothing_enabled", "target_smoothing_enabled"),
+    ("target_smoothing_p", "target_smoothing_p"),
+    ("x1_state_min", "x1_state_min"),
+    ("x1_state_max", "x1_state_max"),
+    ("x1_state_abs", "x1_state_abs"),
+    ("x1_state_sum_error", "x1_state_sum_error"),
+    ("x1_gt_margin", "x1_gt_margin"),
+    ("x1_hard_abs", "x1_hard_abs"),
+    ("x1_smoothed_abs", "x1_smoothed_abs"),
 )
 
 

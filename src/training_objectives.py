@@ -28,7 +28,12 @@ from discrete_flow_maps import (
     sample_prior,
     sample_stage1_times,
 )
-from state_space import prepare_state_targets, resize_continuous, state_spatial_size
+from state_space import (
+    prepare_state_targets,
+    resize_continuous,
+    state_spatial_size,
+    target_state_from_config,
+)
 
 
 def _zero(reference: torch.Tensor) -> torch.Tensor:
@@ -180,6 +185,30 @@ def compute_model_training_objectives(
         sample_state=not source_only_stage1,
         sampling_mode="training",
     )
+    x1_state = target_state_from_config(targets.one_hot_state, config)
+    smoothing = config.get("flow", {}).get("target_smoothing", {})
+    smoothing_enabled = bool(smoothing.get("enabled", False))
+    smoothing_p = float(smoothing.get("p", 0.0)) if smoothing_enabled else 0.0
+    x1_gt = x1_state.gather(1, targets.target_state[:, None]).squeeze(1)
+    x1_competitors = x1_state.clone()
+    x1_competitors.scatter_(1, targets.target_state[:, None], -torch.inf)
+    source_stats.update({
+        "target_smoothing_enabled": x1_state.new_tensor(float(smoothing_enabled)),
+        "target_smoothing_p": x1_state.new_tensor(smoothing_p),
+        "x1_state_min": x1_state.detach().amin(),
+        "x1_state_max": x1_state.detach().amax(),
+        "x1_state_abs": x1_state.detach().abs().mean(),
+        "x1_state_sum_error": (
+            x1_state.detach().sum(dim=1) - 1.0
+        ).abs().amax(),
+        "x1_gt_margin": (
+            x1_gt - x1_competitors.amax(dim=1)
+        ).detach().mean(),
+        "x1_hard_abs": targets.one_hot_state.detach().abs().mean(),
+        "x1_smoothed_abs": x1_state.detach().abs().mean(),
+        # Preserve the legacy dashboard name while reporting the trajectory x1.
+        "target_x1_abs": x1_state.detach().abs().mean(),
+    })
     if source_only_stage1:
         zero = _zero(image)
         source_objective = source_stats.get(
@@ -232,7 +261,7 @@ def compute_model_training_objectives(
             spatial_size=state_size,
         )
     image_feat = endpoint.encode_image(image)
-    assert x0.shape == targets.one_hot_state.shape
+    assert x0.shape == x1_state.shape == targets.one_hot_state.shape
     assert image_feat.shape[-2:] == state_size
     zero = _zero(image)
     consistency_result = None
@@ -246,7 +275,7 @@ def compute_model_training_objectives(
             time_config["min_time"], time_config["max_time"],
         )
         diagonal_state = linear_path(
-            x0, targets.one_hot_state, diagonal_time, config, path_difficulty
+            x0, x1_state, diagonal_time, config, path_difficulty
         )
         schedule_weight = 0.0
         effective_weight = 0.0
@@ -257,7 +286,7 @@ def compute_model_training_objectives(
             time_config["min_gap"],
         )
         consistency_state = linear_path(
-            x0, targets.one_hot_state, consistency_s, config, path_difficulty
+            x0, x1_state, consistency_s, config, path_difficulty
         )
         if operation == "joint_objectives":
             # Joint training intentionally samples an independent diagonal time.
@@ -266,7 +295,7 @@ def compute_model_training_objectives(
                 time_config["min_time"], time_config["max_time"],
             )
             diagonal_state = linear_path(
-                x0, targets.one_hot_state, diagonal_time, config, path_difficulty
+                x0, x1_state, diagonal_time, config, path_difficulty
             )
         else:
             # Preserve the original Stage 2 diagonal-at-s behavior.
