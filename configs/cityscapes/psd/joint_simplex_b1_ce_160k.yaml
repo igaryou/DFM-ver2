@@ -5,12 +5,12 @@ source:
   var_weight: 0.0
   simplex_prior:
     training:
-      lambda: 0.8
-      temperature: 1.0
+      lambda: 0.2
+      temperature: 4.75
       dirichlet_alpha: 1.0
     inference:
-      lambda: 0.8
-      temperature: 1.0
+      lambda: 0.2
+      temperature: 4.25
       dirichlet_alpha: 1.0
 
 checkpoint:
