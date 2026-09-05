@@ -343,17 +343,21 @@ def sample_image_bounded_gaussian(
     mu_raw: torch.Tensor,
     *,
     amplitude: float,
+    temperature: float,
     sigma: float,
     epsilon: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Build the bounded state mean and sample x0 without changing raw logits."""
     amplitude = float(amplitude)
+    temperature = float(temperature)
     sigma = float(sigma)
     if amplitude <= 0:
         raise ValueError("amplitude must be positive")
+    if temperature <= 0:
+        raise ValueError("temperature must be positive")
     if sigma < 0:
         raise ValueError("sigma must be non-negative")
-    mu_state = amplitude * torch.tanh(mu_raw)
+    mu_state = amplitude * torch.tanh(mu_raw / temperature)
     if epsilon is None:
         epsilon = torch.randn_like(mu_raw)
     elif epsilon.shape != mu_raw.shape:
@@ -446,13 +450,15 @@ def sample_prior(
             x0 = mu
         if source["prior_type"] == "image_bounded_gaussian":
             amplitude = float(source["bounded_gaussian"]["amplitude"])
+            temperature = float(source["bounded_gaussian"]["temperature"])
             sigma_value = float(source["fixed_std"])
             if sample_state:
                 mu_state, x0 = sample_image_bounded_gaussian(
-                    mu, amplitude=amplitude, sigma=sigma_value
+                    mu, amplitude=amplitude, temperature=temperature,
+                    sigma=sigma_value
                 )
             else:
-                mu_state = amplitude * torch.tanh(mu)
+                mu_state = amplitude * torch.tanh(mu / temperature)
                 x0 = mu_state
         if sample_state and source["prior_type"] == "image_simplex_mixture":
             x0, simplex_stats = _sample_image_simplex_mixture(
@@ -572,6 +578,9 @@ def sample_prior(
             "source_mu_state_max": mu_state.detach().amax(),
             "source_amplitude": mu.new_tensor(
                 float(source["bounded_gaussian"]["amplitude"])
+            ),
+            "source_bounded_temperature": mu.new_tensor(
+                float(source["bounded_gaussian"]["temperature"])
             ),
         })
     stats.update({key: value.detach() for key, value in simplex_stats.items()})

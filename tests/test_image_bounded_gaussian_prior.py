@@ -61,27 +61,41 @@ def test_bounded_components_formula_range_order_zero_sigma_and_seed():
     mu_raw = torch.tensor([[[[-8.0]], [[-0.2]], [[0.4]], [[9.0]]]])
     epsilon = torch.tensor([[[[0.5]], [[-1.0]], [[2.0]], [[-0.25]]]])
     mu_state, x0 = sample_image_bounded_gaussian(
-        mu_raw, amplitude=1.7, sigma=0.6, epsilon=epsilon
+        mu_raw, amplitude=1.7, temperature=2.0, sigma=0.6, epsilon=epsilon
     )
-    torch.testing.assert_close(mu_state, 1.7 * torch.tanh(mu_raw))
+    torch.testing.assert_close(mu_state, 1.7 * torch.tanh(mu_raw / 2.0))
     torch.testing.assert_close(x0, mu_state + 0.6 * epsilon)
     assert mu_state.min() >= -1.7 and mu_state.max() <= 1.7
     assert torch.equal(mu_raw.argmax(dim=1), mu_state.argmax(dim=1))
 
     state_zero, x0_zero = sample_image_bounded_gaussian(
-        mu_raw, amplitude=1.0, sigma=0.0, epsilon=epsilon
+        mu_raw, amplitude=1.0, temperature=1.0, sigma=0.0, epsilon=epsilon
     )
     torch.testing.assert_close(x0_zero, state_zero)
 
     torch.manual_seed(123)
     first = sample_image_bounded_gaussian(
-        mu_raw, amplitude=1.0, sigma=1.0
+        mu_raw, amplitude=1.0, temperature=1.0, sigma=1.0
     )[1]
     torch.manual_seed(123)
     second = sample_image_bounded_gaussian(
-        mu_raw, amplitude=1.0, sigma=1.0
+        mu_raw, amplitude=1.0, temperature=1.0, sigma=1.0
     )[1]
     torch.testing.assert_close(first, second)
+
+
+def test_temperature_one_matches_legacy_bounded_formula_and_larger_temperature_reduces_saturation():
+    mu_raw = torch.tensor([[[[-6.0]], [[-1.0]], [[0.5]], [[4.0]]]])
+    legacy = 1.3 * torch.tanh(mu_raw)
+    state_t1, _ = sample_image_bounded_gaussian(
+        mu_raw, amplitude=1.3, temperature=1.0, sigma=0.0
+    )
+    state_t5, _ = sample_image_bounded_gaussian(
+        mu_raw, amplitude=1.3, temperature=5.0, sigma=0.0
+    )
+    torch.testing.assert_close(state_t1, legacy)
+    assert state_t5.abs().max() < state_t1.abs().max()
+    assert torch.equal(mu_raw.argmax(dim=1), state_t5.argmax(dim=1))
 
 
 def test_production_sampling_uses_raw_ce_bounded_state_and_fixed_sigma():
@@ -102,7 +116,7 @@ def test_production_sampling_uses_raw_ce_bounded_state_and_fixed_sigma():
     )
     torch.manual_seed(19)
     mu_raw, _ = source.forward_statistics(image)
-    mu_state = torch.tanh(mu_raw)
+    mu_state = torch.tanh(mu_raw / 5.0)
     expected_x0 = mu_state + torch.randn_like(mu_state)
     torch.testing.assert_close(x0, expected_x0)
     assert source.forward_calls == 0
@@ -116,6 +130,7 @@ def test_production_sampling_uses_raw_ce_bounded_state_and_fixed_sigma():
     assert stats["source_mu_state_min"] >= -1
     assert stats["source_mu_state_max"] <= 1
     assert stats["source_amplitude"] == 1
+    assert stats["source_bounded_temperature"] == 5
     assert stats["source_sigma_mean"] == 1
     torch.testing.assert_close(stats["source_mu_raw_abs"], mu_raw.abs().mean())
     torch.testing.assert_close(stats["source_mu_state_abs"], mu_state.abs().mean())
@@ -126,20 +141,24 @@ def test_bounded_training_and_inference_draw_the_same_distribution():
     source = RawStatisticsSource(torch.tensor([-2.0, -0.5, 0.25, 3.0]))
     image = torch.zeros(2, 3, 8, 12)
     torch.manual_seed(77)
-    training, _ = sample_prior(
+    training, training_stats = sample_prior(
         config, image, None, source, sampling_mode="training"
     )
     torch.manual_seed(77)
-    inference, _ = sample_prior(
+    inference, inference_stats = sample_prior(
         config, image, None, source, sampling_mode="inference"
     )
     torch.testing.assert_close(training, inference)
+    assert training_stats["source_bounded_temperature"] == 5
+    assert inference_stats["source_bounded_temperature"] == 5
 
 
 @pytest.mark.parametrize(
     "override,match",
     [
         ("source.bounded_gaussian.amplitude=0", "amplitude must be positive"),
+        ("source.bounded_gaussian.temperature=0", "temperature must be positive"),
+        ("source.bounded_gaussian.temperature=-1", "temperature must be positive"),
         ("source.fixed_std=0", "fixed_std > 0"),
         ("source.learned_logvar=true", "learned_logvar=false"),
     ],
@@ -153,7 +172,9 @@ def test_bounded_config_inherits_recipe_and_cli_path_overrides():
     config = load_config(CONFIG)
     parent = load_config(PARENT)
     assert config["source"]["prior_type"] == "image_bounded_gaussian"
-    assert config["source"]["bounded_gaussian"] == {"amplitude": 1.0}
+    assert config["source"]["bounded_gaussian"] == {
+        "amplitude": 1.0, "temperature": 5.0,
+    }
     assert config["source"]["fixed_std"] == 1.0
     assert config["source"]["learned_logvar"] is False
     assert config["flow"]["target_smoothing"] == {"enabled": False, "p": 0.0}
@@ -248,7 +269,7 @@ def test_cuda_bf16_bounded_forward_backward_smoke():
     mu_raw = torch.randn(2, 4, 3, 5, device=device, dtype=torch.bfloat16,
                          requires_grad=True)
     mu_state, x0 = sample_image_bounded_gaussian(
-        mu_raw, amplitude=1.0, sigma=1.0
+        mu_raw, amplitude=1.0, temperature=1.0, sigma=1.0
     )
     loss = x0.float().square().mean() + mu_state.float().mean()
     loss.backward()

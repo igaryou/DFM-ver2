@@ -10,6 +10,7 @@ source:
   learned_logvar: false
   bounded_gaussian:
     amplitude: 1.0
+    temperature: 5.0
 
 flow:
   target_smoothing:

@@ -167,6 +167,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         },
         "bounded_gaussian": {
             "amplitude": 1.0,
+            "temperature": 1.0,
         },
     },
     "flow": {
@@ -642,6 +643,15 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
         ):
             raise ValueError(
                 "source.bounded_gaussian.amplitude must be positive"
+            )
+        temperature = config["source"]["bounded_gaussian"]["temperature"]
+        if (
+            isinstance(temperature, bool)
+            or not isinstance(temperature, (int, float))
+            or temperature <= 0
+        ):
+            raise ValueError(
+                "source.bounded_gaussian.temperature must be positive"
             )
         fixed_std = config["source"]["fixed_std"]
         if (

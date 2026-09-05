@@ -201,6 +201,7 @@ SOURCE_SUMMARY_ALIASES = (
     ("mu_state_min", "source_mu_state_min"),
     ("mu_state_max", "source_mu_state_max"),
     ("source_amplitude", "source_amplitude"),
+    ("source_bounded_temperature", "source_bounded_temperature"),
     ("logvar_mean", "source_logvar_mean"),
     ("sigma_mean", "source_sigma_mean"),
     ("x0_abs", "source_x0_abs"),

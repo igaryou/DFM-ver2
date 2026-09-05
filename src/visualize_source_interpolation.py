@@ -28,6 +28,7 @@ from visualize_simplex_source import (
 
 DEFAULT_TIMES = (0.0, 0.25, 0.35, 0.5, 0.65, 0.75, 0.85, 0.95)
 MODES = ("simplex", "bounded_gaussian")
+RAW_GAUSSIAN_MODE = "raw_gaussian"
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -39,7 +40,9 @@ def build_parser() -> argparse.ArgumentParser:
     checkpoint.add_argument("--checkpoint")
     checkpoint.add_argument("--checkpoint-dir")
     parser.add_argument("--output-dir", required=True)
-    parser.add_argument("--mode", choices=(*MODES, "both"), default="both")
+    parser.add_argument(
+        "--mode", choices=(*MODES, RAW_GAUSSIAN_MODE, "both"), default="both"
+    )
     parser.add_argument("--times", type=float, nargs="+", default=DEFAULT_TIMES)
     parser.add_argument("--lambda", dest="lambda_value", type=float, default=0.1)
     parser.add_argument("--temperature", type=float, default=6.0)
@@ -79,9 +82,25 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         raise ValueError("--target-smoothing-p must satisfy 0 <= p < 1")
     if args.compare_hard_target and args.target_smoothing_p == 0.0:
         raise ValueError("--compare-hard-target requires --target-smoothing-p > 0")
-    if args.compare_hard_target and args.mode == "bounded_gaussian":
+    if args.compare_hard_target and args.mode not in ("simplex", "both"):
         raise ValueError("--compare-hard-target requires simplex or both mode")
     return args
+
+
+def raw_gaussian_components(
+    mu: torch.Tensor,
+    *,
+    sigma: float,
+    seed: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Sample x0 = mu + sigma * epsilon without transforming raw source logits."""
+    if sigma < 0:
+        raise ValueError("sigma must be non-negative")
+    devices = [] if mu.device.type != "cuda" else [mu.device.index or 0]
+    with torch.random.fork_rng(devices=devices):
+        torch.manual_seed(int(seed))
+        epsilon = torch.randn_like(mu)
+    return epsilon, mu + float(sigma) * epsilon
 
 
 def bounded_gaussian_components(
@@ -191,7 +210,8 @@ def _save_mode_figure(
     ]
     if mu_new is not None:
         panels.append(("argmax(mu_new)", _semantic_display(mu_new, sample), False))
-    panels.append(("x0", _semantic_display(x0, sample), False))
+    x0_title = "x0 = mu + sigma*eps" if mode == RAW_GAUSSIAN_MODE else "x0"
+    panels.append((x0_title, _semantic_display(x0, sample), False))
     panels.extend(
         (f"t={time:g}", _semantic_display(state, sample), False)
         for time, state in zip(times, states, strict=True)
@@ -341,6 +361,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     margin_values: dict[tuple[str, int, str], list[float]] = {}
     gaussian_totals = {"pixels": 0, "raw_abs": 0.0, "new_abs": 0.0, "noise_abs": 0.0, "x0_abs": 0.0,
                        "raw_min": math.inf, "raw_max": -math.inf, "new_min": math.inf, "new_max": -math.inf, "flips": 0}
+    raw_gaussian_totals = {
+        "elements": 0, "semantic_pixels": 0, "mu_abs": 0.0,
+        "mu_min": math.inf, "mu_max": -math.inf, "noise_abs": 0.0,
+        "x0_abs": 0.0, "x0_min": math.inf, "x0_max": -math.inf, "flips": 0,
+    }
     simplex_flips = {"pixels": 0, "source_q": 0, "q_x0": 0}
     shapes: dict[str, Any] = {}
 
@@ -399,6 +424,36 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             mode_states["bounded_gaussian"] = [linear_interpolation(x0, x1, time) for time in times]
             mode_x0["bounded_gaussian"] = x0
             mode_mu_new["bounded_gaussian"] = mu_new
+        if RAW_GAUSSIAN_MODE in modes:
+            epsilon, x0 = raw_gaussian_components(
+                mu, sigma=args.sigma, seed=sample_seed,
+            )
+            elements = mu.numel()
+            raw_gaussian_totals["elements"] += elements
+            raw_gaussian_totals["semantic_pixels"] += source_prediction.numel()
+            raw_gaussian_totals["mu_abs"] += float(mu.abs().sum())
+            raw_gaussian_totals["mu_min"] = min(
+                raw_gaussian_totals["mu_min"], float(mu.min())
+            )
+            raw_gaussian_totals["mu_max"] = max(
+                raw_gaussian_totals["mu_max"], float(mu.max())
+            )
+            raw_gaussian_totals["noise_abs"] += float(epsilon.abs().sum())
+            raw_gaussian_totals["x0_abs"] += float(x0.abs().sum())
+            raw_gaussian_totals["x0_min"] = min(
+                raw_gaussian_totals["x0_min"], float(x0.min())
+            )
+            raw_gaussian_totals["x0_max"] = max(
+                raw_gaussian_totals["x0_max"], float(x0.max())
+            )
+            raw_gaussian_totals["flips"] += int(
+                (source_prediction != x0.argmax(dim=1)).sum()
+            )
+            mode_states[RAW_GAUSSIAN_MODE] = [
+                linear_interpolation(x0, x1_hard, time) for time in times
+            ]
+            mode_x0[RAW_GAUSSIAN_MODE] = x0
+            mode_mu_new[RAW_GAUSSIAN_MODE] = None
 
         display_target = sample["target"].cpu()
         display_image = _inverse_normalized_image(sample["image"], config)
@@ -473,6 +528,28 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         n = simplex_flips["pixels"]
         simplex = {"source_to_q_argmax_flip_ratio": simplex_flips["source_q"] / n,
                    "q_to_x0_argmax_flip_ratio": simplex_flips["q_x0"] / n}
+    raw_gaussian = None
+    if RAW_GAUSSIAN_MODE in modes:
+        n = raw_gaussian_totals["elements"]
+        semantic_pixels = raw_gaussian_totals["semantic_pixels"]
+        raw_gaussian = {
+            "mu_raw_abs": raw_gaussian_totals["mu_abs"] / n,
+            "mu_raw_min": raw_gaussian_totals["mu_min"],
+            "mu_raw_max": raw_gaussian_totals["mu_max"],
+            "noise_abs_mean": raw_gaussian_totals["noise_abs"] / n,
+            "sigma": args.sigma,
+            "x0_abs": raw_gaussian_totals["x0_abs"] / n,
+            "x0_min": raw_gaussian_totals["x0_min"],
+            "x0_max": raw_gaussian_totals["x0_max"],
+            "mu_to_x0_argmax_flip_ratio": (
+                raw_gaussian_totals["flips"] / semantic_pixels
+            ),
+            "abs_reduction": "mean",
+        }
+    effective_smoothing_p = (
+        0.0 if args.mode == RAW_GAUSSIAN_MODE else args.target_smoothing_p
+    )
+    summary_x1 = x1_hard if args.mode == RAW_GAUSSIAN_MODE else x1
     summary = {
         "checkpoint": str(checkpoint_path), "checkpoint_stage": checkpoint.get("stage"),
         "indices": indices, "mode": args.mode, "times": times, "shapes": shapes,
@@ -480,14 +557,18 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "parameters": {"lambda": args.lambda_value, "temperature": args.temperature,
                        "dirichlet_alpha": args.dirichlet_alpha, "amplitude": args.amplitude,
                        "tanh_temperature": args.tanh_temperature, "sigma": args.sigma, "seed": args.seed},
-        "target_smoothing_enabled": args.target_smoothing_p > 0.0,
-        "target_smoothing_p": args.target_smoothing_p,
-        "x1_min": float(x1.min()), "x1_max": float(x1.max()),
-        "x1_sum_error": float((x1.sum(dim=1) - 1.0).abs().max()),
-        "x1_gt_value": 1.0 - args.target_smoothing_p + args.target_smoothing_p / x1.shape[1],
-        "x1_non_gt_value": args.target_smoothing_p / x1.shape[1],
-        "x1_gt_margin": 1.0 - args.target_smoothing_p,
+        "target_smoothing_enabled": effective_smoothing_p > 0.0,
+        "target_smoothing_p": effective_smoothing_p,
+        "x1_min": float(summary_x1.min()), "x1_max": float(summary_x1.max()),
+        "x1_sum_error": float((summary_x1.sum(dim=1) - 1.0).abs().max()),
+        "x1_gt_value": 1.0 - effective_smoothing_p + effective_smoothing_p / summary_x1.shape[1],
+        "x1_non_gt_value": effective_smoothing_p / summary_x1.shape[1],
+        "x1_gt_margin": 1.0 - effective_smoothing_p,
         "trajectory": aggregate, "simplex_diagnostics": simplex, "bounded_gaussian_diagnostics": gaussian,
+        "raw_gaussian_diagnostics": raw_gaussian,
+        "raw_gaussian_x0": "x0 = mu + sigma * epsilon; epsilon ~ N(0, I)",
+        "raw_gaussian_x1": "hard one-hot e_y",
+        "raw_gaussian_target_smoothing_enabled": False,
         "first_gt_argmax_time": {mode: {str(time): values.count(time) for time in (*times, None)} for mode, values in first_times.items()},
     }
     with (output / "summary.json").open("w", encoding="utf-8") as handle:
