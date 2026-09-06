@@ -184,6 +184,7 @@ def compute_model_training_objectives(
         valid_mask_full=targets.valid_mask_full,
         sample_state=not source_only_stage1,
         sampling_mode="training",
+        optimizer_step=optimizer_step,
     )
     x1_state = target_state_from_config(targets.one_hot_state, config)
     smoothing = config.get("flow", {}).get("target_smoothing", {})

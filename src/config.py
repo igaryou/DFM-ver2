@@ -146,6 +146,12 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "type": None,
             "weight": None,
             "include_void": False,
+            "weight_schedule": {
+                "type": "fixed",
+                "initial": None,
+                "final": None,
+                "steps": None,
+            },
         },
         "diagnostics": {
             "enabled": False,
@@ -198,6 +204,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "scheduler": {
                 "type": "mean_preserving_additive",
                 "beta": 0.5,
+                "difficulty_gamma": 1.0,
             },
             "diagnostics": {
                 "enabled": True,
@@ -749,6 +756,33 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
         )
     if supervision["weight"] is not None and supervision["weight"] < 0:
         raise ValueError("source.supervision.weight must be non-negative")
+    # load_config validates both before and after CLI overrides. Legacy fixed
+    # schedules are removed below for resolved-config/checkpoint compatibility,
+    # so the second validation restores their implicit fixed semantics.
+    weight_schedule = supervision.get(
+        "weight_schedule",
+        {"type": "fixed", "initial": None, "final": None, "steps": None},
+    )
+    if weight_schedule["type"] not in {"fixed", "linear"}:
+        raise ValueError(
+            "source.supervision.weight_schedule.type must be fixed or linear"
+        )
+    if weight_schedule["type"] == "linear":
+        for key in ("initial", "final"):
+            value = weight_schedule[key]
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or value < 0
+            ):
+                raise ValueError(
+                    f"source.supervision.weight_schedule.{key} must be non-negative"
+                )
+        steps = weight_schedule["steps"]
+        if isinstance(steps, bool) or not isinstance(steps, int) or steps <= 0:
+            raise ValueError(
+                "source.supervision.weight_schedule.steps must be a positive integer"
+            )
     if not isinstance(supervision.get("include_void", False), bool):
         raise ValueError("source.supervision.include_void must be boolean")
     source_diagnostics = config["source"]["diagnostics"]
@@ -779,10 +813,9 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
             raise ValueError(
                 "task_finetuned_segformer does not support learned_logvar=true"
             )
-        if config["source"]["freeze"] and supervision["type"] not in {None, "none"}:
-            raise ValueError(
-                "Frozen task_finetuned_segformer requires source.supervision.type=none"
-            )
+    if weight_schedule["type"] == "fixed":
+        # Preserve the exact legacy resolved supervision mapping and behavior.
+        supervision.pop("weight_schedule", None)
     if supervision.get("include_void", False) is False:
         # Preserve the exact legacy resolved supervision mapping.
         supervision.pop("include_void", None)
@@ -824,15 +857,32 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(entropy["exclude_predicted_void"], bool):
             raise ValueError("entropy exclude_predicted_void must be boolean")
         path_scheduler = path["scheduler"]
-        if path_scheduler["type"] != "mean_preserving_additive":
+        scheduler_type = path_scheduler["type"]
+        if scheduler_type not in {
+            "mean_preserving_additive", "additive", "exponential"
+        }:
             raise ValueError("unsupported flow.path.scheduler.type")
         beta = path_scheduler["beta"]
-        if (
+        beta_invalid = (
             isinstance(beta, bool)
             or not isinstance(beta, (int, float))
-            or not 0 <= beta <= 1
+            or beta < 0
+            or (scheduler_type != "exponential" and beta > 1)
+        )
+        if beta_invalid:
+            constraint = ">= 0" if scheduler_type == "exponential" else "in [0,1]"
+            raise ValueError(
+                f"flow.path.scheduler.beta must be {constraint} for {scheduler_type}"
+            )
+        gamma = path_scheduler["difficulty_gamma"]
+        if (
+            isinstance(gamma, bool)
+            or not isinstance(gamma, (int, float))
+            or gamma <= 0
         ):
-            raise ValueError("flow.path.scheduler.beta must be in [0,1]")
+            raise ValueError(
+                "flow.path.scheduler.difficulty_gamma must be positive"
+            )
         diagnostics = path["diagnostics"]
         if not isinstance(diagnostics["enabled"], bool) or not isinstance(
             diagnostics["visualization"], bool
@@ -842,8 +892,6 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
             raise ValueError("path diagnostic times must be in [0,1]")
         if stage == "diagonal_pretrain" and config["source"]["freeze"]:
             raise ValueError("entropy-adaptive Stage 1 requires a trainable source")
-        if stage != "diagonal_pretrain" and not config["source"]["freeze"]:
-            raise ValueError("entropy-adaptive Stage 2/joint paths require source.freeze=true")
         if config["source"]["prior_type"] not in {
             "image_gaussian", "image_bounded_gaussian", "image_simplex_mixture"
         }:
@@ -967,6 +1015,19 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
 
 def apply_overrides(config: dict[str, Any], overrides: Iterable[str]) -> dict[str, Any]:
     result = copy.deepcopy(config)
+    overrides = tuple(overrides)
+    if any(
+        override.split("=", 1)[0].startswith(
+            "source.supervision.weight_schedule."
+        )
+        for override in overrides
+    ):
+        # Fixed schedules are omitted from legacy resolved configs; restore only
+        # this schema block when the user explicitly overrides the schedule.
+        result["source"]["supervision"].setdefault(
+            "weight_schedule",
+            copy.deepcopy(DEFAULT_CONFIG["source"]["supervision"]["weight_schedule"]),
+        )
     override_keys: set[str] = set()
     for override in overrides:
         if "=" not in override:

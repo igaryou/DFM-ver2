@@ -202,6 +202,13 @@ SOURCE_SUMMARY_ALIASES = (
     ("mu_state_max", "source_mu_state_max"),
     ("source_amplitude", "source_amplitude"),
     ("source_bounded_temperature", "source_bounded_temperature"),
+    ("source_frozen", "source_frozen"),
+    ("source_checkpoint_loaded", "source_checkpoint_loaded"),
+    ("source_ce_raw", "source_ce_raw"),
+    ("source_ce_effective_weight", "source_ce_effective_weight"),
+    ("source_ce_weighted", "source_ce_weighted"),
+    ("source_ce_schedule_progress", "source_ce_schedule_progress"),
+    ("optimizer_step", "source_optimizer_step"),
     ("logvar_mean", "source_logvar_mean"),
     ("sigma_mean", "source_sigma_mean"),
     ("variance_entropy_mean", "source_variance_entropy_mean"),
@@ -497,6 +504,9 @@ def _wandb_epoch_payload(
     for key in DFM_RECIPE_SUMMARY_KEYS:
         if key in report:
             payload[f"epoch/{key}"] = report[key]
+    for output_key, _ in SOURCE_SUMMARY_ALIASES:
+        if output_key in report:
+            payload[f"epoch/{output_key}"] = report[output_key]
     return payload
 
 

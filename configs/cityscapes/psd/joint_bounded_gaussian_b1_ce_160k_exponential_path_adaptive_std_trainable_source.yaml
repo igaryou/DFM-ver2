@@ -1,0 +1,39 @@
+extends: joint_bounded_gaussian_b1_ce_160k.yaml
+
+experiment:
+  name: dfm_bounded_gaussian_exponential_path_adaptive_std_trainable_source_160k
+  output_dir: /home/igarashi_25/DFM/results/cityscapes/bounded_gaussian_exponential_path_adaptive_std_trainable_source_160k
+
+source:
+  checkpoint: null
+  freeze: false
+  fixed_std: 1.0
+  supervision:
+    type: cross_entropy
+    weight: 0.2
+    weight_schedule:
+      type: linear
+      initial: 3.0
+      final: 0.2
+      steps: 16000
+  bounded_gaussian:
+    amplitude: 0.5
+    temperature: 4.0
+    variance:
+      type: entropy_adaptive
+      rho: 0.95
+      normalization: rank
+      eps: 1.0e-8
+
+flow:
+  path:
+    type: entropy_adaptive
+    entropy:
+      normalization: rank
+    scheduler:
+      type: exponential
+      beta: 2.0
+      difficulty_gamma: 1.0
+
+wandb:
+  name: dfm-bounded-gaussian-exponential-path-adaptive-std-trainable-source-160k

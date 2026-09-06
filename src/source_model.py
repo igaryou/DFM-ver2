@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import math
+from types import MethodType
 
 import torch
 import torch.nn as nn
@@ -319,6 +320,21 @@ def source_statistics(source_model: nn.Module, image: torch.Tensor) -> tuple[tor
     return mean, log_variance
 
 
+def freeze_source_model(model: nn.Module) -> nn.Module:
+    """Completely freeze a source and keep it in eval mode across train calls."""
+    model.requires_grad_(False)
+    model.eval()
+
+    def frozen_train(instance: nn.Module, mode: bool = True) -> nn.Module:
+        del mode
+        nn.Module.train(instance, False)
+        return instance
+
+    model.train = MethodType(frozen_train, model)
+    model._source_frozen = True
+    return model
+
+
 def build_source_model(config: dict):
     source = config["source"]
     if source["prior_type"] not in {
@@ -356,6 +372,7 @@ def build_source_model(config: dict):
             config["model"].get("state_downsample_factor", 4),
             source["segformer_decoder"],
         )
+    checkpoint_loaded = False
     if source["checkpoint"]:
         checkpoint = torch.load(source["checkpoint"], map_location="cpu", weights_only=False)
         if isinstance(checkpoint, dict) and "config" in checkpoint:
@@ -365,6 +382,9 @@ def build_source_model(config: dict):
             )
         state = checkpoint.get("source_model", checkpoint.get("model", checkpoint))
         model.load_state_dict(state, strict=True)
+        checkpoint_loaded = True
+    model._source_checkpoint_loaded = checkpoint_loaded
+    model._source_frozen = False
     if source["freeze"]:
-        model.requires_grad_(False)
+        freeze_source_model(model)
     return model

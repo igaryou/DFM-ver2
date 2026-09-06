@@ -218,6 +218,57 @@ def source_predicted_semantic_mask(
     return source_state.argmax(dim=1) != int(void_index)
 
 
+def emphasize_difficulty(
+    difficulty: torch.Tensor, gamma: float
+) -> torch.Tensor:
+    """Apply sign-preserving power emphasis to normalized difficulty."""
+    gamma = float(gamma)
+    if gamma <= 0:
+        raise ValueError("difficulty gamma must be positive")
+    return difficulty.sign() * difficulty.abs().pow(gamma)
+
+
+def entropy_scheduler_lambda(
+    time: torch.Tensor,
+    difficulty: torch.Tensor,
+    *,
+    beta: float,
+    scheduler_type: str,
+    difficulty_gamma: float = 1.0,
+) -> torch.Tensor:
+    """Apply the configured additive or exponential adaptive scheduler."""
+    emphasized = emphasize_difficulty(difficulty.float(), difficulty_gamma)
+    if scheduler_type in {"mean_preserving_additive", "additive"}:
+        return adaptive_lambda(time, emphasized, beta=beta)
+    if scheduler_type == "exponential":
+        if time.ndim != 1 or time.shape[0] != difficulty.shape[0]:
+            raise ValueError("time must be [B] and match difficulty batch size")
+        t = time.float()[:, None, None]
+        return t.pow(torch.exp(float(beta) * emphasized))
+    raise ValueError(f"Unknown entropy scheduler: {scheduler_type}")
+
+
+def entropy_scheduler_lambda_derivative(
+    time: torch.Tensor,
+    difficulty: torch.Tensor,
+    *,
+    beta: float,
+    scheduler_type: str,
+    difficulty_gamma: float = 1.0,
+) -> torch.Tensor:
+    """Return d lambda / dt for an additive or exponential scheduler."""
+    emphasized = emphasize_difficulty(difficulty.float(), difficulty_gamma)
+    if scheduler_type in {"mean_preserving_additive", "additive"}:
+        return adaptive_lambda_derivative(time, emphasized, beta=beta)
+    if scheduler_type == "exponential":
+        if time.ndim != 1 or time.shape[0] != difficulty.shape[0]:
+            raise ValueError("time must be [B] and match difficulty batch size")
+        t = time.float()[:, None, None]
+        exponent = torch.exp(float(beta) * emphasized)
+        return exponent * t.pow(exponent - 1.0)
+    raise ValueError(f"Unknown entropy scheduler: {scheduler_type}")
+
+
 def adaptive_lambda(
     time: torch.Tensor, difficulty: torch.Tensor, *, beta: float
 ) -> torch.Tensor:

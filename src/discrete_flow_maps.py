@@ -10,6 +10,8 @@ from adaptive_path import (
     adaptive_lambda_derivative,
     bounded_gaussian_variance_maps,
     entropy_adaptive_enabled,
+    entropy_scheduler_lambda,
+    entropy_scheduler_lambda_derivative,
     path_config as _path_config,
 )
 from state_space import resize_continuous, state_spatial_size
@@ -37,8 +39,11 @@ def path_coefficient(
     if path_type == "entropy_adaptive":
         if difficulty is None:
             raise ValueError("entropy_adaptive path requires pixel difficulty")
-        return adaptive_lambda(
-            time, difficulty, beta=float(path["scheduler"]["beta"])
+        scheduler = path["scheduler"]
+        return entropy_scheduler_lambda(
+            time, difficulty, beta=float(scheduler["beta"]),
+            scheduler_type=scheduler["type"],
+            difficulty_gamma=float(scheduler.get("difficulty_gamma", 1.0)),
         )
     raise ValueError(f"Unknown flow path type: {path_type}")
 
@@ -59,8 +64,11 @@ def path_derivative(
     if path_type == "entropy_adaptive":
         if difficulty is None:
             raise ValueError("entropy_adaptive path requires pixel difficulty")
-        return adaptive_lambda_derivative(
-            time, difficulty, beta=float(path["scheduler"]["beta"])
+        scheduler = path["scheduler"]
+        return entropy_scheduler_lambda_derivative(
+            time, difficulty, beta=float(scheduler["beta"]),
+            scheduler_type=scheduler["type"],
+            difficulty_gamma=float(scheduler.get("difficulty_gamma", 1.0)),
         )
     raise ValueError(f"Unknown flow path type: {path_type}")
 
@@ -379,6 +387,27 @@ def sample_image_bounded_gaussian(
     return mu_state, x0
 
 
+def source_supervision_schedule(
+    supervision: dict, optimizer_step: int
+) -> tuple[float, float]:
+    """Return CE weight and progress from the completed optimizer update count."""
+    optimizer_step = int(optimizer_step)
+    if optimizer_step < 0:
+        raise ValueError("optimizer_step must be non-negative")
+    schedule = supervision.get("weight_schedule", {"type": "fixed"})
+    schedule_type = schedule.get("type", "fixed")
+    if schedule_type == "fixed":
+        weight = supervision.get("weight")
+        return (0.0 if weight is None else float(weight)), 0.0
+    if schedule_type != "linear":
+        raise ValueError(f"Unknown source CE weight schedule: {schedule_type}")
+    steps = int(schedule["steps"])
+    progress = min(float(optimizer_step) / steps, 1.0)
+    initial = float(schedule["initial"])
+    final = float(schedule["final"])
+    return initial + (final - initial) * progress, progress
+
+
 def sample_prior(
     config: dict,
     image: torch.Tensor,
@@ -389,6 +418,7 @@ def sample_prior(
     valid_mask_full: torch.Tensor | None = None,
     sample_state: bool = True,
     sampling_mode: str = "training",
+    optimizer_step: int = 0,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Sample state-resolution x0 and compute optional full-resolution supervision."""
     if sampling_mode not in {"training", "inference"}:
@@ -444,8 +474,8 @@ def sample_prior(
             f"source.prior_type={source['prior_type']} requires a source model"
         )
 
-    adaptive_frozen = entropy_adaptive_enabled(config) and source.get("freeze", False)
-    source_context = torch.no_grad() if adaptive_frozen else nullcontext()
+    source_frozen = bool(source.get("freeze", False))
+    source_context = torch.no_grad() if source_frozen else nullcontext()
     simplex_stats: dict[str, torch.Tensor] = {}
     variance_stats: dict[str, torch.Tensor] = {}
     bounded_sigma_map: torch.Tensor | None = None
@@ -533,24 +563,36 @@ def sample_prior(
             "image_bounded_gaussian", "image_simplex_mixture"
         }
         or fixed_std is not None
-        or adaptive_frozen
+        or source_frozen
         else 0.5 * torch.mean(torch.exp(logvar) - logvar - 1.0)
     )
-    supervision = source.get("supervision")
-    if adaptive_frozen:
-        # Stage 2 uses the checkpointed source only as x0/entropy conditioning.
-        supervision_type = "none"
-        supervision_weight = 0.0
-    elif supervision is not None and supervision.get("type") is not None:
-        supervision_type = supervision["type"]
+    supervision = source.get("supervision") or {}
+    configured_supervision_type = supervision.get("type")
+    if configured_supervision_type is not None:
+        supervision_type = configured_supervision_type
         supervision_weight = (
             source["align_weight"]
             if supervision.get("weight") is None
-            else supervision["weight"]
+            else float(supervision["weight"])
         )
     else:
         supervision_type = "align" if source.get("use_loss_align", False) else "none"
-        supervision_weight = source.get("align_weight", 0.0)
+        supervision_weight = float(source.get("align_weight", 0.0))
+    ce_scheduled_weight, ce_schedule_progress = source_supervision_schedule(
+        supervision, optimizer_step
+    )
+    if (
+        supervision_type == "cross_entropy"
+        and (
+            supervision.get("weight") is not None
+            or supervision.get("weight_schedule", {}).get("type") == "linear"
+        )
+    ):
+        supervision_weight = ce_scheduled_weight
+    if source_frozen:
+        # Frozen sources still run forward for mu/entropy/x0, but never add CE grads.
+        supervision_type = "none"
+        supervision_weight = 0.0
     if (
         supervision_type in {"align", "cross_entropy"}
         and target_one_hot_state is not None
@@ -625,6 +667,20 @@ def sample_prior(
         "source_logvar_mean": logvar.detach().mean(),
         "source_sigma_mean": sigma.mean(),
         "source_x0_abs": x0.detach().abs().mean(),
+        "source_frozen": mu.new_tensor(float(source_frozen)),
+        "source_checkpoint_loaded": mu.new_tensor(float(
+            getattr(source_model, "_source_checkpoint_loaded", bool(source.get("checkpoint")))
+        )),
+        "source_ce_raw": loss_ce.detach(),
+        "source_ce_effective_weight": mu.new_tensor(
+            supervision_weight if configured_supervision_type == "cross_entropy" else 0.0
+        ),
+        "source_ce_weighted": (
+            supervision_weight * loss_ce
+            if configured_supervision_type == "cross_entropy" else source_zero
+        ).detach(),
+        "source_ce_schedule_progress": mu.new_tensor(ce_schedule_progress),
+        "source_optimizer_step": mu.new_tensor(float(optimizer_step)),
     }
     if mu_state is not None:
         stats.update({
@@ -652,9 +708,7 @@ def sample_prior(
         assert x0.shape == target_one_hot_state.shape
     if entropy_adaptive_enabled(config):
         # Internal non-scalar payload consumed by training/inference in this batch.
-        stats["_path_source_state"] = (
-            mu_state.detach() if mu_state is not None else mu.detach()
-        )
+        stats["_path_source_state"] = mu.detach()
     return x0, stats
 
 
