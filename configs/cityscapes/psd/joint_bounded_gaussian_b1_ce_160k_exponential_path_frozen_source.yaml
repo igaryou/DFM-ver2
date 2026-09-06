@@ -5,7 +5,7 @@ experiment:
   output_dir: /home/igarashi_25/DFM/results/cityscapes/bounded_gaussian_exponential_path_frozen_source_160k
 
 source:
-  checkpoint: <SOURCE_CHECKPOINT_PLACEHOLDER>
+  checkpoint: /home/igarashi_25/DFM/results/cityscapes/source_segformer_b1_32k/step_032000.pt
   freeze: true
   fixed_std: 1.0
   bounded_gaussian:
@@ -19,6 +19,8 @@ flow:
     type: entropy_adaptive
     entropy:
       normalization: rank
+      exclude_ignore: false
+      exclude_predicted_void: false
     scheduler:
       type: exponential
       beta: 2.0

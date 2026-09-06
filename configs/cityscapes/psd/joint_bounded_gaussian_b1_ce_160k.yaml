@@ -6,11 +6,11 @@ experiment:
 
 source:
   prior_type: image_bounded_gaussian
-  fixed_std: 1.5
+  fixed_std: 1.0
   learned_logvar: false
   bounded_gaussian:
-    amplitude: 0.2
-    temperature: 8.0
+    amplitude: 0.5
+    temperature: 4.0
 
 flow:
   target_smoothing:

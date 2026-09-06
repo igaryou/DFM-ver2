@@ -30,6 +30,8 @@ flow:
     type: entropy_adaptive
     entropy:
       normalization: rank
+      exclude_ignore: false
+      exclude_predicted_void: false
     scheduler:
       type: exponential
       beta: 2.0
