@@ -48,10 +48,12 @@ def bounded_gaussian_variance_maps(
     normalization: str = "rank",
     eps: float = 1.0e-8,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Build GT-independent per-pixel variance maps from source probabilities.
+    """Build GT-independent per-pixel std/variance maps from source probabilities.
 
     Entropy is always ``H(softmax(mu_raw))``.  No target or validity mask is
     accepted, so both training and inference use identical image-only maps.
+    For adaptive sampling, rho directly controls standard deviation as
+    ``std = base_std * (1 + rho*difficulty)`` and variance is ``std.square()``.
     Returns entropy, difficulty, variance, and standard deviation as [B,H,W].
     """
     base_std = float(base_std)
@@ -68,14 +70,15 @@ def bounded_gaussian_variance_maps(
     entropy = shannon_entropy(mu_raw, representation="logits", eps=eps)
     if variance_type == "fixed":
         difficulty = torch.zeros_like(entropy)
-        variance = torch.full_like(entropy, base_std * base_std)
+        std = torch.full_like(entropy, base_std)
     else:
         difficulty = normalize_entropy(
             entropy, normalization, valid_mask=None, eps=eps,
             num_classes=mu_raw.shape[1],
         )
-        variance = (base_std * base_std) * (1.0 + rho * difficulty)
-    std = variance.clamp_min(0.0).sqrt()
+        # rho controls standard deviation directly, not variance.
+        std = base_std * (1.0 + rho * difficulty)
+    variance = std.square()
     return entropy, difficulty, variance, std
 
 

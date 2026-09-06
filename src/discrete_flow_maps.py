@@ -488,12 +488,19 @@ def sample_prior(
                         "source_variance_mean": variance_map.mean(),
                         "source_variance_min": variance_map.amin(),
                         "source_variance_max": variance_map.amax(),
+                        "source_std_min": bounded_sigma_map.amin(),
+                        "source_std_max": bounded_sigma_map.amax(),
+                        "source_std_adaptation_rho": mu.new_tensor(
+                            float(variance_config["rho"])
+                        ),
+                        # Legacy dashboard key retained; rho controls std directly.
                         "source_variance_rho": mu.new_tensor(float(variance_config["rho"])),
                         "source_variance_adaptive": mu.new_tensor(1.0),
                     }
                 else:
                     sampling_sigma = sigma_value
                     variance_stats = {
+                        "source_std_adaptation_rho": mu.new_tensor(0.0),
                         "source_variance_rho": mu.new_tensor(0.0),
                         "source_variance_adaptive": mu.new_tensor(0.0),
                     }

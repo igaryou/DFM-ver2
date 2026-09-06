@@ -31,6 +31,12 @@ BINARY_DIFFICULTY_BINS = (
     ("easy", -1.0, 0.0, False),
     ("hard", 0.0, 1.0, True),
 )
+CITYSCAPES_CLASS_NAMES = (
+    "road", "sidewalk", "building", "wall", "fence", "pole",
+    "traffic_light", "traffic_sign", "vegetation", "terrain", "sky",
+    "person", "rider", "car", "truck", "bus", "train", "motorcycle",
+    "bicycle",
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -141,12 +147,26 @@ class BinAccumulator:
         predicted = confusion.sum(dim=0)
         union = ground_truth + predicted - true_positive
         evaluated = torch.tensor(self.evaluated_classes, dtype=torch.long)
+        present = union > 0
         if self.nanmean:
-            iou = torch.where(union > 0, true_positive / union, torch.nan)
+            iou = torch.where(present, true_positive / union, torch.nan)
             miou = torch.nanmean(iou[evaluated])
         else:
             iou = true_positive / union.clamp_min(1.0)
             miou = iou[evaluated].mean()
+        evaluated_present = present[evaluated]
+        present_class_miou = (
+            (true_positive[evaluated][evaluated_present]
+             / union[evaluated][evaluated_present]).mean()
+            if bool(evaluated_present.any()) else confusion.new_tensor(float("nan"))
+        )
+        class_iou = {
+            name: (
+                float(true_positive[index] / union[index])
+                if bool(present[index]) else float("nan")
+            )
+            for name, index in zip(CITYSCAPES_CLASS_NAMES, self.evaluated_classes)
+        }
         correct = true_positive[evaluated].sum()
         return {
             "kind": self.kind,
@@ -158,6 +178,9 @@ class BinAccumulator:
                 float(correct / self.pixel_count) if self.pixel_count else float("nan")
             ),
             "miou": float(miou) if self.pixel_count else float("nan"),
+            "present_class_miou": (
+                float(present_class_miou) if self.pixel_count else float("nan")
+            ),
             "pixel_count": self.pixel_count,
             "mean_entropy": (
                 self.entropy_sum / self.pixel_count
@@ -167,6 +190,7 @@ class BinAccumulator:
                 self.difficulty_sum / self.pixel_count
                 if self.pixel_count else float("nan")
             ),
+            "class_iou": class_iou,
             "confusion_matrix": self.confusion.tolist(),
         }
 
@@ -258,13 +282,26 @@ def _make_accumulators(
 def _write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
     fields = [
         "kind", "bin", "lower", "upper", "upper_inclusive",
-        "pixel_accuracy", "miou", "pixel_count", "mean_entropy",
+        "pixel_accuracy", "miou", "present_class_miou", "pixel_count", "mean_entropy",
         "mean_difficulty",
     ]
     with path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=fields)
         writer.writeheader()
         writer.writerows({key: row[key] for key in fields} for row in rows)
+
+
+def _write_class_iou_csv(path: Path, rows: list[dict[str, Any]]) -> None:
+    fields = ["kind", "bin", *CITYSCAPES_CLASS_NAMES]
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({
+                "kind": row["kind"],
+                "bin": row["bin"],
+                **row["class_iou"],
+            })
 
 
 def _save_plot(
@@ -373,6 +410,9 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
     output.mkdir(parents=True, exist_ok=True)
     _write_csv(output / "difficulty_bins.csv", [*binary_rows, *difficulty_rows])
     _write_csv(output / "entropy_bins.csv", entropy_rows)
+    _write_class_iou_csv(
+        output / "difficulty_class_iou.csv", [*binary_rows, *difficulty_rows]
+    )
     _save_plot(
         output / "difficulty_vs_pixel_accuracy.png",
         difficulty_rows,

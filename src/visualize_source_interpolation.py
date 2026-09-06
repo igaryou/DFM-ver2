@@ -651,7 +651,7 @@ def _save_variance_figure(
         ("Input", image.permute(1, 2, 0), None),
         ("Entropy H(softmax(mu_raw))", entropy, "viridis"),
         ("Difficulty d (GT-independent)", difficulty, "coolwarm"),
-        ("Variance v", variance, "viridis"),
+        ("Variance sigma_i^2", variance, "viridis"),
         ("Std sigma_i", std, "viridis"),
     )
     for axis, (title, values, cmap) in zip(axes.reshape(-1), panels):
@@ -1230,8 +1230,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "eps": 1.0e-8,
             "entropy_source": "softmax(raw_source_logits_mu)",
             "gt_independent": True,
-            "variance_formula": "v = sigma0^2 * (1 + rho*d)",
-            "std_formula": "sigma_i = sigma0 * sqrt(1 + rho*d)",
+            "rho_controls": "standard_deviation",
+            "std_formula": "sigma_i = sigma0 * (1 + rho*d)",
+            "variance_formula": "variance_i = sigma_i^2",
         },
         "entropy_scheduler": (
             {

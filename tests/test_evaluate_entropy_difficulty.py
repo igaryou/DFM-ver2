@@ -1,3 +1,4 @@
+import csv
 from pathlib import Path
 
 import pytest
@@ -25,7 +26,7 @@ def test_entropy_difficulty_is_softmax_entropy_and_gt_independent():
 
 def test_bin_accumulator_uses_only_selected_nonvoid_pixels_and_own_confusion():
     accumulator = evaluation.BinAccumulator(
-        "easy", -1.0, 0.0, False, 4, (0, 1, 2), True, "binary"
+        "easy", -1.0, 0.0, False, 4, (0, 1, 2), False, "binary"
     )
     prediction = torch.tensor([[[0, 1, 2, 3]]])
     target = torch.tensor([[[0, 0, 2, 3]]])
@@ -39,6 +40,11 @@ def test_bin_accumulator_uses_only_selected_nonvoid_pixels_and_own_confusion():
     assert result["pixel_count"] == 2
     assert result["pixel_accuracy"] == pytest.approx(0.5)
     assert result["mean_entropy"] == pytest.approx(0.15)
+    assert result["miou"] == pytest.approx(1.0 / 6.0)
+    assert result["present_class_miou"] == pytest.approx(0.25)
+    assert result["class_iou"]["road"] == pytest.approx(0.5)
+    assert result["class_iou"]["sidewalk"] == pytest.approx(0.0)
+    assert result["class_iou"]["building"] != result["class_iou"]["building"]
     assert sum(map(sum, result["confusion_matrix"])) == 2
     assert result["confusion_matrix"][3][3] == 0
 
@@ -103,13 +109,31 @@ def test_evaluate_writes_all_outputs_and_excludes_void_only_in_metrics(
     for filename in (
         "summary.json", "difficulty_bins.csv", "entropy_bins.csv",
         "difficulty_vs_pixel_accuracy.png", "difficulty_vs_miou.png",
+        "difficulty_class_iou.csv",
     ):
         assert (tmp_path / filename).is_file()
+    with (tmp_path / "difficulty_bins.csv").open(newline="") as handle:
+        difficulty_fields = csv.DictReader(handle).fieldnames
+    assert {
+        "pixel_accuracy", "miou", "present_class_miou", "pixel_count",
+        "mean_entropy", "mean_difficulty",
+    }.issubset(difficulty_fields)
+    with (tmp_path / "difficulty_class_iou.csv").open(newline="") as handle:
+        class_fields = csv.DictReader(handle).fieldnames
+    assert class_fields == [
+        "kind", "bin", *evaluation.CITYSCAPES_CLASS_NAMES
+    ]
     assert summary["difficulty"]["gt_used"] is False
     assert summary["evaluation"]["void_gt_excluded"] == 19
     assert summary["evaluation"]["evaluated_class_indices"] == list(range(19))
     assert sum(row["pixel_count"] for row in summary["difficulty_bins"]) == 4 * 23
     assert len(summary["entropy_bins"]) == 5
+    for row in (
+        *summary["binary_difficulty_regions"], *summary["difficulty_bins"],
+        *summary["entropy_bins"],
+    ):
+        assert "present_class_miou" in row
+        assert tuple(row["class_iou"]) == evaluation.CITYSCAPES_CLASS_NAMES
     assert "pixel_accuracy_nonincreasing" in summary["difficulty_accuracy_trend"]
     assert summary["entropy_quantile_estimator"]["histogram_bins"] == 1000
     assert summary["binary_difficulty_regions"][0]["pixel_count"] + summary[

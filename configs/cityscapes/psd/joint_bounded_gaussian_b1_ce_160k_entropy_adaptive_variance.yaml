@@ -13,7 +13,7 @@ source:
     temperature: 8.0
     variance:
       type: entropy_adaptive
-      rho: 0.8
+      rho: 0.8  # Direct multiplicative adaptation of standard deviation.
       normalization: rank
       eps: 1.0e-8
 

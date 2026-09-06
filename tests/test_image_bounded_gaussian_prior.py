@@ -204,10 +204,10 @@ def test_bounded_config_inherits_recipe_and_cli_path_overrides():
 
 def test_entropy_adaptive_variance_formula_rank_and_gt_independence():
     mu_raw = torch.tensor([[
-        [[6.0, 0.5, 0.0]],
-        [[0.0, 0.5, 0.0]],
-        [[-4.0, 0.5, 0.0]],
-        [[-6.0, 0.5, 0.0]],
+        [[6.0, 2.0, 0.0]],
+        [[0.0, 1.0, 0.0]],
+        [[-4.0, 0.0, 0.0]],
+        [[-6.0, -1.0, 0.0]],
     ]])
     entropy, difficulty, variance, std = bounded_gaussian_variance_maps(
         mu_raw, base_std=1.5, variance_type="entropy_adaptive",
@@ -218,12 +218,16 @@ def test_entropy_adaptive_variance_formula_rank_and_gt_independence():
         probability * probability.clamp_min(1.0e-8).log()
     ).sum(dim=1)
     torch.testing.assert_close(entropy, expected_entropy)
-    torch.testing.assert_close(variance, 1.5 ** 2 * (1.0 + 0.8 * difficulty))
-    torch.testing.assert_close(std, 1.5 * torch.sqrt(1.0 + 0.8 * difficulty))
+    torch.testing.assert_close(std, 1.5 * (1.0 + 0.8 * difficulty))
+    torch.testing.assert_close(variance, std.square())
     assert difficulty.shape == variance.shape == std.shape == (1, 1, 3)
     assert abs(float(difficulty.mean())) < 1.0e-6
     assert float(variance[0, 0, 2]) > float(variance[0, 0, 0])
-    assert float(variance.mean()) == pytest.approx(1.5 ** 2, abs=1.0e-6)
+    torch.testing.assert_close(difficulty, torch.tensor([[[-1.0, 0.0, 1.0]]]))
+    torch.testing.assert_close(std, torch.tensor([[[0.3, 1.5, 2.7]]]))
+    torch.testing.assert_close(
+        variance, torch.tensor([[[0.09, 2.25, 7.29]]]), atol=1.0e-6, rtol=1.0e-6
+    )
 
     epsilon = torch.ones_like(mu_raw)
     mu_state, x0 = sample_image_bounded_gaussian(
@@ -267,6 +271,7 @@ def test_adaptive_variance_yaml_and_training_inference_distribution():
     assert training_stats["source_variance_adaptive"] == 1
     assert inference_stats["source_variance_adaptive"] == 1
     assert training_stats["source_variance_rho"] == pytest.approx(0.8)
+    assert training_stats["source_std_adaptation_rho"] == pytest.approx(0.8)
 
 
 def test_adaptive_variance_production_sampling_does_not_depend_on_gt():
