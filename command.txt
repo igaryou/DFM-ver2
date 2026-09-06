@@ -48,3 +48,14 @@ uv run torchrun \
   --nproc_per_node=2 \
   src/train.py \
   --config configs/cityscapes/psd/stage2_from_joint500.yaml
+
+
+CUDA_VISIBLE_DEVICES=0 \
+uv run python src/visualize_standard_normal_interpolation.py \
+  --config /home/igarashi_25/DFM/configs/cityscapes/psd/joint_bounded_gaussian_b1_ce_160k.yaml \
+  --output-dir /home/igarashi_25/DFM/results/cityscapes/standard_normal_interpolation \
+  --split train \
+  --num-images 32 \
+  --times 0.0 0.25 0.35 0.50 0.65 0.75 0.85 0.95 \
+  --seed 42 \
+  --device cuda

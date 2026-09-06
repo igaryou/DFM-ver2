@@ -168,6 +168,12 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "bounded_gaussian": {
             "amplitude": 1.0,
             "temperature": 1.0,
+            "variance": {
+                "type": "fixed",
+                "rho": 0.0,
+                "normalization": "rank",
+                "eps": 1.0e-8,
+            },
         },
     },
     "flow": {
@@ -665,6 +671,35 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
         if config["source"]["learned_logvar"] is not False:
             raise ValueError(
                 "image_bounded_gaussian requires source.learned_logvar=false"
+            )
+        variance = config["source"]["bounded_gaussian"]["variance"]
+        if variance["type"] not in {"fixed", "entropy_adaptive"}:
+            raise ValueError(
+                "source.bounded_gaussian.variance.type must be fixed or "
+                "entropy_adaptive"
+            )
+        rho = variance["rho"]
+        if (
+            isinstance(rho, bool)
+            or not isinstance(rho, (int, float))
+            or not 0 <= rho < 1
+        ):
+            raise ValueError(
+                "source.bounded_gaussian.variance.rho must satisfy 0 <= rho < 1"
+            )
+        if variance["normalization"] not in {
+            "mean", "zscore", "minmax", "rank"
+        }:
+            raise ValueError(
+                "source.bounded_gaussian.variance.normalization is invalid"
+            )
+        if (
+            isinstance(variance["eps"], bool)
+            or not isinstance(variance["eps"], (int, float))
+            or variance["eps"] <= 0
+        ):
+            raise ValueError(
+                "source.bounded_gaussian.variance.eps must be positive"
             )
     simplex_prior = config["source"]["simplex_prior"]
     for sampling_mode in ("training", "inference"):

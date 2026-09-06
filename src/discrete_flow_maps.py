@@ -8,6 +8,7 @@ import torch.nn.functional as F
 from adaptive_path import (
     adaptive_lambda,
     adaptive_lambda_derivative,
+    bounded_gaussian_variance_maps,
     entropy_adaptive_enabled,
     path_config as _path_config,
 )
@@ -344,25 +345,37 @@ def sample_image_bounded_gaussian(
     *,
     amplitude: float,
     temperature: float,
-    sigma: float,
+    sigma: float | torch.Tensor,
     epsilon: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Build the bounded state mean and sample x0 without changing raw logits."""
     amplitude = float(amplitude)
     temperature = float(temperature)
-    sigma = float(sigma)
+    sigma_is_tensor = torch.is_tensor(sigma)
+    sigma_value = sigma if sigma_is_tensor else float(sigma)
     if amplitude <= 0:
         raise ValueError("amplitude must be positive")
     if temperature <= 0:
         raise ValueError("temperature must be positive")
-    if sigma < 0:
+    if sigma_is_tensor:
+        if sigma_value.shape != (mu_raw.shape[0], *mu_raw.shape[-2:]):
+            raise ValueError("sigma map must have shape [B,H,W]")
+        if bool((sigma_value < 0).any()):
+            raise ValueError("sigma must be non-negative")
+    elif sigma_value < 0:
         raise ValueError("sigma must be non-negative")
     mu_state = amplitude * torch.tanh(mu_raw / temperature)
     if epsilon is None:
         epsilon = torch.randn_like(mu_raw)
     elif epsilon.shape != mu_raw.shape:
         raise ValueError("epsilon and mu_raw must have identical shapes")
-    x0 = mu_state + sigma * epsilon.to(device=mu_raw.device, dtype=mu_raw.dtype)
+    epsilon = epsilon.to(device=mu_raw.device, dtype=mu_raw.dtype)
+    if sigma_is_tensor:
+        sigma_state = sigma_value.to(device=mu_raw.device, dtype=mu_raw.dtype)[:, None]
+        x0 = mu_state + sigma_state * epsilon
+    else:
+        # Keep the legacy scalar operation unchanged for variance.type=fixed.
+        x0 = mu_state + sigma_value * epsilon
     return mu_state, x0
 
 
@@ -434,6 +447,8 @@ def sample_prior(
     adaptive_frozen = entropy_adaptive_enabled(config) and source.get("freeze", False)
     source_context = torch.no_grad() if adaptive_frozen else nullcontext()
     simplex_stats: dict[str, torch.Tensor] = {}
+    variance_stats: dict[str, torch.Tensor] = {}
+    bounded_sigma_map: torch.Tensor | None = None
     mu_state: torch.Tensor | None = None
     with source_context:
         if sample_state and source["prior_type"] == "image_gaussian":
@@ -452,10 +467,39 @@ def sample_prior(
             amplitude = float(source["bounded_gaussian"]["amplitude"])
             temperature = float(source["bounded_gaussian"]["temperature"])
             sigma_value = float(source["fixed_std"])
+            variance_config = source["bounded_gaussian"]["variance"]
             if sample_state:
+                if variance_config["type"] == "entropy_adaptive":
+                    entropy, variance_difficulty, variance_map, bounded_sigma_map = (
+                        bounded_gaussian_variance_maps(
+                            mu, base_std=sigma_value,
+                            variance_type="entropy_adaptive",
+                            rho=float(variance_config["rho"]),
+                            normalization=variance_config["normalization"],
+                            eps=float(variance_config["eps"]),
+                        )
+                    )
+                    sampling_sigma: float | torch.Tensor = bounded_sigma_map
+                    variance_stats = {
+                        "source_variance_entropy_mean": entropy.mean(),
+                        "source_variance_difficulty_mean": variance_difficulty.mean(),
+                        "source_variance_difficulty_min": variance_difficulty.amin(),
+                        "source_variance_difficulty_max": variance_difficulty.amax(),
+                        "source_variance_mean": variance_map.mean(),
+                        "source_variance_min": variance_map.amin(),
+                        "source_variance_max": variance_map.amax(),
+                        "source_variance_rho": mu.new_tensor(float(variance_config["rho"])),
+                        "source_variance_adaptive": mu.new_tensor(1.0),
+                    }
+                else:
+                    sampling_sigma = sigma_value
+                    variance_stats = {
+                        "source_variance_rho": mu.new_tensor(0.0),
+                        "source_variance_adaptive": mu.new_tensor(0.0),
+                    }
                 mu_state, x0 = sample_image_bounded_gaussian(
                     mu, amplitude=amplitude, temperature=temperature,
-                    sigma=sigma_value
+                    sigma=sampling_sigma
                 )
             else:
                 mu_state = amplitude * torch.tanh(mu / temperature)
@@ -551,7 +595,14 @@ def sample_prior(
             loss_ce = (loss_map * weights).sum() / weights.sum().clamp_min(1.0)
     loss_supervision = loss_align if supervision_type == "align" else loss_ce
     weighted_supervision = supervision_weight * loss_supervision
-    sigma = torch.exp(0.5 * logvar.detach())
+    if source["prior_type"] == "image_bounded_gaussian":
+        sigma = (
+            bounded_sigma_map.detach()
+            if bounded_sigma_map is not None
+            else mu.new_tensor(float(source["fixed_std"]))
+        )
+    else:
+        sigma = torch.exp(0.5 * logvar.detach())
     stats = {
         "loss_source_var": loss_var,
         "loss_source_align": loss_align,
@@ -584,6 +635,7 @@ def sample_prior(
             ),
         })
     stats.update({key: value.detach() for key, value in simplex_stats.items()})
+    stats.update({key: value.detach() for key, value in variance_stats.items()})
     if simplex_stats:
         stats["source_prior_mode"] = mu.new_tensor(
             0.0 if sampling_mode == "training" else 1.0

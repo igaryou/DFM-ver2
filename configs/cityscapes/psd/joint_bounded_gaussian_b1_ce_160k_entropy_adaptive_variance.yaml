@@ -1,0 +1,21 @@
+extends: joint_bounded_gaussian_b1_ce_160k.yaml
+
+experiment:
+  name: dfm_joint_psd_cityscapes_swin_t_b1_bounded_gaussian_entropy_adaptive_variance_160k
+  output_dir: /home/igarashi_25/DFM/results/cityscapes/joint_psd_cityscapes_swin_t_b1_bounded_gaussian_entropy_adaptive_variance_160k
+
+source:
+  prior_type: image_bounded_gaussian
+  fixed_std: 1.5
+  learned_logvar: false
+  bounded_gaussian:
+    amplitude: 0.2
+    temperature: 8.0
+    variance:
+      type: entropy_adaptive
+      rho: 0.8
+      normalization: rank
+      eps: 1.0e-8
+
+wandb:
+  name: dfm-joint-psd-cityscapes-swin-t-b1-bounded-gaussian-entropy-adaptive-variance-160k

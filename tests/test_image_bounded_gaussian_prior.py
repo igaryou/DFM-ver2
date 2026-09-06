@@ -10,6 +10,7 @@ import torch.nn.functional as F
 
 from checkpoint import model_signature
 from config import load_config, validate_config
+from adaptive_path import bounded_gaussian_variance_maps
 from discrete_flow_maps import (
     flow_map,
     linear_path,
@@ -23,6 +24,10 @@ from training_objectives import DDPCompatibleTrainingModel
 
 ROOT = Path(__file__).parents[1]
 CONFIG = ROOT / "configs/cityscapes/psd/joint_bounded_gaussian_b1_ce_160k.yaml"
+ADAPTIVE_VARIANCE_CONFIG = ROOT / (
+    "configs/cityscapes/psd/"
+    "joint_bounded_gaussian_b1_ce_160k_entropy_adaptive_variance.yaml"
+)
 PARENT = ROOT / "configs/cityscapes/psd/joint_swin_t_segformer_b1_standard_ce_160k.yaml"
 
 
@@ -116,8 +121,8 @@ def test_production_sampling_uses_raw_ce_bounded_state_and_fixed_sigma():
     )
     torch.manual_seed(19)
     mu_raw, _ = source.forward_statistics(image)
-    mu_state = torch.tanh(mu_raw / 5.0)
-    expected_x0 = mu_state + torch.randn_like(mu_state)
+    mu_state = 0.2 * torch.tanh(mu_raw / 8.0)
+    expected_x0 = mu_state + 1.5 * torch.randn_like(mu_state)
     torch.testing.assert_close(x0, expected_x0)
     assert source.forward_calls == 0
 
@@ -129,9 +134,9 @@ def test_production_sampling_uses_raw_ce_bounded_state_and_fixed_sigma():
     assert not torch.isclose(stats["loss_source_ce"], state_ce)
     assert stats["source_mu_state_min"] >= -1
     assert stats["source_mu_state_max"] <= 1
-    assert stats["source_amplitude"] == 1
-    assert stats["source_bounded_temperature"] == 5
-    assert stats["source_sigma_mean"] == 1
+    assert stats["source_amplitude"] == 0.2
+    assert stats["source_bounded_temperature"] == 8
+    assert stats["source_sigma_mean"] == 1.5
     torch.testing.assert_close(stats["source_mu_raw_abs"], mu_raw.abs().mean())
     torch.testing.assert_close(stats["source_mu_state_abs"], mu_state.abs().mean())
 
@@ -149,8 +154,8 @@ def test_bounded_training_and_inference_draw_the_same_distribution():
         config, image, None, source, sampling_mode="inference"
     )
     torch.testing.assert_close(training, inference)
-    assert training_stats["source_bounded_temperature"] == 5
-    assert inference_stats["source_bounded_temperature"] == 5
+    assert training_stats["source_bounded_temperature"] == 8
+    assert inference_stats["source_bounded_temperature"] == 8
 
 
 @pytest.mark.parametrize(
@@ -161,6 +166,10 @@ def test_bounded_training_and_inference_draw_the_same_distribution():
         ("source.bounded_gaussian.temperature=-1", "temperature must be positive"),
         ("source.fixed_std=0", "fixed_std > 0"),
         ("source.learned_logvar=true", "learned_logvar=false"),
+        ("source.bounded_gaussian.variance.type=other", "variance.type"),
+        ("source.bounded_gaussian.variance.rho=-0.1", "0 <= rho < 1"),
+        ("source.bounded_gaussian.variance.rho=1", "0 <= rho < 1"),
+        ("source.bounded_gaussian.variance.eps=0", "variance.eps"),
     ],
 )
 def test_bounded_config_validation(override, match):
@@ -173,9 +182,13 @@ def test_bounded_config_inherits_recipe_and_cli_path_overrides():
     parent = load_config(PARENT)
     assert config["source"]["prior_type"] == "image_bounded_gaussian"
     assert config["source"]["bounded_gaussian"] == {
-        "amplitude": 1.0, "temperature": 5.0,
+        "amplitude": 0.2, "temperature": 8.0,
+        "variance": {
+            "type": "fixed", "rho": 0.0, "normalization": "rank",
+            "eps": 1.0e-8,
+        },
     }
-    assert config["source"]["fixed_std"] == 1.0
+    assert config["source"]["fixed_std"] == 1.5
     assert config["source"]["learned_logvar"] is False
     assert config["flow"]["target_smoothing"] == {"enabled": False, "p": 0.0}
     for key in ("optimizer", "scheduler"):
@@ -187,6 +200,103 @@ def test_bounded_config_inherits_recipe_and_cli_path_overrides():
             "flow.path.type=power", f"flow.path.exponent={exponent}",
         ])
         assert overridden["flow"]["path"]["exponent"] == exponent
+
+
+def test_entropy_adaptive_variance_formula_rank_and_gt_independence():
+    mu_raw = torch.tensor([[
+        [[6.0, 0.5, 0.0]],
+        [[0.0, 0.5, 0.0]],
+        [[-4.0, 0.5, 0.0]],
+        [[-6.0, 0.5, 0.0]],
+    ]])
+    entropy, difficulty, variance, std = bounded_gaussian_variance_maps(
+        mu_raw, base_std=1.5, variance_type="entropy_adaptive",
+        rho=0.8, normalization="rank", eps=1.0e-8,
+    )
+    probability = torch.softmax(mu_raw.float(), dim=1)
+    expected_entropy = -(
+        probability * probability.clamp_min(1.0e-8).log()
+    ).sum(dim=1)
+    torch.testing.assert_close(entropy, expected_entropy)
+    torch.testing.assert_close(variance, 1.5 ** 2 * (1.0 + 0.8 * difficulty))
+    torch.testing.assert_close(std, 1.5 * torch.sqrt(1.0 + 0.8 * difficulty))
+    assert difficulty.shape == variance.shape == std.shape == (1, 1, 3)
+    assert abs(float(difficulty.mean())) < 1.0e-6
+    assert float(variance[0, 0, 2]) > float(variance[0, 0, 0])
+    assert float(variance.mean()) == pytest.approx(1.5 ** 2, abs=1.0e-6)
+
+    epsilon = torch.ones_like(mu_raw)
+    mu_state, x0 = sample_image_bounded_gaussian(
+        mu_raw, amplitude=0.2, temperature=8.0, sigma=std, epsilon=epsilon,
+    )
+    torch.testing.assert_close(x0, mu_state + std[:, None] * epsilon)
+
+
+def test_fixed_variance_is_exact_legacy_scalar_sampling():
+    mu_raw = torch.randn(2, 4, 2, 3)
+    epsilon = torch.randn_like(mu_raw)
+    fixed = sample_image_bounded_gaussian(
+        mu_raw, amplitude=0.2, temperature=8.0, sigma=1.5, epsilon=epsilon,
+    )
+    expected_state = 0.2 * torch.tanh(mu_raw / 8.0)
+    assert torch.equal(fixed[0], expected_state)
+    assert torch.equal(fixed[1], expected_state + 1.5 * epsilon)
+
+
+def test_adaptive_variance_yaml_and_training_inference_distribution():
+    config = load_config(ADAPTIVE_VARIANCE_CONFIG)
+    variance_config = config["source"]["bounded_gaussian"]["variance"]
+    assert variance_config == {
+        "type": "entropy_adaptive", "rho": 0.8,
+        "normalization": "rank", "eps": 1.0e-8,
+    }
+    config["dataset"]["num_classes"] = 4
+    config["model"]["num_classes"] = 4
+    config["model"]["state_downsample_factor"] = 4
+    source = RawStatisticsSource(torch.tensor([-3.0, -0.5, 0.5, 4.0]))
+    image = torch.zeros(2, 3, 8, 12)
+    torch.manual_seed(91)
+    training, training_stats = sample_prior(
+        config, image, None, source, sampling_mode="training"
+    )
+    torch.manual_seed(91)
+    inference, inference_stats = sample_prior(
+        config, image, None, source, sampling_mode="inference"
+    )
+    torch.testing.assert_close(training, inference)
+    assert training_stats["source_variance_adaptive"] == 1
+    assert inference_stats["source_variance_adaptive"] == 1
+    assert training_stats["source_variance_rho"] == pytest.approx(0.8)
+
+
+def test_adaptive_variance_production_sampling_does_not_depend_on_gt():
+    config = load_config(ADAPTIVE_VARIANCE_CONFIG)
+    config["dataset"]["num_classes"] = 4
+    config["model"]["num_classes"] = 4
+    config["model"]["state_downsample_factor"] = 4
+    config["loss"]["ignore_index"] = 3
+    source = RawStatisticsSource(torch.tensor([-3.0, -0.5, 0.5, 4.0]))
+    image = torch.zeros(1, 3, 8, 12)
+    targets = []
+    for value in (0, 3):
+        full = torch.full((1, 8, 12), value, dtype=torch.long)
+        targets.append((
+            full,
+            prepare_state_targets(
+                full, num_classes=4, state_size=(2, 3), ignore_index=3,
+                mask_pixel_losses=True,
+            ),
+        ))
+    samples = []
+    for full, prepared in targets:
+        torch.manual_seed(123)
+        x0, _ = sample_prior(
+            config, image, prepared.one_hot_state, source,
+            target_full=full, valid_mask_full=prepared.valid_mask_full,
+            sampling_mode="training",
+        )
+        samples.append(x0)
+    torch.testing.assert_close(samples[0], samples[1], rtol=0, atol=0)
 
 
 def test_bounded_prior_has_same_source_architecture_signature_as_gaussian():

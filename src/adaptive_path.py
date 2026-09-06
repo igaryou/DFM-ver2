@@ -39,6 +39,46 @@ def shannon_entropy(
     return -(probability * probability.clamp_min(eps).log()).sum(dim=1)
 
 
+def bounded_gaussian_variance_maps(
+    mu_raw: torch.Tensor,
+    *,
+    base_std: float,
+    variance_type: str = "fixed",
+    rho: float = 0.0,
+    normalization: str = "rank",
+    eps: float = 1.0e-8,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Build GT-independent per-pixel variance maps from source probabilities.
+
+    Entropy is always ``H(softmax(mu_raw))``.  No target or validity mask is
+    accepted, so both training and inference use identical image-only maps.
+    Returns entropy, difficulty, variance, and standard deviation as [B,H,W].
+    """
+    base_std = float(base_std)
+    rho = float(rho)
+    eps = float(eps)
+    if base_std <= 0:
+        raise ValueError("base_std must be positive")
+    if variance_type not in {"fixed", "entropy_adaptive"}:
+        raise ValueError("variance type must be fixed or entropy_adaptive")
+    if not 0.0 <= rho < 1.0:
+        raise ValueError("variance rho must satisfy 0 <= rho < 1")
+    if eps <= 0:
+        raise ValueError("variance eps must be positive")
+    entropy = shannon_entropy(mu_raw, representation="logits", eps=eps)
+    if variance_type == "fixed":
+        difficulty = torch.zeros_like(entropy)
+        variance = torch.full_like(entropy, base_std * base_std)
+    else:
+        difficulty = normalize_entropy(
+            entropy, normalization, valid_mask=None, eps=eps,
+            num_classes=mu_raw.shape[1],
+        )
+        variance = (base_std * base_std) * (1.0 + rho * difficulty)
+    std = variance.clamp_min(0.0).sqrt()
+    return entropy, difficulty, variance, std
+
+
 def _average_rank(values: torch.Tensor) -> torch.Tensor:
     """Zero-based average ranks for one 1-D tensor, including stable ties."""
     if values.numel() <= 1:
