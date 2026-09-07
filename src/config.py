@@ -251,6 +251,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         },
         "scheduler": {
             "name": "cosine",
+            "stage_aware": False,
             "warmup_epochs": 20,
             "warmup_start_factor": 0.1,
             "eta_min": 1.0e-6,
@@ -639,6 +640,15 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
         if any(not isinstance(flow_schedule[key], (int, float)) for key in ("initial", "final")):
             raise ValueError("training.flow_weight_schedule endpoints must be numeric")
     scheduler = training["scheduler"]
+    if not isinstance(scheduler["stage_aware"], bool):
+        raise ValueError("training.scheduler.stage_aware must be boolean")
+    if scheduler["stage_aware"]:
+        if not stages["enabled"]:
+            raise ValueError("stage-aware scheduler requires training.stages.enabled=true")
+        if scheduler["step_unit"] != "epoch":
+            raise ValueError("stage-aware scheduler currently requires step_unit=epoch")
+        if scheduler["name"] not in {"constant", "cosine"}:
+            raise ValueError("stage-aware scheduler supports constant or cosine")
     if scheduler["step_unit"] not in {"epoch", "optimizer_step"}:
         raise ValueError("training.scheduler.step_unit must be epoch or optimizer_step")
     if scheduler["name"] not in {"constant", "cosine", "poly"}:

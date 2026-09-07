@@ -142,6 +142,7 @@ def test_joint_psd_cityscapes_main_protocol_is_optimizer_step_based():
     assert config["training"]["grad_accum_steps"] == 1
     assert config["training"]["scheduler"] == {
         "name": "poly",
+        "stage_aware": False,
         "warmup_epochs": 0,
         "warmup_start_factor": 1.0e-6,
         "eta_min": 0.0,

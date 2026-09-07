@@ -22,6 +22,8 @@ class TrainingState:
     global_step: int = 0
     micro_step: int = 0
     best_miou: float = float("-inf")
+    best_source_miou: float = float("-inf")
+    best_flow_miou: float = float("-inf")
     current_stage: str | None = None
     stage_local_progress: int = 0
 
@@ -127,10 +129,25 @@ def checkpoint_payload(
         "optimizer_step": global_step,
         "current_stage": metrics.get("training_stage", config["experiment"]["stage"]),
         "stage_local_progress": metrics.get("stage_local_epoch", 0),
+        "best_source_miou": metrics.get("best_source_mIoU", float("-inf")),
+        "best_flow_miou": metrics.get(
+            "best_flow_mIoU", metrics.get("best_mIoU", float("-inf"))
+        ),
         "model": raw_model.state_dict(),
         "source_model": raw_source.state_dict() if raw_source is not None else None,
         "optimizer": optimizer.state_dict() if optimizer is not None else None,
         "scheduler": scheduler.state_dict() if scheduler is not None else None,
+        "scheduler_stage_aware": bool(
+            getattr(scheduler, "stage_aware", False)
+        ) if scheduler is not None else False,
+        "flow_scheduler_progress": (
+            scheduler.progress_for("flow")
+            if getattr(scheduler, "stage_aware", False) else None
+        ),
+        "source_scheduler_progress": (
+            scheduler.progress_for("source")
+            if getattr(scheduler, "stage_aware", False) else None
+        ),
         "micro_step": micro_step,
         "scheduler_step_unit": config["training"]["scheduler"]["step_unit"],
         "scheduler_version": (
@@ -404,6 +421,57 @@ def _validate_resume_scheduler(
         )
 
 
+def _restore_scheduler_state(
+    scheduler,
+    saved_state: dict,
+    *,
+    completed_epochs: int,
+    logger=None,
+) -> None:
+    if getattr(scheduler, "stage_aware", False):
+        if "stage_aware_version" in saved_state:
+            scheduler.load_state_dict(saved_state)
+        else:
+            scheduler.set_progress_from_completed_epochs(completed_epochs)
+            warnings.warn(
+                "Migrated legacy global scheduler state to stage-local progress "
+                f"at completed_epoch={completed_epochs}",
+                RuntimeWarning,
+            )
+            if logger is not None:
+                logger.info(
+                    "Migrated scheduler progress: flow=%d source=%d",
+                    scheduler.progress_for("flow"),
+                    scheduler.progress_for("source"),
+                )
+        return
+    scheduler.load_state_dict(saved_state)
+
+
+def _resume_best_metrics(
+    checkpoint: dict, metrics: dict
+) -> tuple[float, float, float]:
+    legacy_best = float(
+        metrics.get("best_mIoU", metrics.get("mIoU", float("-inf")))
+    )
+    saved_stage = checkpoint.get("current_stage")
+    default_source = (
+        legacy_best if saved_stage == "source_pretrain" else float("-inf")
+    )
+    default_flow = (
+        float("-inf") if saved_stage == "source_pretrain" else legacy_best
+    )
+    best_source = float(checkpoint.get(
+        "best_source_miou",
+        metrics.get("best_source_mIoU", default_source),
+    ))
+    best_flow = float(checkpoint.get(
+        "best_flow_miou",
+        metrics.get("best_flow_mIoU", default_flow),
+    ))
+    return legacy_best, best_source, best_flow
+
+
 def initialize_or_resume(
     config: dict,
     model,
@@ -520,7 +588,12 @@ def initialize_or_resume(
         current_optimizer = optimizer.state_dict()
         if len(saved_optimizer["param_groups"]) == len(current_optimizer["param_groups"]):
             optimizer.load_state_dict(saved_optimizer)
-            scheduler.load_state_dict(checkpoint["scheduler"])
+            _restore_scheduler_state(
+                scheduler,
+                checkpoint["scheduler"],
+                completed_epochs=int(checkpoint["epoch"]),
+                logger=logger,
+            )
         elif weight_model is not None and saved_weight is None:
             weight_group_name = (
                 "psd_weight" if consistency_type == "psd" else "esd_weight"
@@ -568,12 +641,18 @@ def initialize_or_resume(
                 "Resumed %s at completed epoch %s, global_step=%s",
                 resume, checkpoint["epoch"], checkpoint["global_step"],
             )
+        legacy_best, best_source, best_flow = _resume_best_metrics(
+            checkpoint, metrics
+        )
+        saved_stage = checkpoint.get("current_stage")
         return TrainingState(
             start_epoch=int(checkpoint["epoch"]),
             global_step=int(checkpoint["global_step"]),
             micro_step=int(checkpoint.get("micro_step", 0)),
-            best_miou=float(metrics.get("best_mIoU", metrics.get("mIoU", float("-inf")))),
-            current_stage=checkpoint.get("current_stage"),
+            best_miou=legacy_best,
+            best_source_miou=best_source,
+            best_flow_miou=best_flow,
+            current_stage=saved_stage,
             stage_local_progress=int(checkpoint.get("stage_local_progress", 0)),
         )
     return TrainingState()

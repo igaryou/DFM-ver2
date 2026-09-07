@@ -15,6 +15,8 @@ source:
     variance: {type: fixed}
   supervision: {type: cross_entropy, weight: 0.2, include_void: true}
 training:
+  scheduler:
+    stage_aware: true
   stages:
     enabled: true
     source_pretrain: {enabled: false}

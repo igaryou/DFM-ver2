@@ -52,11 +52,13 @@ from training_objectives import (
     DDPCompatibleTrainingModel,
     run_model_training_objectives,
 )
+from stage_scheduler import StageAwareGroupLRScheduler
 from training_stages import (
     set_stage_trainability,
     stage_operation,
     staged_training_enabled,
     training_stage_for_epoch,
+    update_staged_best_metrics,
 )
 from utils import (
     append_jsonl,
@@ -547,6 +549,10 @@ def _wandb_epoch_payload(
         "epoch/source/std_mean": "sigma_mean",
         "epoch/path/difficulty_mean": "path_difficulty_mean",
         "epoch/path/difficulty_std": "path_difficulty_std",
+        "epoch/lr/source": "source_lr",
+        "epoch/lr/flow": "lr",
+        "epoch/scheduler/source_progress": "source_scheduler_progress",
+        "epoch/scheduler/flow_progress": "flow_scheduler_progress",
     }
     payload.update({
         output_key: report[report_key]
@@ -697,6 +703,8 @@ class _RatioPreservingCosineAnnealingLR(
 
 def build_scheduler(config: dict, optimizer):
     scheduler_config = config["training"]["scheduler"]
+    if scheduler_config.get("stage_aware", False):
+        return StageAwareGroupLRScheduler(optimizer, config)
 
     if scheduler_config["name"] == "constant":
         return torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _: 1.0)
@@ -1347,6 +1355,10 @@ def run_training(config: dict, *, joint_entrypoint: bool = False) -> dict:
             logger if context.is_main_process else None,
             consistency_weight_model=adapter.consistency_weight_model,
         )
+        if not hasattr(state, "best_source_miou"):
+            state.best_source_miou = float("-inf")
+        if not hasattr(state, "best_flow_miou"):
+            state.best_flow_miou = state.best_miou
         active_stage = training_stage_for_epoch(
             config, min(state.start_epoch, config["training"]["epochs"] - 1)
         )
@@ -1361,6 +1373,14 @@ def run_training(config: dict, *, joint_entrypoint: bool = False) -> dict:
             )
         training_model = wrap_ddp(adapter, context, config)
         wrapped_stage_name = active_stage.name
+        if staged_training_enabled(config) and context.is_main_process:
+            logger.info(
+                "Entering stage: %s flow_scheduler_progress=%d "
+                "source_scheduler_progress=%d",
+                active_stage.name,
+                scheduler.progress_for("flow"),
+                scheduler.progress_for("source"),
+            )
         # Model initialization/checkpoint loading used the same seed. From here on,
         # rank-local stochastic paths intentionally differ.
         torch.manual_seed(config["experiment"]["seed"] + context.rank)
@@ -1386,7 +1406,11 @@ def run_training(config: dict, *, joint_entrypoint: bool = False) -> dict:
         )
         metrics_path = output_dir / "metrics.jsonl"
         total_iterations = getattr(state, "micro_step", 0)
-        last_metrics: dict = {"best_mIoU": state.best_miou}
+        last_metrics: dict = {
+            "best_mIoU": state.best_miou,
+            "best_source_mIoU": state.best_source_miou,
+            "best_flow_mIoU": state.best_flow_miou,
+        }
         last_epoch_report: dict[str, float | int | str] = {}
         validated_optimizer_steps: set[int] = set()
         best_checkpoint_steps: set[int] = set()
@@ -1405,8 +1429,9 @@ def run_training(config: dict, *, joint_entrypoint: bool = False) -> dict:
             checkpoint_epoch: int,
             checkpoint_micro_step: int,
         ) -> dict:
+            staged = staged_training_enabled(config)
             previous_best = state.best_miou
-            if staged_training_enabled(config) and active_stage.source_only:
+            if staged and active_stage.source_only:
                 result = validate_source_only(
                     config, training_model, val_loader, context, output_dir
                 )
@@ -1414,7 +1439,7 @@ def run_training(config: dict, *, joint_entrypoint: bool = False) -> dict:
                 result = validate(
                     config, training_model, val_loader, context, output_dir
                 )
-                if staged_training_enabled(config):
+                if staged:
                     result.update({
                         "flow_mIoU": result["mIoU"],
                         "flow_pixel_acc": result["pixel_acc"],
@@ -1433,9 +1458,21 @@ def run_training(config: dict, *, joint_entrypoint: bool = False) -> dict:
                     max(displayed_epoch - 1, 0)
                 ),
             })
-            is_new_best = result["mIoU"] > previous_best
-            if is_new_best:
-                state.best_miou = result["mIoU"]
+            staged_best_filenames: list[str] = []
+            is_new_best = False
+            if staged:
+                staged_best_filenames = update_staged_best_metrics(
+                    state, result, flow_enabled=not active_stage.source_only
+                )
+            else:
+                is_new_best = result["mIoU"] > previous_best
+                if is_new_best:
+                    state.best_miou = result["mIoU"]
+                    state.best_flow_miou = state.best_miou
+            result.update({
+                "best_source_mIoU": state.best_source_miou,
+                "best_flow_mIoU": state.best_flow_miou,
+            })
             validated_optimizer_steps.add(state.global_step)
             if context.is_main_process:
                 append_jsonl(metrics_path, {
@@ -1463,14 +1500,23 @@ def run_training(config: dict, *, joint_entrypoint: bool = False) -> dict:
                         if (key.startswith("source_") or key.startswith("flow_"))
                         and isinstance(value, (int, float))
                     })
+                    if math.isfinite(state.best_source_miou):
+                        wandb_payload["best/source_mIoU"] = state.best_source_miou
+                    if math.isfinite(state.best_flow_miou):
+                        wandb_payload["best/flow_mIoU"] = state.best_flow_miou
                     wandb_run.log(wandb_payload, step=state.global_step)
-            if is_new_best and trigger in {
+            best_filenames = list(staged_best_filenames)
+            if not staged and is_new_best and trigger in {
                 "optimizer_step_interval", "final_optimizer_step"
             }:
+                best_filenames.append("best.pt")
+            if best_filenames:
                 assert_checkpointable_surgery_state()
                 checkpoint_metrics = {
                     **result,
                     "best_mIoU": state.best_miou,
+                    "best_source_mIoU": state.best_source_miou,
+                    "best_flow_mIoU": state.best_flow_miou,
                     "optimizer_step": state.global_step,
                 }
                 _save_training_checkpoint(
@@ -1485,11 +1531,12 @@ def run_training(config: dict, *, joint_entrypoint: bool = False) -> dict:
                     metrics=checkpoint_metrics,
                     context=context,
                     output_dir=output_dir,
-                    filenames=["best.pt"],
+                    filenames=best_filenames,
                     global_batch_size=global_batch_size,
                     local_batch_size=local_batch_size,
                 )
-                best_checkpoint_steps.add(state.global_step)
+                if not staged:
+                    best_checkpoint_steps.add(state.global_step)
             return result
 
         optimizer.zero_grad(set_to_none=True)
@@ -1513,6 +1560,14 @@ def run_training(config: dict, *, joint_entrypoint: bool = False) -> dict:
                 training_model = wrap_ddp(adapter, context, config)
                 wrapped_stage_name = active_stage.name
                 adapter = unwrap_model(training_model)
+                if context.is_main_process:
+                    logger.info(
+                        "Entering stage: %s flow_scheduler_progress=%d "
+                        "source_scheduler_progress=%d",
+                        active_stage.name,
+                        scheduler.progress_for("flow"),
+                        scheduler.progress_for("source"),
+                    )
             training_model.train()
             if staged_training_enabled(config):
                 # Module.train() is recursive, so restore stage-specific modes.
@@ -1527,13 +1582,8 @@ def run_training(config: dict, *, joint_entrypoint: bool = False) -> dict:
                 min_keys=MIN_REDUCTION_KEYS,
                 max_keys=MAX_REDUCTION_KEYS,
             )
-            epoch_lr = (
-                float(optimizer.param_groups[0]["lr"])
-                if active_stage.train_flow else 0.0
-            )
+            epoch_lr = float(optimizer.param_groups[0]["lr"])
             epoch_source_lr = _parameter_group_lr(optimizer, "source")
-            if epoch_source_lr is not None and not active_stage.train_source:
-                epoch_source_lr = 0.0
             epoch_consistency_weight_lr = _parameter_group_lr(
                 optimizer, "psd_weight"
             )
@@ -1695,6 +1745,8 @@ def run_training(config: dict, *, joint_entrypoint: bool = False) -> dict:
                                     else {}
                                 ),
                                 "best_mIoU": state.best_miou,
+                                "best_source_mIoU": state.best_source_miou,
+                                "best_flow_mIoU": state.best_flow_miou,
                                 "optimizer_step": state.global_step,
                             }
                             filenames = ["latest.pt"]
@@ -1786,6 +1838,16 @@ def run_training(config: dict, *, joint_entrypoint: bool = False) -> dict:
                 "stage_local_epoch": active_stage.local_epoch(epoch_index),
                 "source_trainable": int(active_stage.train_source),
                 "flow_trainable": int(active_stage.train_flow),
+                "source_scheduler_progress": int(
+                    scheduler.progress_for("source")
+                    if getattr(scheduler, "stage_aware", False)
+                    else scheduler.last_epoch
+                ),
+                "flow_scheduler_progress": int(
+                    scheduler.progress_for("flow")
+                    if getattr(scheduler, "stage_aware", False)
+                    else scheduler.last_epoch
+                ),
             })
             raw_epoch_metrics = {
                 key: float(value) for key, value in reduced_epoch.items()
@@ -1811,7 +1873,13 @@ def run_training(config: dict, *, joint_entrypoint: bool = False) -> dict:
                         step=state.global_step,
                     )
             if training["scheduler"]["step_unit"] == "epoch":
-                scheduler.step()
+                if getattr(scheduler, "stage_aware", False):
+                    scheduler.step(
+                        train_flow=active_stage.train_flow,
+                        train_source=active_stage.train_source,
+                    )
+                else:
+                    scheduler.step()
             last_epoch_report = epoch_report
 
             displayed_epoch = epoch_index + 1
@@ -1850,6 +1918,8 @@ def run_training(config: dict, *, joint_entrypoint: bool = False) -> dict:
                 **epoch_report,
                 **(validation_metrics or {}),
                 "best_mIoU": state.best_miou,
+                "best_source_mIoU": state.best_source_miou,
+                "best_flow_mIoU": state.best_flow_miou,
             }
             filenames = []
             if state.global_step not in latest_checkpoint_steps:
@@ -1857,7 +1927,8 @@ def run_training(config: dict, *, joint_entrypoint: bool = False) -> dict:
             if displayed_epoch in numbered_checkpoint_epochs:
                 filenames.append(f"epoch_{epoch_index + 1:04d}.pt")
             if (
-                validation_metrics is not None
+                not staged_training_enabled(config)
+                and validation_metrics is not None
                 and validation_step == state.global_step
                 and state.global_step not in best_checkpoint_steps
                 and validation_metrics["mIoU"] >= state.best_miou

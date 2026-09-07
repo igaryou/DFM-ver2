@@ -149,3 +149,24 @@ def stage_operation(config: dict, stage: TrainingStage) -> str:
     if experiment_stage in {"consistency_distillation", "esd_distillation"}:
         return "stage2_objectives"
     return "stage1_objectives"
+
+
+def update_staged_best_metrics(
+    state,
+    result: dict,
+    *,
+    flow_enabled: bool,
+) -> list[str]:
+    """Update independent source/flow best values and return checkpoint names."""
+    filenames: list[str] = []
+    source_score = float(result["source_mIoU"])
+    if source_score > state.best_source_miou:
+        state.best_source_miou = source_score
+        filenames.append("best_source.pt")
+    if flow_enabled:
+        flow_score = float(result["flow_mIoU"])
+        if flow_score > state.best_flow_miou:
+            state.best_flow_miou = flow_score
+            filenames.append("best_flow.pt")
+        state.best_miou = state.best_flow_miou
+    return filenames
