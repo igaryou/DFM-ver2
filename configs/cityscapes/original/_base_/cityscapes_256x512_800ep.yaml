@@ -34,7 +34,7 @@ training:
   grad_accum_steps: 1
   checkpoint_interval_epochs: 25
   checkpoint_interval_steps: null
-  validation_epochs: [25, 50, 75, 100, 125, 150, 200, 300, 400, 500, 600, 700, 800]
+  validation_epochs: [1,25, 50, 75, 100, 125, 150, 200, 300, 400, 500, 600, 700, 800]
   optimizer:
     parameter_groups:
       model: {lr: 1.0e-4}

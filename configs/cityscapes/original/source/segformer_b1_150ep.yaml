@@ -14,7 +14,7 @@ source:
 training:
   epochs: 150
   train_endpoint: false
-  checkpoint_interval_epochs: 25
+  checkpoint_interval_epochs: 50
   validation_epochs: [25, 50, 75, 100, 125, 150]
   stages: {enabled: false}
 loss:

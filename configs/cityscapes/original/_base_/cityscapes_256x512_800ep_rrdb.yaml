@@ -4,7 +4,7 @@ extends: cityscapes_256x512_800ep.yaml
 model:
   state_downsample_factor: 4
   fusion_channels: 128
-  rrdb_blocks: 5
+  rrdb_blocks: 3
   rrdb_growth_channels: 32
   image_encoder:
     type: rrdb

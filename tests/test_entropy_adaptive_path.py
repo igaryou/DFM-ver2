@@ -21,8 +21,13 @@ from discrete_flow_maps import (
     path_derivative,
     sample_prior,
 )
-from trainer import build_optimizer, validate_source_only
+from trainer import (
+    _validation_batch_items,
+    build_optimizer,
+    validate_source_only,
+)
 from training_objectives import DDPCompatibleTrainingModel
+from training_stages import training_stage_for_epoch
 
 
 ADAPTIVE = {
@@ -247,8 +252,10 @@ class _LogitSource(nn.Module):
     def __init__(self) -> None:
         super().__init__()
         self.logits = nn.Parameter(torch.zeros(20))
+        self.statistics_calls = 0
 
     def forward_statistics(self, image: torch.Tensor):
+        self.statistics_calls += 1
         mean = self.logits[None, :, None, None].expand(
             image.shape[0], 20, image.shape[-2] // 4, image.shape[-1] // 4
         )
@@ -305,6 +312,53 @@ def test_source_only_stage1_skips_endpoint_and_path() -> None:
     assert result["diagonal_objective"] == 0
     assert result["psd_objective"] == 0
     assert source.logits.grad is not None
+
+
+def test_validation_batch_items_distinguishes_collated_tensors_from_sample_list():
+    images = torch.rand(2, 3, 8, 12)
+    targets = torch.zeros(2, 8, 12, dtype=torch.long)
+    fixed = _validation_batch_items([images, targets])
+    assert len(fixed) == 1
+    assert fixed[0]["image"] is images
+    assert fixed[0]["target"] is targets
+
+    native = [
+        {"image": images[0], "target": targets[0], "original_shape": (8, 12)},
+        {"image": images[1], "target": targets[1], "original_shape": (8, 12)},
+    ]
+    assert _validation_batch_items(native) == native
+
+
+@pytest.mark.parametrize(
+    ("epoch_index", "validation_stage"),
+    [(149, "source_pretrain"), (150, "flow_training")],
+)
+def test_original_fixed_resolution_source_validation_is_batched(
+    tmp_path, epoch_index: int, validation_stage: str
+) -> None:
+    config = load_config(
+        "configs/cityscapes/original/psd/"
+        "joint_bounded_gaussian_b1_exponential_path_adaptive_std_trainable.yaml"
+    )
+    assert training_stage_for_epoch(config, epoch_index).name == validation_stage
+    config["source"]["diagnostics"]["enabled"] = False
+    config["evaluation"]["max_visualizations"] = 0
+    source = _LogitSource()
+    adapter = DDPCompatibleTrainingModel(_ForbiddenEndpoint(), source, config)
+    images = torch.rand(2, 3, 8, 12)
+    targets = torch.zeros(2, 8, 12, dtype=torch.long)
+    # PyTorch default_collate returns a list for tuple-valued dataset samples.
+    loader = [[images, targets]]
+    context = DistributedContext(
+        distributed=False, rank=0, local_rank=0, world_size=1,
+        device=torch.device("cpu"), is_main_process=True, backend=None,
+    )
+
+    result = validate_source_only(config, adapter, loader, context, tmp_path)
+
+    assert source.statistics_calls == 1
+    assert result["source_pixel_acc"] == pytest.approx(1.0)
+    assert sum(sum(row) for row in result["confusion_matrix"]) == 2 * 8 * 12
 
 
 def test_source_only_validation_metrics_entropy_bins_and_png(tmp_path) -> None:

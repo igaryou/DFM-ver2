@@ -79,7 +79,7 @@ def test_original_representative_resolves_and_builds_rrdb_flow_encoder():
     model_config = config["model"]
     assert model_config["image_encoder"]["type"] == "rrdb"
     assert model_config["fusion_channels"] == 128
-    assert model_config["rrdb_blocks"] == 5
+    assert model_config["rrdb_blocks"] == 3
     assert model_config["rrdb_growth_channels"] == 32
     assert model_config["state_downsample_factor"] == 4
     assert config["source"]["segformer_variant"] == "b1"
@@ -89,7 +89,7 @@ def test_original_representative_resolves_and_builds_rrdb_flow_encoder():
     assert isinstance(endpoint.image_encoder, ImageEncoder)
     assert endpoint.image_encoder.downsample_factor == 4
     assert endpoint.image_encoder.first.out_channels == 128
-    assert len(endpoint.image_encoder.body) == 5
+    assert len(endpoint.image_encoder.body) == 3
     first_dense_conv = endpoint.image_encoder.body[0].blocks[0].layers[0]
     assert first_dense_conv.out_channels == 32
 

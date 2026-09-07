@@ -846,6 +846,27 @@ def _unpack_training_batch(batch, config: dict):
     raise ValueError(f"training batch must contain 2 or 3 tensors, got {len(batch)}")
 
 
+def _validation_batch_items(batch) -> list[dict]:
+    """Normalize fixed-size tensor batches and native-resolution sample dicts."""
+    if isinstance(batch, dict):
+        if "image" not in batch or "target" not in batch:
+            raise ValueError("validation batch dict requires image and target")
+        return [batch]
+    if isinstance(batch, (list, tuple)):
+        if (
+            len(batch) == 2
+            and torch.is_tensor(batch[0])
+            and torch.is_tensor(batch[1])
+        ):
+            return [{"image": batch[0], "target": batch[1]}]
+        if all(isinstance(sample, dict) for sample in batch):
+            return list(batch)
+    raise ValueError(
+        "validation batch must be an (image, target) tensor pair, "
+        "a dict, or a list of sample dicts"
+    )
+
+
 def _accumulate_entropy_percentiles(
     entropy: torch.Tensor,
     correct: torch.Tensor,
@@ -921,13 +942,22 @@ def validate_source_only(
     for batch_index, batch in enumerate(loader):
         if maximum_batches is not None and batch_index >= maximum_batches:
             break
-        samples = batch if isinstance(batch, list) else [
-            {"image": image, "target": target}
-            for image, target in zip(*batch, strict=True)
-        ]
-        for sample in samples:
-            image = sample["image"].unsqueeze(0).to(context.device, non_blocking=True)
-            target = sample["target"].unsqueeze(0).to(context.device, non_blocking=True)
+        for sample in _validation_batch_items(batch):
+            image = sample["image"]
+            target = sample["target"]
+            if image.ndim == 3:
+                image = image.unsqueeze(0)
+            if target.ndim == 2:
+                target = target.unsqueeze(0)
+            if image.ndim != 4 or target.ndim != 3:
+                raise ValueError(
+                    "validation image/target must have shapes [B,C,H,W] and "
+                    f"[B,H,W], got {tuple(image.shape)} and {tuple(target.shape)}"
+                )
+            if image.shape[0] != target.shape[0]:
+                raise ValueError("validation image and target batch sizes differ")
+            image = image.to(context.device, non_blocking=True)
+            target = target.to(context.device, non_blocking=True)
             with autocast_context(config, context.device):
                 mean, _ = source_statistics(source, image)
             entropy_state = shannon_entropy(
@@ -946,10 +976,10 @@ def validate_source_only(
                     align_corners=config["evaluation"]["align_corners"],
                 )[:, 0]
                 model_height, model_width = (int(v) for v in sample["model_shape"])
-                display_image = F.interpolate(
+                display_images = F.interpolate(
                     image[..., :model_height, :model_width].float(),
                     size=target.shape[-2:], mode="bilinear", align_corners=False,
-                )[0]
+                )
             else:
                 mean_full = F.interpolate(
                     mean.float(), target.shape[-2:], mode="bilinear", align_corners=False
@@ -958,7 +988,7 @@ def validate_source_only(
                     entropy_state[:, None], target.shape[-2:],
                     mode="bilinear", align_corners=False,
                 )[:, 0]
-                display_image = image[0]
+                display_images = image
             prediction = mean_full.argmax(dim=1)
             semantic_metrics.update(prediction, target)
             valid_all = (
@@ -988,18 +1018,21 @@ def validate_source_only(
                 and diagnostic_config["visualization"]
                 and visualized < diagnostic_config["max_visualizations"]
             ):
-                save_source_diagnostics(
-                    display_image, target[0], prediction[0], entropy_full[0],
-                    output_dir / "source_diagnostics"
-                    / f"source_val_{visualized:04d}.png",
-                    num_classes=classes,
-                    imagenet_normalize=(
-                        config["augmentation"]["imagenet_normalize"]
-                        or config["augmentation"]["normalize"]["enabled"]
-                    ),
-                    dataset_name=config["dataset"]["name"],
-                )
-                visualized += 1
+                remaining = diagnostic_config["max_visualizations"] - visualized
+                for sample_index in range(min(image.shape[0], max(remaining, 0))):
+                    save_source_diagnostics(
+                        display_images[sample_index], target[sample_index],
+                        prediction[sample_index], entropy_full[sample_index],
+                        output_dir / "source_diagnostics"
+                        / f"source_val_{visualized:04d}.png",
+                        num_classes=classes,
+                        imagenet_normalize=(
+                            config["augmentation"]["imagenet_normalize"]
+                            or config["augmentation"]["normalize"]["enabled"]
+                        ),
+                        dataset_name=config["dataset"]["name"],
+                    )
+                    visualized += 1
 
     semantic_metrics.confusion_matrix = all_reduce_confusion_matrix(
         semantic_metrics.confusion_matrix, context
@@ -1092,12 +1125,13 @@ def validate(
     for batch_index, batch in enumerate(loader):
         if maximum_batches is not None and batch_index >= maximum_batches:
             break
+        validation_items = _validation_batch_items(batch)
         if (
             config["dataset"]["name"] == "ade20k"
             or config["evaluation"]["original_resolution"]
         ):
             visualization_items = []
-            for sample in batch:
+            for sample in validation_items:
                 image = sample["image"].unsqueeze(0).to(
                     context.device, non_blocking=True
                 )
@@ -1122,9 +1156,16 @@ def validate(
                 metrics.update(prediction, target)
                 visualization_items.append((image, target, prediction))
         else:
-            image, target = batch
-            image = image.to(context.device, non_blocking=True)
-            target = target.to(context.device, non_blocking=True)
+            if len(validation_items) != 1:
+                raise ValueError(
+                    "fixed-resolution validation requires one batched tensor pair"
+                )
+            image = validation_items[0]["image"].to(
+                context.device, non_blocking=True
+            )
+            target = validation_items[0]["target"].to(
+                context.device, non_blocking=True
+            )
             with autocast_context(config, context.device):
                 if config["evaluation"]["num_samples"] == 1:
                     prediction = sample_segmentation(endpoint, source, image, config)
