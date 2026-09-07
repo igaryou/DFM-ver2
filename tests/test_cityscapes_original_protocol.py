@@ -19,6 +19,7 @@ from dataset import Cityscapes20ClassDataset
 from discrete_flow_maps import source_supervision_schedule
 from inference import sample_segmentation_ensemble
 from metrics import SegmentationMetrics
+from model import DiscreteFlowMapModel, ImageEncoder
 from training_objectives import (
     DDPCompatibleTrainingModel, compute_model_training_objectives,
 )
@@ -71,6 +72,29 @@ def test_original_config_resolves_protocol_and_reference_recipe():
     assert config["flow"]["path"]["scheduler"] == {
         "type": "exponential", "beta": 2.0, "difficulty_gamma": 1.0
     }
+
+
+def test_original_representative_resolves_and_builds_rrdb_flow_encoder():
+    config = load_config(REPRESENTATIVE)
+    model_config = config["model"]
+    assert model_config["image_encoder"]["type"] == "rrdb"
+    assert model_config["fusion_channels"] == 128
+    assert model_config["rrdb_blocks"] == 5
+    assert model_config["rrdb_growth_channels"] == 32
+    assert model_config["state_downsample_factor"] == 4
+    assert config["source"]["segformer_variant"] == "b1"
+    assert config["source"]["segformer_decoder"] == "standard"
+
+    endpoint = DiscreteFlowMapModel(model_config)
+    assert isinstance(endpoint.image_encoder, ImageEncoder)
+    assert endpoint.image_encoder.downsample_factor == 4
+    assert endpoint.image_encoder.first.out_channels == 128
+    assert len(endpoint.image_encoder.body) == 5
+    first_dense_conv = endpoint.image_encoder.body[0].blocks[0].layers[0]
+    assert first_dense_conv.out_channels == 32
+
+    feature = endpoint.encode_image(torch.randn(1, 3, 32, 64))
+    assert feature.shape == (1, 128, 8, 16)
 
 
 def test_original_train_and_val_are_fixed_size_and_mask_is_nearest():

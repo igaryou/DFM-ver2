@@ -1,0 +1,17 @@
+extends: cityscapes_256x512_800ep.yaml
+
+# Flow Maps image encoder: the source SegFormer configuration is inherited unchanged.
+model:
+  state_downsample_factor: 4
+  fusion_channels: 128
+  rrdb_blocks: 5
+  rrdb_growth_channels: 32
+  image_encoder:
+    type: rrdb
+    variant: tiny
+    pretrained: false
+    freeze: false
+    input_already_normalized: false
+    neck:
+      type: none
+      channels: 256

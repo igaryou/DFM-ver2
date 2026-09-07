@@ -1,4 +1,4 @@
-extends: ../_base_/cityscapes_256x512_800ep.yaml
+extends: ../_base_/cityscapes_256x512_800ep_rrdb.yaml
 experiment:
   name: dfm_original_cityscapes_b1_bounded_gaussian_joint_800ep
   output_dir: /home/igarashi_25/DFM/results/cityscapes/original/bounded_gaussian_joint_800ep
