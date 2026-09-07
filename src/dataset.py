@@ -335,6 +335,42 @@ class Cityscapes20ClassDataset(Dataset):
             })
         return image, mask, spatial_valid_mask
 
+    def _original_train_item_with_spatial_mask(
+        self, image: torch.Tensor, mask: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """CFM/CCDM fixed-resolution Cityscapes training pipeline."""
+        augmentation = self.config["augmentation"]
+        spatial_valid_mask = torch.ones_like(mask, dtype=torch.bool)
+        flip = augmentation["horizontal_flip"]
+        if flip["enabled"] and torch.rand(()) < flip["probability"]:
+            image = torch.flip(image, (2,))
+            mask = torch.flip(mask, (1,))
+            spatial_valid_mask = torch.flip(spatial_valid_mask, (1,))
+        size = tuple(self.config["dataset"]["image_size"])
+        resize = self.config["dataset"]["fixed_resize"]
+        image = TF.resize(
+            image, size, interpolation=TF.InterpolationMode.BILINEAR,
+            antialias=resize["antialias"],
+        )
+        mask = TF.resize(
+            mask[None], size, interpolation=TF.InterpolationMode.NEAREST
+        )[0].long()
+        spatial_valid_mask = TF.resize(
+            spatial_valid_mask[None], size,
+            interpolation=TF.InterpolationMode.NEAREST,
+        )[0].bool()
+        if augmentation["color_jitter"]["enabled"]:
+            image = self.jitter(image).clamp(0.0, 1.0)
+        if augmentation["imagenet_normalize"]:
+            image = _normalize(image, {
+                "enabled": True,
+                "mean": [0.485, 0.456, 0.406],
+                "std": [0.229, 0.224, 0.225],
+            })
+        else:
+            image = _normalize(image, augmentation["normalize"])
+        return image, mask, spatial_valid_mask
+
     def _train_item(
         self, image: torch.Tensor, mask: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -344,6 +380,8 @@ class Cityscapes20ClassDataset(Dataset):
     def _train_item_with_spatial_mask(
         self, image: torch.Tensor, mask: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if self.config["dataset"]["protocol"] == "original":
+            return self._original_train_item_with_spatial_mask(image, mask)
         augmentation = self.config["augmentation"]
         spatial_valid_mask = torch.ones_like(mask, dtype=torch.bool)
         modern_pipeline = any(
@@ -411,10 +449,14 @@ class Cityscapes20ClassDataset(Dataset):
         self, image: torch.Tensor, mask: torch.Tensor, index: int
     ):
         evaluation = self.config["evaluation"]
-        if not evaluation["original_resolution"]:
+        if (
+            self.config["dataset"]["protocol"] == "original"
+            or not evaluation["original_resolution"]
+        ):
             size = self.config["dataset"]["image_size"]
+            antialias = self.config["dataset"]["fixed_resize"]["antialias"]
             image = TF.resize(
-                image, size, TF.InterpolationMode.BILINEAR, antialias=True
+                image, size, TF.InterpolationMode.BILINEAR, antialias=antialias
             )
             mask = TF.resize(
                 mask[None], size, TF.InterpolationMode.NEAREST
@@ -634,6 +676,6 @@ def build_dataset(
         root=config["dataset"]["root"],
         split=split,
         config=config,
-        augment=enabled and split == "train",
+        augment=enabled and split == config["dataset"]["train_split"],
         return_spatial_valid_mask=return_spatial_valid_mask,
     )

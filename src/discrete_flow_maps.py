@@ -16,6 +16,7 @@ from adaptive_path import (
 )
 from state_space import resize_continuous, state_spatial_size
 from source_model import source_statistics
+from training_stages import schedule_value
 
 
 def _time_view(time: torch.Tensor, ndim: int = 4) -> torch.Tensor:
@@ -388,24 +389,21 @@ def sample_image_bounded_gaussian(
 
 
 def source_supervision_schedule(
-    supervision: dict, optimizer_step: int
+    supervision: dict,
+    optimizer_step: int,
+    epoch_index: int = 0,
 ) -> tuple[float, float]:
-    """Return CE weight and progress from the completed optimizer update count."""
-    optimizer_step = int(optimizer_step)
-    if optimizer_step < 0:
+    """Resolve CE weight from epoch or completed optimizer update count."""
+    if int(optimizer_step) < 0:
         raise ValueError("optimizer_step must be non-negative")
-    schedule = supervision.get("weight_schedule", {"type": "fixed"})
-    schedule_type = schedule.get("type", "fixed")
-    if schedule_type == "fixed":
-        weight = supervision.get("weight")
-        return (0.0 if weight is None else float(weight)), 0.0
-    if schedule_type != "linear":
-        raise ValueError(f"Unknown source CE weight schedule: {schedule_type}")
-    steps = int(schedule["steps"])
-    progress = min(float(optimizer_step) / steps, 1.0)
-    initial = float(schedule["initial"])
-    final = float(schedule["final"])
-    return initial + (final - initial) * progress, progress
+    weight = supervision.get("weight")
+    fallback = 0.0 if weight is None else float(weight)
+    return schedule_value(
+        supervision.get("weight_schedule", {"type": "fixed"}),
+        epoch_index=epoch_index,
+        optimizer_step=optimizer_step,
+        fallback=fallback,
+    )
 
 
 def sample_prior(
@@ -419,6 +417,8 @@ def sample_prior(
     sample_state: bool = True,
     sampling_mode: str = "training",
     optimizer_step: int = 0,
+    epoch_index: int = 0,
+    source_trainable: bool | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Sample state-resolution x0 and compute optional full-resolution supervision."""
     if sampling_mode not in {"training", "inference"}:
@@ -474,7 +474,10 @@ def sample_prior(
             f"source.prior_type={source['prior_type']} requires a source model"
         )
 
-    source_frozen = bool(source.get("freeze", False))
+    source_frozen = (
+        bool(source.get("freeze", False))
+        if source_trainable is None else not bool(source_trainable)
+    )
     source_context = torch.no_grad() if source_frozen else nullcontext()
     simplex_stats: dict[str, torch.Tensor] = {}
     variance_stats: dict[str, torch.Tensor] = {}
@@ -579,7 +582,7 @@ def sample_prior(
         supervision_type = "align" if source.get("use_loss_align", False) else "none"
         supervision_weight = float(source.get("align_weight", 0.0))
     ce_scheduled_weight, ce_schedule_progress = source_supervision_schedule(
-        supervision, optimizer_step
+        supervision, optimizer_step, epoch_index
     )
     if (
         supervision_type == "cross_entropy"

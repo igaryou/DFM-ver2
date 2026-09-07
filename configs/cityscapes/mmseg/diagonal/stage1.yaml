@@ -1,0 +1,4 @@
+extends: ../../diagonal/stage1.yaml
+
+dataset:
+  protocol: mmseg

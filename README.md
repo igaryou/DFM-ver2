@@ -10,6 +10,80 @@ Stage 1、Stage 2、joint training、PSD/CSD/ECLD/ESD、single GPU、単一ノ�
 DDP、bf16 AMP、JVP、gradient accumulation/clipping、checkpoint resumeを維持
 しています。元の参照実装 `/home/igarashi_25/playground_2/CSDFM/DFM` は変更しません。
 
+
+## Cityscapes protocols
+
+Cityscapes supports the existing MMSegmentation-compatible protocol and a
+fixed-resolution protocol for CFM-Segmentation/CCDM comparisons. Existing
+`configs/cityscapes/*` paths remain valid; `configs/cityscapes/mmseg/*`
+contains backward-compatible wrappers.
+
+| | mmseg | original |
+|---|---|---|
+| train resize | random 0.5-2.0 | fixed bilinear |
+| train crop | 512x1024 + cat_max_ratio | none |
+| mask resize | nearest | nearest |
+| color augmentation | MMSeg photometric distortion | ColorJitter + horizontal flip |
+| validation resolution | native 1024x2048 | configured fixed HxW |
+| schedule | optimizer steps | epochs |
+| default evaluation | full resolution | fixed resolution |
+| purpose | MMSeg/DDP comparison | CCDM/CFM/HSRDiff comparison |
+
+With `dataset.protocol: original`, train and validation images and masks are
+resized to `dataset.image_size: [H, W]`. Predictions are compared directly
+with fixed-resolution GT. The shared `SegmentationMetrics` excludes GT
+void=19 and evaluates classes 0..18.
+
+The representative 800-epoch recipe trains source CE alone in epochs 0-149,
+then uses the existing Flow Maps objectives in epochs 150-799.
+
+```bash
+CUDA_VISIBLE_DEVICES=0 uv run torchrun --standalone --nproc_per_node=1 \
+  src/train_joint.py \
+  --config configs/cityscapes/original/psd/joint_bounded_gaussian_b1_exponential_path_adaptive_std_trainable.yaml
+```
+
+To start from a pretrained source, set `source.checkpoint`, disable
+`training.stages.source_pretrain`, and start `flow_training` at epoch 0.
+Multi-sample evaluation uses `evaluation.num_samples` and
+`evaluation.aggregation: probability_mean | majority_vote`. Probability mean
+averages the final endpoint class probabilities before `argmax`; it never
+averages integer masks.
+
+The staged schema uses half-open, zero-based epoch intervals:
+
+```yaml
+training:
+  schedule_unit: epoch
+  stages:
+    enabled: true
+    source_pretrain:
+      enabled: true
+      start_epoch: 0
+      end_epoch: 150
+      train_source: true
+      train_flow: false
+    flow_training:
+      enabled: true
+      start_epoch: 150
+      end_epoch: 800
+      train_source: true  # false freezes source and puts it in eval mode
+      train_flow: true
+  flow_weight_schedule:
+    type: linear
+    unit: epoch
+    start_epoch: 150
+    duration: 10
+    initial: 0.0
+    final: 1.0
+```
+
+`source.checkpoint` only loads weights; it does not imply freezing. The
+`joint_bounded_gaussian_b1_from_checkpoint_{frozen,trainable}.yaml` recipes
+show both checkpoint-start modes. Source CE uses the existing schedule schema
+with either `unit: epoch` plus `duration`, or the backward-compatible
+optimizer-step form with `steps: 16000`.
+
 ## 1/4 state設計
 
 生成に関係する処理はすべてstate空間で行います。

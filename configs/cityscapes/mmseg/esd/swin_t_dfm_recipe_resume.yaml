@@ -1,0 +1,4 @@
+extends: ../../esd/swin_t_dfm_recipe_resume.yaml
+
+dataset:
+  protocol: mmseg

@@ -1,0 +1,16 @@
+extends: joint_bounded_gaussian_b1_800ep.yaml
+experiment:
+  name: dfm_original_cityscapes_b1_150ep_source_then_trainable_800ep
+  output_dir: /home/igarashi_25/DFM/results/cityscapes/original/b1_150ep_source_then_trainable_800ep
+source:
+  supervision:
+    type: cross_entropy
+    weight: 0.2
+    include_void: true
+    weight_schedule: {type: linear, unit: epoch, start_epoch: 150, duration: 50, initial: 3.0, final: 0.2}
+training:
+  stages:
+    enabled: true
+    source_pretrain: {enabled: true, start_epoch: 0, end_epoch: 150, train_source: true, train_flow: false}
+    flow_training: {enabled: true, start_epoch: 150, end_epoch: 800, train_source: true, train_flow: true}
+  flow_weight_schedule: {type: linear, unit: epoch, start_epoch: 150, duration: 10, initial: 0.0, final: 1.0}

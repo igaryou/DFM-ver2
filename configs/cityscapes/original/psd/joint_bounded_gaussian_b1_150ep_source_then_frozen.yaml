@@ -1,0 +1,7 @@
+extends: joint_bounded_gaussian_b1_150ep_source_then_trainable.yaml
+experiment:
+  name: dfm_original_cityscapes_b1_150ep_source_then_frozen_800ep
+  output_dir: /home/igarashi_25/DFM/results/cityscapes/original/b1_150ep_source_then_frozen_800ep
+training:
+  stages:
+    flow_training: {train_source: false}

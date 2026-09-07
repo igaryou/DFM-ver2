@@ -46,8 +46,11 @@ def run_flow_from_state(
     num_steps: int,
     return_trajectory: bool = False,
     path_difficulty: torch.Tensor | None = None,
+    return_final_probability: bool = False,
 ):
     """Run the production Flow Map update from a caller-provided state."""
+    if isinstance(num_steps, bool) or not isinstance(num_steps, int) or num_steps <= 0:
+        raise ValueError("num_steps must be a positive integer")
     model.eval()
     x = initial_state
     expected_state_size = state_spatial_size(
@@ -67,6 +70,8 @@ def run_flow_from_state(
             difficulty=path_difficulty,
         )
         trajectory.append(x.argmax(dim=1))
+    if return_final_probability:
+        return probability.float()
     if return_trajectory:
         return x, torch.stack(trajectory, dim=1)
     return x
@@ -141,6 +146,78 @@ def sample_segmentation(
         return_terminal_state=return_terminal_state,
         path_difficulty=path_difficulty,
     )
+
+@torch.no_grad()
+def sample_segmentation_probabilities(
+    model,
+    source_model,
+    image: torch.Tensor,
+    config: dict,
+    num_steps: int | None = None,
+) -> torch.Tensor:
+    """Return one stochastic sample as full-image class probabilities."""
+    model.eval()
+    if source_model is not None:
+        source_model.eval()
+    x0, source_stats = sample_prior(
+        config, image, None, source_model, sampling_mode="inference"
+    )
+    path_difficulty = None
+    if entropy_adaptive_enabled(config):
+        source_state = source_stats.get("_path_source_state")
+        if source_state is None:
+            raise RuntimeError("adaptive inference requires source model output")
+        _, path_difficulty = source_entropy_difficulty(
+            source_state, config, spatial_size=x0.shape[-2:]
+        )
+    final_probability = run_flow_from_state(
+        model, image, x0, config, num_steps or config["evaluation"]["num_steps"],
+        path_difficulty=path_difficulty, return_final_probability=True,
+    )
+    full_resolution = resize_continuous(
+        final_probability.float(), image.shape[-2:]
+    ).clamp_min(0.0)
+    return full_resolution / full_resolution.sum(dim=1, keepdim=True).clamp_min(1.0e-12)
+
+
+@torch.no_grad()
+def sample_segmentation_ensemble(
+    model,
+    source_model,
+    image: torch.Tensor,
+    config: dict,
+    *,
+    num_samples: int | None = None,
+    aggregation: str | None = None,
+    num_steps: int | None = None,
+) -> torch.Tensor:
+    """Aggregate stochastic predictions by probability mean or majority vote."""
+    count = int(num_samples or config.get("evaluation", {}).get("num_samples", 1))
+    mode = aggregation or config.get("evaluation", {}).get(
+        "aggregation", "probability_mean"
+    )
+    if count <= 0:
+        raise ValueError("num_samples must be positive")
+    if mode not in {"probability_mean", "majority_vote"}:
+        raise ValueError("aggregation must be probability_mean or majority_vote")
+    samples = [
+        sample_segmentation_probabilities(
+            model, source_model, image, config, num_steps=num_steps
+        )
+        for _ in range(count)
+    ]
+    if mode == "probability_mean":
+        aggregate = torch.stack(samples).mean(dim=0)
+    else:
+        predictions = torch.stack([probability.argmax(dim=1) for probability in samples])
+        aggregate = F.one_hot(
+            predictions, num_classes=samples[0].shape[1]
+        ).sum(dim=0).permute(0, 3, 1, 2).float()
+    evaluation = config.get("evaluation", {})
+    if evaluation.get("exclude_void_from_prediction", False):
+        void_index = config["dataset"]["void_class_index"]
+        aggregate[:, void_index] = -torch.inf
+    return aggregate.argmax(dim=1)
 
 
 def state_to_original_continuous(

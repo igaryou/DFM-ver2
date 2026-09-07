@@ -44,8 +44,8 @@ def test_joint_simplex_b1_ce_contract(path):
     assert config["checkpoint"]["resume"] is None
     for mode in ("training", "inference"):
         assert config["source"]["simplex_prior"][mode] == {
-            "lambda": 0.8,
-            "temperature": 1.0,
+            "lambda": 0.2,
+            "temperature": 4.75 if mode == "training" else 4.25,
             "dirichlet_alpha": 1.0,
         }
 

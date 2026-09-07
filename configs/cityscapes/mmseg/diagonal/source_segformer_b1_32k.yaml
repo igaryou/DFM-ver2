@@ -1,0 +1,4 @@
+extends: ../../diagonal/source_segformer_b1_32k.yaml
+
+dataset:
+  protocol: mmseg

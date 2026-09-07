@@ -20,7 +20,10 @@ from distributed import (
     setup_distributed,
     validate_global_batch_size,
 )
-from inference import sample_segmentation, terminal_state_to_original_prediction
+from inference import (
+    sample_segmentation, sample_segmentation_ensemble,
+    terminal_state_to_original_prediction,
+)
 from metrics import SegmentationMetrics
 from model_factory import build_models
 from utils import autocast_context, seed_everything
@@ -146,7 +149,14 @@ def evaluate(config: dict, checkpoint_path: str | Path) -> dict:
                 image = image.to(device, non_blocking=True)
                 target = target.to(device, non_blocking=True)
                 with autocast_context(config, device):
-                    prediction = sample_segmentation(model, source_model, image, config)
+                    if config["evaluation"]["num_samples"] == 1:
+                        prediction = sample_segmentation(
+                            model, source_model, image, config
+                        )
+                    else:
+                        prediction = sample_segmentation_ensemble(
+                            model, source_model, image, config
+                        )
                 metrics.update(prediction, target)
                 items = [(image, target, prediction)]
             if context.is_main_process and config["evaluation"]["save_predictions"]:
@@ -175,6 +185,13 @@ def evaluate(config: dict, checkpoint_path: str | Path) -> dict:
             metrics.confusion_matrix, context
         )
         result = metrics.compute()
+        result.update({
+            "dataset_protocol": config["dataset"].get("protocol", "mmseg"),
+            "evaluation_resolution": list(config["dataset"]["image_size"]),
+            "original_resolution": bool(config["evaluation"]["original_resolution"]),
+            "num_samples": int(config["evaluation"]["num_samples"]),
+            "aggregation": config["evaluation"]["aggregation"],
+        })
         if context.is_main_process:
             with (output_dir / "metrics.json").open(
                 "w", encoding="utf-8"

@@ -1,0 +1,4 @@
+extends: ../../ecld/joint.yaml
+
+dataset:
+  protocol: mmseg

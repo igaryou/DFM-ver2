@@ -1,0 +1,7 @@
+extends: joint_bounded_gaussian_b1_exponential_path_trainable.yaml
+experiment:
+  name: dfm_original_cityscapes_b1_exponential_path_adaptive_std_trainable_800ep
+  output_dir: /home/igarashi_25/DFM/results/cityscapes/original/b1_exponential_path_adaptive_std_trainable_800ep
+source:
+  bounded_gaussian:
+    variance: {type: entropy_adaptive, rho: 0.95, normalization: rank, eps: 1.0e-8}

@@ -28,6 +28,7 @@ from discrete_flow_maps import (
     sample_prior,
     sample_stage1_times,
 )
+from training_stages import schedule_value, training_stage_for_epoch
 from state_space import (
     prepare_state_targets,
     resize_continuous,
@@ -137,7 +138,10 @@ def compute_model_training_objectives(
     optimizer_step: int = 0,
 ) -> dict[str, Any]:
     """Build the complete endpoint/source graph inside one composite forward."""
-    if operation not in {"stage1_objectives", "stage2_objectives", "joint_objectives"}:
+    if operation not in {
+        "stage1_objectives", "stage2_objectives", "joint_objectives",
+        "source_pretrain_objectives",
+    }:
         raise ValueError(f"Unknown training operation: {operation}")
     config = adapter.config
     endpoint = adapter.endpoint_model
@@ -170,10 +174,17 @@ def compute_model_training_objectives(
                 "ignore_void", True
             ),
         )
+    stages_enabled = training.get("stages", {}).get("enabled", False)
+    active_stage = (
+        training_stage_for_epoch(config, epoch_index) if stages_enabled else None
+    )
     source_only_stage1 = (
-        operation == "stage1_objectives"
-        and not training.get("train_endpoint", True)
-        and float(config["loss"]["primary"]["weight"]) == 0.0
+        operation == "source_pretrain_objectives"
+        or (
+            operation == "stage1_objectives"
+            and not training.get("train_endpoint", True)
+            and float(config["loss"]["primary"]["weight"]) == 0.0
+        )
     )
     x0, source_stats = sample_prior(
         config,
@@ -185,6 +196,10 @@ def compute_model_training_objectives(
         sample_state=not source_only_stage1,
         sampling_mode="training",
         optimizer_step=optimizer_step,
+        epoch_index=epoch_index,
+        source_trainable=(
+            active_stage.train_source if active_stage is not None else None
+        ),
     )
     x1_state = target_state_from_config(targets.one_hot_state, config)
     smoothing = config.get("flow", {}).get("target_smoothing", {})
@@ -223,6 +238,8 @@ def compute_model_training_objectives(
             "consistency_base_weight": zero.detach(),
             "consistency_schedule_weight": zero.detach(),
             "consistency_effective_weight": zero.detach(),
+            "flow_effective_weight": zero.detach(),
+            "flow_schedule_progress": zero.detach(),
             "diagonal_time_mean": zero.detach(),
             "valid_pixel_ratio": targets.valid_mask_full.float().mean().detach()
             if targets.valid_mask_full is not None else zero.new_tensor(1.0),
@@ -416,8 +433,14 @@ def compute_model_training_objectives(
             ))
         else:  # Config validation rejects this before training.
             raise RuntimeError("learnable weighting supports PSD and ESD only")
+    flow_weight, flow_schedule_progress = schedule_value(
+        training.get("flow_weight_schedule", {"type": "fixed"}),
+        epoch_index=epoch_index,
+        optimizer_step=optimizer_step,
+        fallback=1.0,
+    )
     primary_objective = (
-        config["loss"]["primary"]["weight"] * diagonal_loss
+        flow_weight * config["loss"]["primary"]["weight"] * diagonal_loss
     ).float()
     psd_objective = (effective_weight * consistency_loss).float()
     if adapter.consistency_weight_model is not None and consistency_result is None:
@@ -450,6 +473,8 @@ def compute_model_training_objectives(
         ),
         "consistency_schedule_weight": total.new_tensor(schedule_weight),
         "consistency_effective_weight": total.new_tensor(effective_weight),
+        "flow_effective_weight": total.new_tensor(flow_weight),
+        "flow_schedule_progress": total.new_tensor(flow_schedule_progress),
         # Legacy ESD log names are retained for existing dashboards.
         "esd_base_weight": total.new_tensor(
             consistency_config["weight"]

@@ -1,0 +1,25 @@
+extends: ../_base_/cityscapes_256x512_800ep.yaml
+experiment:
+  name: dfm_original_cityscapes_source_segformer_b1_150ep
+  output_dir: /home/igarashi_25/DFM/results/cityscapes/original/source_segformer_b1_150ep
+  stage: diagonal_pretrain
+source:
+  segformer_variant: b1
+  segformer_decoder: standard
+  checkpoint: null
+  freeze: false
+  prior_type: image_gaussian
+  fixed_std: 1.0
+  supervision: {type: cross_entropy, weight: 1.0, include_void: true}
+training:
+  epochs: 150
+  train_endpoint: false
+  checkpoint_interval_epochs: 25
+  validation_epochs: [25, 50, 75, 100, 125, 150]
+  stages: {enabled: false}
+loss:
+  primary: {weight: 0.0}
+  consistency: {enabled: false, weight: 0.0}
+evaluation:
+  source_only: true
+  interval: {unit: epoch, value: 25}

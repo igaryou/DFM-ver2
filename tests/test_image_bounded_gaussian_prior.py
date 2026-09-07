@@ -121,8 +121,8 @@ def test_production_sampling_uses_raw_ce_bounded_state_and_fixed_sigma():
     )
     torch.manual_seed(19)
     mu_raw, _ = source.forward_statistics(image)
-    mu_state = 0.2 * torch.tanh(mu_raw / 8.0)
-    expected_x0 = mu_state + 1.5 * torch.randn_like(mu_state)
+    mu_state = 0.5 * torch.tanh(mu_raw / 4.0)
+    expected_x0 = mu_state + 1.0 * torch.randn_like(mu_state)
     torch.testing.assert_close(x0, expected_x0)
     assert source.forward_calls == 0
 
@@ -134,9 +134,9 @@ def test_production_sampling_uses_raw_ce_bounded_state_and_fixed_sigma():
     assert not torch.isclose(stats["loss_source_ce"], state_ce)
     assert stats["source_mu_state_min"] >= -1
     assert stats["source_mu_state_max"] <= 1
-    assert stats["source_amplitude"] == 0.2
-    assert stats["source_bounded_temperature"] == 8
-    assert stats["source_sigma_mean"] == 1.5
+    assert stats["source_amplitude"] == 0.5
+    assert stats["source_bounded_temperature"] == 4
+    assert stats["source_sigma_mean"] == 1.0
     torch.testing.assert_close(stats["source_mu_raw_abs"], mu_raw.abs().mean())
     torch.testing.assert_close(stats["source_mu_state_abs"], mu_state.abs().mean())
 
@@ -154,8 +154,8 @@ def test_bounded_training_and_inference_draw_the_same_distribution():
         config, image, None, source, sampling_mode="inference"
     )
     torch.testing.assert_close(training, inference)
-    assert training_stats["source_bounded_temperature"] == 8
-    assert inference_stats["source_bounded_temperature"] == 8
+    assert training_stats["source_bounded_temperature"] == 4
+    assert inference_stats["source_bounded_temperature"] == 4
 
 
 @pytest.mark.parametrize(
@@ -182,13 +182,13 @@ def test_bounded_config_inherits_recipe_and_cli_path_overrides():
     parent = load_config(PARENT)
     assert config["source"]["prior_type"] == "image_bounded_gaussian"
     assert config["source"]["bounded_gaussian"] == {
-        "amplitude": 0.2, "temperature": 8.0,
+        "amplitude": 0.5, "temperature": 4.0,
         "variance": {
             "type": "fixed", "rho": 0.0, "normalization": "rank",
             "eps": 1.0e-8,
         },
     }
-    assert config["source"]["fixed_std"] == 1.5
+    assert config["source"]["fixed_std"] == 1.0
     assert config["source"]["learned_logvar"] is False
     assert config["flow"]["target_smoothing"] == {"enabled": False, "p": 0.0}
     for key in ("optimizer", "scheduler"):

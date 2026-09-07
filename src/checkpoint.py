@@ -22,6 +22,8 @@ class TrainingState:
     global_step: int = 0
     micro_step: int = 0
     best_miou: float = float("-inf")
+    current_stage: str | None = None
+    stage_local_progress: int = 0
 
 
 def model_signature(config: dict) -> dict[str, Any]:
@@ -121,6 +123,10 @@ def checkpoint_payload(
         "stage": config["experiment"]["stage"],
         "epoch": epoch,
         "global_step": global_step,
+        # global_step is the completed optimizer update count in this trainer.
+        "optimizer_step": global_step,
+        "current_stage": metrics.get("training_stage", config["experiment"]["stage"]),
+        "stage_local_progress": metrics.get("stage_local_epoch", 0),
         "model": raw_model.state_dict(),
         "source_model": raw_source.state_dict() if raw_source is not None else None,
         "optimizer": optimizer.state_dict() if optimizer is not None else None,
@@ -567,6 +573,8 @@ def initialize_or_resume(
             global_step=int(checkpoint["global_step"]),
             micro_step=int(checkpoint.get("micro_step", 0)),
             best_miou=float(metrics.get("best_mIoU", metrics.get("mIoU", float("-inf")))),
+            current_stage=checkpoint.get("current_stage"),
+            stage_local_progress=int(checkpoint.get("stage_local_progress", 0)),
         )
     return TrainingState()
 

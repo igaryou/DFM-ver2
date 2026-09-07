@@ -1,0 +1,21 @@
+extends: ../_base_/cityscapes_256x512_800ep.yaml
+experiment:
+  name: dfm_original_cityscapes_b1_bounded_gaussian_joint_800ep
+  output_dir: /home/igarashi_25/DFM/results/cityscapes/original/bounded_gaussian_joint_800ep
+source:
+  segformer_variant: b1
+  segformer_decoder: standard
+  checkpoint: null
+  freeze: false
+  prior_type: image_bounded_gaussian
+  fixed_std: 1.0
+  bounded_gaussian:
+    amplitude: 0.5
+    temperature: 4.0
+    variance: {type: fixed}
+  supervision: {type: cross_entropy, weight: 0.2, include_void: true}
+training:
+  stages:
+    enabled: true
+    source_pretrain: {enabled: false}
+    flow_training: {enabled: true, start_epoch: 0, end_epoch: 800, train_source: true, train_flow: true}

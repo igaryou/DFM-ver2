@@ -33,6 +33,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     },
     "dataset": {
         "name": "cityscapes",
+        "protocol": "mmseg",
         "root": "",
         "num_classes": 20,
         "eval_num_classes": 19,
@@ -47,6 +48,12 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "num_workers": 8,
         "pin_memory": True,
         "persistent_workers": False,
+        "fixed_resize": {
+            "enabled": False,
+            "image_interpolation": "bilinear",
+            "mask_interpolation": "nearest",
+            "antialias": True,
+        },
     },
     "augmentation": {
         "enabled": True,
@@ -151,6 +158,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
                 "initial": None,
                 "final": None,
                 "steps": None,
+                "unit": "optimizer_step",
+                "start": 0,
+                "start_epoch": None,
+                "duration": None,
             },
         },
         "diagnostics": {
@@ -221,6 +232,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     },
     "training": {
         "train_endpoint": True,
+        "schedule_unit": "auto",
         "epochs": 150,
         "max_iterations": None,
         "max_optimizer_steps": None,
@@ -253,6 +265,21 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "checkpoint_interval_epochs": 10,
         "checkpoint_interval_steps": None,
         "validation_epochs": [50, 100, 150],
+        "stages": {
+            "enabled": False,
+            "source_pretrain": {
+                "enabled": False, "start_epoch": 0, "end_epoch": 0,
+                "train_source": True, "train_flow": False,
+            },
+            "flow_training": {
+                "enabled": False, "start_epoch": 0, "end_epoch": 150,
+                "train_source": True, "train_flow": True,
+            },
+        },
+        "flow_weight_schedule": {
+            "type": "fixed", "unit": "epoch", "start_epoch": 0,
+            "duration": None, "initial": 1.0, "final": 1.0,
+        },
     },
     "loss": {
         "ignore_index": None,
@@ -331,6 +358,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "split": "val",
         "batch_size": 4,
         "num_steps": 15,
+        "num_samples": 1,
+        "aggregation": "probability_mean",
         "sampler": "flow_map",
         "save_predictions": True,
         "max_visualizations": 16,
@@ -437,6 +466,10 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
     dataset = config["dataset"]
     if dataset["name"] not in {"cityscapes", "ade20k"}:
         raise ValueError("dataset.name must be cityscapes or ade20k")
+    if dataset["protocol"] not in {"mmseg", "original"}:
+        raise ValueError("dataset.protocol must be mmseg or original")
+    if dataset["name"] != "cityscapes" and dataset["protocol"] != "mmseg":
+        raise ValueError("dataset.protocol=original is currently Cityscapes-only")
     if dataset["num_classes"] != config["model"]["num_classes"]:
         raise ValueError("dataset.num_classes and model.num_classes must match")
     exclude_void = config["evaluation"]["exclude_void_from_prediction"]
@@ -517,6 +550,22 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
             raise ValueError("ADE20K random_crop.ignore_index must be 0")
         if config["augmentation"]["pad"]["mask_value"] != 0:
             raise ValueError("ADE20K padding mask value must be 0")
+    fixed_resize = dataset["fixed_resize"]
+    if fixed_resize["image_interpolation"] != "bilinear":
+        raise ValueError("dataset.fixed_resize.image_interpolation must be bilinear")
+    if fixed_resize["mask_interpolation"] != "nearest":
+        raise ValueError("dataset.fixed_resize.mask_interpolation must be nearest")
+    if not isinstance(fixed_resize["antialias"], bool):
+        raise ValueError("dataset.fixed_resize.antialias must be boolean")
+    if dataset["protocol"] == "original":
+        if fixed_resize["enabled"] is not True:
+            raise ValueError("original protocol requires dataset.fixed_resize.enabled=true")
+        if config["evaluation"]["original_resolution"]:
+            raise ValueError("original protocol evaluates directly at fixed resolution")
+        augmentation = config["augmentation"]
+        for name in ("random_resize", "random_crop", "photometric_distortion", "pad"):
+            if augmentation[name]["enabled"]:
+                raise ValueError(f"original protocol requires augmentation.{name}.enabled=false")
     if len(config["dataset"]["image_size"]) != 2:
         raise ValueError("dataset.image_size must be [height, width]")
     if config["dataset"]["crop_size"] is not None and len(config["dataset"]["crop_size"]) != 2:
@@ -524,6 +573,10 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
     if config["runtime"]["amp_dtype"] not in {"bf16", "fp16"}:
         raise ValueError("runtime.amp_dtype must be bf16 or fp16")
     training = config["training"]
+    if training["schedule_unit"] not in {"auto", "epoch", "step", "optimizer_step"}:
+        raise ValueError("training.schedule_unit must be auto, epoch, step, or optimizer_step")
+    if dataset["protocol"] == "original" and training["schedule_unit"] != "epoch":
+        raise ValueError("original protocol requires training.schedule_unit=epoch")
     if (
         isinstance(training["grad_accum_steps"], bool)
         or not isinstance(training["grad_accum_steps"], int)
@@ -546,6 +599,45 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
         raise ValueError(
             "training.checkpoint_interval_steps must be null or a positive integer"
         )
+    stages = training["stages"]
+    if not isinstance(stages["enabled"], bool):
+        raise ValueError("training.stages.enabled must be boolean")
+    if stages["enabled"]:
+        intervals = []
+        for stage_name in ("source_pretrain", "flow_training"):
+            stage_config = stages[stage_name]
+            for flag in ("enabled", "train_source", "train_flow"):
+                if not isinstance(stage_config[flag], bool):
+                    raise ValueError(f"training.stages.{stage_name}.{flag} must be boolean")
+            if not stage_config["enabled"]:
+                continue
+            start_epoch, end_epoch = stage_config["start_epoch"], stage_config["end_epoch"]
+            if (isinstance(start_epoch, bool) or isinstance(end_epoch, bool)
+                    or not isinstance(start_epoch, int) or not isinstance(end_epoch, int)
+                    or not 0 <= start_epoch < end_epoch <= training["epochs"]):
+                raise ValueError(f"training.stages.{stage_name} has an invalid epoch interval")
+            intervals.append((start_epoch, end_epoch, stage_name))
+        intervals.sort()
+        if not intervals or intervals[0][0] != 0 or intervals[-1][1] != training["epochs"]:
+            raise ValueError("enabled training stages must cover epochs [0, training.epochs)")
+        if any(left[1] != right[0] for left, right in zip(intervals, intervals[1:])):
+            raise ValueError("enabled training stages must be contiguous and non-overlapping")
+        if config["source"]["freeze"] and any(
+            stages[name]["enabled"] and stages[name]["train_source"]
+            for name in ("source_pretrain", "flow_training")
+        ):
+            raise ValueError("source.freeze=true conflicts with a stage train_source=true")
+    flow_schedule = training["flow_weight_schedule"]
+    if flow_schedule["type"] not in {"fixed", "linear"}:
+        raise ValueError("training.flow_weight_schedule.type must be fixed or linear")
+    if flow_schedule["type"] == "linear":
+        if flow_schedule["unit"] not in {"epoch", "step", "optimizer_step"}:
+            raise ValueError("training.flow_weight_schedule.unit is invalid")
+        if (flow_schedule["duration"] is None or isinstance(flow_schedule["duration"], bool)
+                or not isinstance(flow_schedule["duration"], int) or flow_schedule["duration"] <= 0):
+            raise ValueError("training.flow_weight_schedule.duration must be positive")
+        if any(not isinstance(flow_schedule[key], (int, float)) for key in ("initial", "final")):
+            raise ValueError("training.flow_weight_schedule endpoints must be numeric")
     scheduler = training["scheduler"]
     if scheduler["step_unit"] not in {"epoch", "optimizer_step"}:
         raise ValueError("training.scheduler.step_unit must be epoch or optimizer_step")
@@ -573,6 +665,13 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
         raise ValueError(
             "training.scheduler.warmup_start_factor must satisfy 0 < factor <= 1"
         )
+    evaluation = config["evaluation"]
+    if isinstance(evaluation["num_steps"], bool) or not isinstance(evaluation["num_steps"], int) or evaluation["num_steps"] <= 0:
+        raise ValueError("evaluation.num_steps must be a positive integer")
+    if isinstance(evaluation["num_samples"], bool) or not isinstance(evaluation["num_samples"], int) or evaluation["num_samples"] <= 0:
+        raise ValueError("evaluation.num_samples must be a positive integer")
+    if evaluation["aggregation"] not in {"probability_mean", "majority_vote"}:
+        raise ValueError("evaluation.aggregation must be probability_mean or majority_vote")
     evaluation_interval = config["evaluation"]["interval"]
     if evaluation_interval["unit"] not in {"epoch", "optimizer_step"}:
         raise ValueError("evaluation.interval.unit must be epoch or optimizer_step")
@@ -778,11 +877,39 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
                 raise ValueError(
                     f"source.supervision.weight_schedule.{key} must be non-negative"
                 )
-        steps = weight_schedule["steps"]
-        if isinstance(steps, bool) or not isinstance(steps, int) or steps <= 0:
+        unit = weight_schedule.get("unit", "optimizer_step")
+        if unit not in {"epoch", "step", "optimizer_step"}:
             raise ValueError(
-                "source.supervision.weight_schedule.steps must be a positive integer"
+                "source.supervision.weight_schedule.unit must be epoch or optimizer_step"
             )
+        duration = weight_schedule.get("duration")
+        if duration is None:
+            duration = weight_schedule.get("steps")
+        if (
+            isinstance(duration, bool)
+            or not isinstance(duration, int)
+            or duration <= 0
+        ):
+            label = "duration" if unit == "epoch" else "steps"
+            raise ValueError(
+                f"source.supervision.weight_schedule.{label} must be a positive integer"
+            )
+        start_epoch = weight_schedule.get("start_epoch")
+        start = start_epoch if start_epoch is not None else weight_schedule.get("start", 0)
+        if isinstance(start, bool) or not isinstance(start, int) or start < 0:
+            raise ValueError(
+                "source.supervision.weight_schedule start must be non-negative"
+            )
+    if (
+        weight_schedule["type"] == "linear"
+        and weight_schedule.get("unit", "optimizer_step") == "optimizer_step"
+        and weight_schedule.get("start", 0) == 0
+        and weight_schedule.get("start_epoch") is None
+        and weight_schedule.get("duration") is None
+    ):
+        # Preserve the resolved shape of the original steps-based schedule.
+        for key in ("unit", "start", "start_epoch", "duration"):
+            weight_schedule.pop(key, None)
     if not isinstance(supervision.get("include_void", False), bool):
         raise ValueError("source.supervision.include_void must be boolean")
     source_diagnostics = config["source"]["diagnostics"]

@@ -1,0 +1,4 @@
+extends: ../../esd/swin_t_core_resume.yaml
+
+dataset:
+  protocol: mmseg

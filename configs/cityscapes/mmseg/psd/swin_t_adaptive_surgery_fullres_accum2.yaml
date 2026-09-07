@@ -1,0 +1,4 @@
+extends: ../../psd/swin_t_adaptive_surgery_fullres_accum2.yaml
+
+dataset:
+  protocol: mmseg

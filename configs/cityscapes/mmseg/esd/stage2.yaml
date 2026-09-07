@@ -1,0 +1,4 @@
+extends: ../../esd/stage2.yaml
+
+dataset:
+  protocol: mmseg

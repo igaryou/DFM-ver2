@@ -1,0 +1,4 @@
+extends: ../../csd/joint.yaml
+
+dataset:
+  protocol: mmseg

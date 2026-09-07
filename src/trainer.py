@@ -41,6 +41,7 @@ from distributed import (
 )
 from inference import (
     sample_segmentation,
+    sample_segmentation_ensemble,
     state_to_original_continuous,
     terminal_state_to_original_prediction,
 )
@@ -50,6 +51,12 @@ from source_model import source_statistics
 from training_objectives import (
     DDPCompatibleTrainingModel,
     run_model_training_objectives,
+)
+from training_stages import (
+    set_stage_trainability,
+    stage_operation,
+    staged_training_enabled,
+    training_stage_for_epoch,
 )
 from utils import (
     append_jsonl,
@@ -108,6 +115,10 @@ MAX_REDUCTION_KEYS.update({
 })
 
 DFM_RECIPE_SUMMARY_KEYS = (
+    "flow_effective_weight",
+    "flow_schedule_progress",
+    "path_difficulty_mean",
+    "path_difficulty_std",
     "loss_diagonal_raw",
     "loss_diagonal_adaptive",
     "diagonal_adaptive_weight_mean",
@@ -492,6 +503,14 @@ def _wandb_epoch_payload(
         "optimizer_updates_per_second": "optimizer_updates_per_second",
         "grad_norm": "grad_norm",
         "epoch": "epoch",
+        "optimizer_step": "optimizer_step",
+        "training_stage": "training_stage",
+        "stage_local_epoch": "stage_local_epoch",
+        "source_trainable": "source_trainable",
+        "flow_trainable": "flow_trainable",
+        "flow_effective_weight": "flow_effective_weight",
+        "source_ce_effective_weight": "source_ce_effective_weight",
+        "consistency_effective_weight": "consistency_weight",
     }
     payload = {
         f"epoch/{output_key}": report[report_key]
@@ -507,6 +526,33 @@ def _wandb_epoch_payload(
     for output_key, _ in SOURCE_SUMMARY_ALIASES:
         if output_key in report:
             payload[f"epoch/{output_key}"] = report[output_key]
+    exact = {
+        "epoch/training/stage": "training_stage",
+        "epoch/training/epoch": "epoch",
+        "epoch/training/global_step": "optimizer_step",
+        "epoch/training/optimizer_step": "optimizer_step",
+        "epoch/loss/total": "loss_total",
+        "epoch/loss/flow": "loss_primary",
+        "epoch/loss/source_ce": "source_ce_raw",
+        "epoch/loss/consistency": "loss_consistency",
+        "epoch/weight/flow": "flow_effective_weight",
+        "epoch/weight/source_ce": "source_ce_effective_weight",
+        "epoch/weight/consistency": "consistency_weight",
+        "epoch/source/frozen": "source_frozen",
+        "epoch/source/lr": "source_lr",
+        "epoch/model/lr": "lr",
+        "epoch/source/mu_abs_mean": "mu_abs",
+        "epoch/source/mu_min": "mu_min",
+        "epoch/source/mu_max": "mu_max",
+        "epoch/source/std_mean": "sigma_mean",
+        "epoch/path/difficulty_mean": "path_difficulty_mean",
+        "epoch/path/difficulty_std": "path_difficulty_std",
+    }
+    payload.update({
+        output_key: report[report_key]
+        for output_key, report_key in exact.items()
+        if report_key in report
+    })
     return payload
 
 
@@ -833,6 +879,8 @@ def validate_source_only(
     endpoint, source = adapter.endpoint_model, adapter.source_model
     if source is None:
         raise RuntimeError("source-only validation requires a source model")
+    endpoint_was_training = endpoint.training
+    source_was_training = source.training
     endpoint.eval()
     source.eval()
     classes = config["dataset"]["num_classes"]
@@ -992,8 +1040,8 @@ def validate_source_only(
             1.0 - accuracy if has_values else 0.0
         )
         result[f"source_entropy_bin_{index}_mean"] = float(bin_entropy[index] / count)
-    endpoint.train(config["training"].get("train_endpoint", True))
-    source.train(not config["source"]["freeze"])
+    endpoint.train(endpoint_was_training)
+    source.train(source_was_training)
     return result
 
 
@@ -1012,6 +1060,8 @@ def validate(
     adapter = unwrap_model(training_model)
     endpoint = adapter.endpoint_model
     source = adapter.source_model
+    endpoint_was_training = endpoint.training
+    source_was_training = source.training if source is not None else False
     endpoint.eval()
     if source is not None:
         source.eval()
@@ -1068,7 +1118,12 @@ def validate(
             image = image.to(context.device, non_blocking=True)
             target = target.to(context.device, non_blocking=True)
             with autocast_context(config, context.device):
-                prediction = sample_segmentation(endpoint, source, image, config)
+                if config["evaluation"]["num_samples"] == 1:
+                    prediction = sample_segmentation(endpoint, source, image, config)
+                else:
+                    prediction = sample_segmentation_ensemble(
+                        endpoint, source, image, config
+                    )
             metrics.update(prediction, target)
             visualization_items = [(image, target, prediction)]
         if context.is_main_process:
@@ -1099,9 +1154,9 @@ def validate(
         metrics.confusion_matrix, context
     )
     result = metrics.compute()
-    endpoint.train()
+    endpoint.train(endpoint_was_training)
     if source is not None:
-        source.train(not config["source"]["freeze"])
+        source.train(source_was_training)
     return result
 
 
@@ -1292,7 +1347,20 @@ def run_training(config: dict, *, joint_entrypoint: bool = False) -> dict:
             logger if context.is_main_process else None,
             consistency_weight_model=adapter.consistency_weight_model,
         )
+        active_stage = training_stage_for_epoch(
+            config, min(state.start_epoch, config["training"]["epochs"] - 1)
+        )
+        operation = stage_operation(config, active_stage)
+        if staged_training_enabled(config):
+            # DDP captures the set of trainable parameters when it is built.
+            # Apply the resumed stage before the first wrap, then rebuild the
+            # lightweight wrapper only at a stage boundary. The underlying
+            # Parameter objects and optimizer state remain unchanged.
+            set_stage_trainability(
+                adapter.endpoint_model, adapter.source_model, active_stage
+            )
         training_model = wrap_ddp(adapter, context, config)
+        wrapped_stage_name = active_stage.name
         # Model initialization/checkpoint loading used the same seed. From here on,
         # rank-local stochastic paths intentionally differ.
         torch.manual_seed(config["experiment"]["seed"] + context.rank)
@@ -1316,7 +1384,6 @@ def run_training(config: dict, *, joint_entrypoint: bool = False) -> dict:
             consistency_enabled=consistency_config["enabled"],
             consistency_start_epoch=consistency_config["start_epoch"],
         )
-        operation = _operation_for_stage(stage)
         metrics_path = output_dir / "metrics.jsonl"
         total_iterations = getattr(state, "micro_step", 0)
         last_metrics: dict = {"best_mIoU": state.best_miou}
@@ -1339,9 +1406,33 @@ def run_training(config: dict, *, joint_entrypoint: bool = False) -> dict:
             checkpoint_micro_step: int,
         ) -> dict:
             previous_best = state.best_miou
-            result = validate(
-                config, training_model, val_loader, context, output_dir
-            )
+            if staged_training_enabled(config) and active_stage.source_only:
+                result = validate_source_only(
+                    config, training_model, val_loader, context, output_dir
+                )
+            else:
+                result = validate(
+                    config, training_model, val_loader, context, output_dir
+                )
+                if staged_training_enabled(config):
+                    result.update({
+                        "flow_mIoU": result["mIoU"],
+                        "flow_pixel_acc": result["pixel_acc"],
+                        "flow_mAcc": result["mAcc"],
+                    })
+                    source_result = validate_source_only(
+                        config, training_model, val_loader, context, output_dir
+                    )
+                    result.update({
+                        key: value for key, value in source_result.items()
+                        if key.startswith("source_")
+                    })
+            result.update({
+                "training_stage": active_stage.name,
+                "stage_local_epoch": active_stage.local_epoch(
+                    max(displayed_epoch - 1, 0)
+                ),
+            })
             is_new_best = result["mIoU"] > previous_best
             if is_new_best:
                 state.best_miou = result["mIoU"]
@@ -1366,13 +1457,12 @@ def run_training(config: dict, *, joint_entrypoint: bool = False) -> dict:
                         "validation/pixel_acc": result["pixel_acc"],
                         "validation/mAcc": result["mAcc"],
                     }
-                    if config["evaluation"].get("source_only", False):
-                        wandb_payload.update({
-                            f"validation/{key}": value
-                            for key, value in result.items()
-                            if key.startswith("source_")
-                            and isinstance(value, (int, float))
-                        })
+                    wandb_payload.update({
+                        f"validation/{key}": value
+                        for key, value in result.items()
+                        if (key.startswith("source_") or key.startswith("flow_"))
+                        and isinstance(value, (int, float))
+                    })
                     wandb_run.log(wandb_payload, step=state.global_step)
             if is_new_best and trigger in {
                 "optimizer_step_interval", "final_optimizer_step"
@@ -1410,9 +1500,26 @@ def run_training(config: dict, *, joint_entrypoint: bool = False) -> dict:
                 and state.global_step >= max_optimizer_steps
             ):
                 break
-            training_model.train()
+            active_stage = training_stage_for_epoch(config, epoch_index)
+            operation = stage_operation(config, active_stage)
             adapter = unwrap_model(training_model)
-            if config["source"]["freeze"] and adapter.source_model is not None:
+            if (
+                staged_training_enabled(config)
+                and active_stage.name != wrapped_stage_name
+            ):
+                set_stage_trainability(
+                    adapter.endpoint_model, adapter.source_model, active_stage
+                )
+                training_model = wrap_ddp(adapter, context, config)
+                wrapped_stage_name = active_stage.name
+                adapter = unwrap_model(training_model)
+            training_model.train()
+            if staged_training_enabled(config):
+                # Module.train() is recursive, so restore stage-specific modes.
+                set_stage_trainability(
+                    adapter.endpoint_model, adapter.source_model, active_stage
+                )
+            elif config["source"]["freeze"] and adapter.source_model is not None:
                 adapter.source_model.eval()
             if train_sampler is not None:
                 train_sampler.set_epoch(epoch_index)
@@ -1420,8 +1527,13 @@ def run_training(config: dict, *, joint_entrypoint: bool = False) -> dict:
                 min_keys=MIN_REDUCTION_KEYS,
                 max_keys=MAX_REDUCTION_KEYS,
             )
-            epoch_lr = float(optimizer.param_groups[0]["lr"])
+            epoch_lr = (
+                float(optimizer.param_groups[0]["lr"])
+                if active_stage.train_flow else 0.0
+            )
             epoch_source_lr = _parameter_group_lr(optimizer, "source")
+            if epoch_source_lr is not None and not active_stage.train_source:
+                epoch_source_lr = 0.0
             epoch_consistency_weight_lr = _parameter_group_lr(
                 optimizer, "psd_weight"
             )
@@ -1646,7 +1758,7 @@ def run_training(config: dict, *, joint_entrypoint: bool = False) -> dict:
             reduced_epoch = reduce_epoch_metric_meter(epoch_meter, context)
             consistency_type = (
                 "none"
-                if stage == "diagonal_pretrain"
+                if active_stage.source_only or stage == "diagonal_pretrain"
                 else config["loss"]["consistency"]["type"]
             )
             epoch_report = _build_epoch_report(
@@ -1669,13 +1781,19 @@ def run_training(config: dict, *, joint_entrypoint: bool = False) -> dict:
                 epoch_source_lr=epoch_source_lr,
                 epoch_consistency_weight_lr=epoch_consistency_weight_lr,
             )
+            epoch_report.update({
+                "training_stage": active_stage.name,
+                "stage_local_epoch": active_stage.local_epoch(epoch_index),
+                "source_trainable": int(active_stage.train_source),
+                "flow_trainable": int(active_stage.train_flow),
+            })
             raw_epoch_metrics = {
                 key: float(value) for key, value in reduced_epoch.items()
             }
             if context.is_main_process:
                 append_jsonl(metrics_path, {
                     "scope": "epoch",
-                    "stage": stage,
+                    "stage": active_stage.name,
                     "consistency_type": consistency_type,
                     **epoch_report,
                     **{

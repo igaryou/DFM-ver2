@@ -1,0 +1,4 @@
+extends: ../../../_base_/cityscapes/swin_t_160k.yaml
+
+dataset:
+  protocol: mmseg

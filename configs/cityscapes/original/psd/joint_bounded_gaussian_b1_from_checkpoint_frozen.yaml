@@ -1,0 +1,15 @@
+extends: joint_bounded_gaussian_b1_800ep.yaml
+
+experiment:
+  name: dfm_original_cityscapes_b1_checkpoint_frozen_800ep
+  output_dir: /home/igarashi_25/DFM/results/cityscapes/original/b1_checkpoint_frozen_800ep
+
+source:
+  checkpoint: /path/to/source_checkpoint.pt
+  freeze: true
+
+training:
+  stages:
+    enabled: true
+    source_pretrain: {enabled: false}
+    flow_training: {enabled: true, start_epoch: 0, end_epoch: 800, train_source: false, train_flow: true}
