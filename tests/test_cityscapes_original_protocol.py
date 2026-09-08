@@ -110,20 +110,20 @@ def test_original_representative_resolves_and_builds_rrdb_flow_encoder():
     assert model_config["fusion_channels"] == 128
     assert model_config["rrdb_blocks"] == 3
     assert model_config["rrdb_growth_channels"] == 32
-    assert model_config["state_downsample_factor"] == 4
+    assert model_config["state_downsample_factor"] == 1
     assert config["source"]["segformer_variant"] == "b1"
     assert config["source"]["segformer_decoder"] == "standard"
 
     endpoint = DiscreteFlowMapModel(model_config)
     assert isinstance(endpoint.image_encoder, ImageEncoder)
-    assert endpoint.image_encoder.downsample_factor == 4
+    assert endpoint.image_encoder.downsample_factor == 1
     assert endpoint.image_encoder.first.out_channels == 128
     assert len(endpoint.image_encoder.body) == 3
     first_dense_conv = endpoint.image_encoder.body[0].blocks[0].layers[0]
     assert first_dense_conv.out_channels == 32
 
     feature = endpoint.encode_image(torch.randn(1, 3, 32, 64))
-    assert feature.shape == (1, 128, 8, 16)
+    assert feature.shape == (1, 128, 32, 64)
 
 
 def test_original_train_and_val_are_fixed_size_and_mask_is_nearest():
@@ -330,7 +330,7 @@ class _TinySource(nn.Module):
 
     def forward_statistics(self, image: torch.Tensor):
         mean = self.logits[None, :, None, None].expand(
-            image.shape[0], 4, image.shape[-2] // 4, image.shape[-1] // 4
+            image.shape[0], 4, image.shape[-2], image.shape[-1]
         )
         return mean, torch.zeros_like(mean)
 
@@ -346,7 +346,7 @@ class _TinyFlowEndpoint(nn.Module):
         self.state_projection = nn.Conv2d(classes, classes, 1)
 
     def encode_image(self, image: torch.Tensor) -> torch.Tensor:
-        return F.avg_pool2d(self.image_projection(image), 4)
+        return self.image_projection(image)
 
     def forward_logits_with_image_feat(self, state, image_feat, s, t):
         del s, t

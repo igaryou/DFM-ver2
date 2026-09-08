@@ -222,6 +222,48 @@ def test_staged_joint_source_boundary_accepts_shifted_stage2_schedule():
         _validate_stage2_init_checkpoint(unsafe, stage2_config, "unsafe.pt")
 
 
+def test_source_only_init_accepts_factor4_checkpoint_and_keeps_flow_fresh(tmp_path):
+    saved_config = load_config(
+        ROOT / "configs/cityscapes/original/psd/"
+        "joint_bounded_gaussian_b1_exponential_path_trainable.yaml"
+    )
+    saved_config = copy.deepcopy(saved_config)
+    saved_config["model"]["state_downsample_factor"] = 4
+    stage2_config = load_config(
+        ROOT / "configs/cityscapes/original/psd/"
+        "joint_bounded_gaussian_b1_exponential_path_trainable_"
+        "stage2_from_epoch0150.yaml"
+    )
+    stage2_config = copy.deepcopy(stage2_config)
+    init_path = tmp_path / "factor4-stage1.pt"
+    stage2_config["checkpoint"]["init_from"] = str(init_path)
+    assert stage2_config["checkpoint"]["init_source_only"] is True
+
+    saved_source = torch.nn.Linear(3, 2)
+    with torch.no_grad():
+        saved_source.weight.fill_(7.0)
+    checkpoint = {
+        "stage": "joint_training", "epoch": 150,
+        "current_stage": "source_pretrain", "config": saved_config,
+        "model_signature": model_signature(saved_config),
+        "model": {"incompatible_flow_weight": torch.zeros(1)},
+        "source_model": saved_source.state_dict(),
+    }
+    torch.save(checkpoint, init_path)
+
+    model, optimizer, scheduler, scaler = objects()
+    initial_model = copy.deepcopy(model.state_dict())
+    source = torch.nn.Linear(3, 2)
+    state = initialize_or_resume(
+        stage2_config, model, source, optimizer, scheduler, scaler
+    )
+    for key, value in initial_model.items():
+        torch.testing.assert_close(model.state_dict()[key], value)
+    torch.testing.assert_close(source.weight, saved_source.weight)
+    assert state.start_epoch == 0 and state.global_step == 0
+    assert optimizer.state == {}
+
+
 def test_joint_checkpoint_after_stage1_boundary_is_rejected(tmp_path):
     _, stage2 = configs(tmp_path)
     joint = joint_config_from(stage2, start_epoch=500)

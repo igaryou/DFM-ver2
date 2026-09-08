@@ -1,0 +1,10 @@
+extends: joint_bounded_gaussian_b1_exponential_path_trainable_stage2_from_epoch0150.yaml
+
+experiment:
+  name: dfm_original_cityscapes_b1_exponential_path_frozen_stage2_from_epoch0150_650ep
+  output_dir: /home/igarashi_25/DFM/results/cityscapes/original/b1_exponential_path_frozen_stage2_from_epoch0150_650ep
+
+training:
+  stages:
+    flow_training:
+      train_source: false

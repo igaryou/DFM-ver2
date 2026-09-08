@@ -262,7 +262,8 @@ def _validate_stage2_init_checkpoint(
             f"stage={saved_stage!r}, path={path}"
         )
 
-    if checkpoint.get("model") is None:
+    source_only = bool(config["checkpoint"].get("init_source_only", False))
+    if not source_only and checkpoint.get("model") is None:
         raise RuntimeError(
             f"Stage 2 initialization checkpoint has no model state: {path}"
         )
@@ -289,11 +290,18 @@ def _validate_stage2_init_checkpoint(
         supervision = signature.get("source", {}).get("supervision")
         if isinstance(supervision, dict):
             supervision.pop("weight_schedule", None)
-    if comparable_saved != comparable_current:
+    saved_for_comparison = (
+        comparable_saved.get("source") if source_only else comparable_saved
+    )
+    current_for_comparison = (
+        comparable_current.get("source") if source_only else comparable_current
+    )
+    if saved_for_comparison != current_for_comparison:
+        component = "source" if source_only else "model/source"
         raise RuntimeError(
             "Stage 2 initialization checkpoint is incompatible with the current "
-            "model/source configuration; "
-            f"saved={comparable_saved}; current={comparable_current}"
+            f"{component} configuration; saved={saved_for_comparison}; "
+            f"current={current_for_comparison}"
         )
 
 
@@ -527,10 +535,12 @@ def initialize_or_resume(
                     "Stage 2 initialization checkpoint has no source_model state: "
                     f"{init_from}"
                 )
-        model_state = _model_state_for_current_transformers(
-            _without_module_prefix(checkpoint["model"]), model
-        )
-        model.load_state_dict(model_state, strict=strict)
+        source_only = bool(checkpoint_config.get("init_source_only", False))
+        if not source_only:
+            model_state = _model_state_for_current_transformers(
+                _without_module_prefix(checkpoint["model"]), model
+            )
+            model.load_state_dict(model_state, strict=strict)
         if source_model is not None:
             source_state = _source_state_for_current_transformers(
                 _without_module_prefix(saved_source), source_model
@@ -540,7 +550,10 @@ def initialize_or_resume(
             f"Loaded Stage 2 initialization checkpoint: {init_from}",
             f"Checkpoint original stage: {checkpoint.get('stage')}",
             f"Checkpoint completed epoch: {checkpoint.get('epoch', 'unknown')}",
-            "Loaded states: model, source_model",
+            (
+                "Loaded states: source_model; model newly initialized"
+                if source_only else "Loaded states: model, source_model"
+            ),
             "Optimizer state: newly initialized",
             "Scheduler state: newly initialized",
             "Scaler state: newly initialized",

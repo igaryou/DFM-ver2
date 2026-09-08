@@ -350,6 +350,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "checkpoint": {
         "resume": None,
         "init_from": None,
+        "init_source_only": False,
         "load_optimizer": True,
         "load_scheduler": True,
         "strict_model": True,
@@ -1052,6 +1053,11 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("invalid_teacher.strategy must be clamp, mask_pixel, or skip_batch")
     if config["checkpoint"]["init_from"] and config["checkpoint"]["resume"]:
         raise ValueError("checkpoint.init_from and checkpoint.resume are mutually exclusive")
+    init_source_only = config["checkpoint"]["init_source_only"]
+    if not isinstance(init_source_only, bool):
+        raise ValueError("checkpoint.init_source_only must be boolean")
+    if init_source_only and not config["checkpoint"]["init_from"]:
+        raise ValueError("checkpoint.init_source_only requires checkpoint.init_from")
     consistency = config["loss"]["consistency"]
     adaptive_diagonal = config["loss"]["primary"]["adaptive_weighting"]
     if not isinstance(adaptive_diagonal["enabled"], bool):

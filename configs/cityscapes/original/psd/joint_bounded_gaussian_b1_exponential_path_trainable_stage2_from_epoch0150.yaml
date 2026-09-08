@@ -6,6 +6,7 @@ experiment:
 
 checkpoint:
   init_from: /home/igarashi_25/DFM/results/cityscapes/original/b1_exponential_path_adaptive_std_trainable_800ep/epoch_0150.pt
+  init_source_only: true
 
 source:
   supervision:

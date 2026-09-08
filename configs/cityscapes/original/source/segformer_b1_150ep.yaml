@@ -3,6 +3,8 @@ experiment:
   name: dfm_original_cityscapes_source_segformer_b1_150ep
   output_dir: /home/igarashi_25/DFM/results/cityscapes/original/source_segformer_b1_150ep
   stage: diagonal_pretrain
+model:
+  state_downsample_factor: 1
 source:
   segformer_variant: b1
   segformer_decoder: standard
