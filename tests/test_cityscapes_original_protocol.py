@@ -38,6 +38,11 @@ REPRESENTATIVE = ROOT / (
     "configs/cityscapes/original/psd/"
     "joint_bounded_gaussian_b1_exponential_path_adaptive_std_trainable.yaml"
 )
+STAGE2_FROM_150 = ROOT / (
+    "configs/cityscapes/original/psd/"
+    "joint_bounded_gaussian_b1_exponential_path_trainable_"
+    "stage2_from_epoch0150.yaml"
+)
 MMSEG = ROOT / "configs/_base_/cityscapes/swin_t_160k.yaml"
 MMSEG_WRAPPER = ROOT / "configs/cityscapes/mmseg/psd/swin_t_linear_160k.yaml"
 
@@ -72,6 +77,30 @@ def test_original_config_resolves_protocol_and_reference_recipe():
     assert config["flow"]["path"]["scheduler"] == {
         "type": "exponential", "beta": 2.0, "difficulty_gamma": 1.0
     }
+
+
+def test_stage2_from_epoch150_config_resolves_shifted_schedules():
+    config = load_config(STAGE2_FROM_150)
+    assert config["checkpoint"]["init_from"].endswith("epoch_0150.pt")
+    assert config["training"]["epochs"] == 650
+    assert config["training"]["stages"]["source_pretrain"]["enabled"] is False
+    flow_stage = config["training"]["stages"]["flow_training"]
+    assert flow_stage == {
+        "enabled": True, "start_epoch": 0, "end_epoch": 650,
+        "train_source": True, "train_flow": True,
+    }
+    assert config["training"]["scheduler"]["stage_aware"] is True
+    assert config["training"]["scheduler"]["warmup_epochs"] == 10
+    flow_schedule = config["training"]["flow_weight_schedule"]
+    assert flow_schedule["start_epoch"] == 0
+    assert flow_schedule["duration"] == 10
+    source_schedule = config["source"]["supervision"]["weight_schedule"]
+    assert source_schedule["start_epoch"] == 0
+    assert source_schedule["duration"] == 50
+    assert source_schedule["initial"] == 1.0
+    assert source_schedule["final"] == 0.2
+    assert training_stage_for_epoch(config, 0).name == "flow_training"
+    assert training_stage_for_epoch(config, 649).name == "flow_training"
 
 
 def test_original_representative_resolves_and_builds_rrdb_flow_encoder():

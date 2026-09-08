@@ -185,6 +185,25 @@ def save_checkpoint(payload: dict, output_dir: str | Path, filename: str) -> Pat
     return destination
 
 
+def _is_staged_source_pretrain_boundary(checkpoint: dict) -> bool:
+    """Return whether a joint checkpoint is exactly at a no-flow Stage 1 end."""
+    if checkpoint.get("current_stage") != "source_pretrain":
+        return False
+    saved_config = checkpoint.get("config", {})
+    stages = saved_config.get("training", {}).get("stages", {})
+    source_stage = stages.get("source_pretrain", {})
+    saved_epoch = checkpoint.get("epoch")
+    return bool(
+        stages.get("enabled")
+        and source_stage.get("enabled")
+        and source_stage.get("train_source")
+        and not source_stage.get("train_flow")
+        and isinstance(saved_epoch, int)
+        and not isinstance(saved_epoch, bool)
+        and saved_epoch == source_stage.get("end_epoch")
+    )
+
+
 def _validate_joint_stage1_boundary(
     checkpoint: dict, path: str | Path
 ) -> None:
@@ -234,7 +253,8 @@ def _validate_stage2_init_checkpoint(
     validate_source_decoder_checkpoint(checkpoint, config, path)
     saved_stage = checkpoint.get("stage")
     if saved_stage == "joint_training":
-        _validate_joint_stage1_boundary(checkpoint, path)
+        if not _is_staged_source_pretrain_boundary(checkpoint):
+            _validate_joint_stage1_boundary(checkpoint, path)
     elif saved_stage != "diagonal_pretrain":
         raise RuntimeError(
             "Stage 2 init_from requires a diagonal_pretrain checkpoint or a "
@@ -261,11 +281,19 @@ def _validate_stage2_init_checkpoint(
             raise RuntimeError(
                 f"Stage 2 initialization checkpoint has no usable model signature: {path}"
             ) from exc
-    if saved_signature != current_signature:
+    # Source CE schedule position is training state, not architecture. Stage 2
+    # init intentionally translates it from global epochs 150..200 to 0..50.
+    comparable_saved = copy.deepcopy(saved_signature)
+    comparable_current = copy.deepcopy(current_signature)
+    for signature in (comparable_saved, comparable_current):
+        supervision = signature.get("source", {}).get("supervision")
+        if isinstance(supervision, dict):
+            supervision.pop("weight_schedule", None)
+    if comparable_saved != comparable_current:
         raise RuntimeError(
             "Stage 2 initialization checkpoint is incompatible with the current "
-            "model/source configuration.\n"
-            f"saved={saved_signature}\ncurrent={current_signature}"
+            "model/source configuration; "
+            f"saved={comparable_saved}; current={comparable_current}"
         )
 
 

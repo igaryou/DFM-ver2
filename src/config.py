@@ -1145,8 +1145,24 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
     if stage == "joint_training":
         if not consistency["enabled"]:
             raise ValueError("joint_training requires consistency.enabled=true")
-        if config["checkpoint"]["init_from"]:
-            raise ValueError("joint_training forbids checkpoint.init_from")
+        init_from = config["checkpoint"]["init_from"]
+        source_stage = stages["source_pretrain"]
+        flow_stage = stages["flow_training"]
+        stage2_only_init = (
+            stages["enabled"]
+            and not source_stage["enabled"]
+            and flow_stage["enabled"]
+            and flow_stage["start_epoch"] == 0
+            and flow_stage["end_epoch"] == training["epochs"]
+            and flow_stage["train_flow"]
+        )
+        if init_from and not stage2_only_init:
+            raise ValueError(
+                "joint_training forbids checkpoint.init_from unless using a "
+                "stage2-only "
+                "schedule with source_pretrain disabled and flow_training "
+                "covering epochs [0, training.epochs)"
+            )
     return config
 
 

@@ -8,8 +8,10 @@ import yaml
 from checkpoint import (
     SCHEDULER_STEP_UNIT,
     SCHEDULER_VERSION,
+    _validate_stage2_init_checkpoint,
     checkpoint_payload,
     initialize_or_resume,
+    model_signature,
     save_checkpoint,
 )
 from config import load_config
@@ -191,6 +193,33 @@ def test_safe_joint_checkpoint_initializes_stage2_weights_only_and_logs(tmp_path
         "Best mIoU reset to: -inf",
         "Consistency loss: esd",
     ]
+
+
+def test_staged_joint_source_boundary_accepts_shifted_stage2_schedule():
+    saved_config = load_config(
+        ROOT / "configs/cityscapes/original/psd/"
+        "joint_bounded_gaussian_b1_exponential_path_trainable.yaml"
+    )
+    stage2_config = load_config(
+        ROOT / "configs/cityscapes/original/psd/"
+        "joint_bounded_gaussian_b1_exponential_path_trainable_"
+        "stage2_from_epoch0150.yaml"
+    )
+    checkpoint = {
+        "stage": "joint_training",
+        "epoch": 150,
+        "current_stage": "source_pretrain",
+        "config": saved_config,
+        "model_signature": model_signature(saved_config),
+        "model": {"weight": torch.zeros(1)},
+        "source_model": {"weight": torch.zeros(1)},
+    }
+    _validate_stage2_init_checkpoint(checkpoint, stage2_config, "epoch_0150.pt")
+
+    unsafe = copy.deepcopy(checkpoint)
+    unsafe["current_stage"] = "flow_training"
+    with pytest.raises(RuntimeError, match="may already contain consistency-loss updates"):
+        _validate_stage2_init_checkpoint(unsafe, stage2_config, "unsafe.pt")
 
 
 def test_joint_checkpoint_after_stage1_boundary_is_rejected(tmp_path):
