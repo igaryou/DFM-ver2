@@ -1,0 +1,4 @@
+extends: ../../../psd/joint_bounded_gaussian_b1_ce_160k_entropy_adaptive_variance.yaml
+
+dataset:
+  protocol: mmseg

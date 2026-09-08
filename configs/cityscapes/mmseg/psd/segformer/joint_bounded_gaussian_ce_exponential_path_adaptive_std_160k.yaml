@@ -1,0 +1,27 @@
+extends: joint_bounded_gaussian_ce_exponential_path_160k.yaml
+
+experiment:
+  name: dfm_segformer_endpoint_full_proposed_160k
+  output_dir: /home/igarashi_25/DFM/results/cityscapes/segformer_endpoint_full_proposed_160k
+
+source:
+  checkpoint: null
+  freeze: false
+  bounded_gaussian:
+    variance:
+      type: entropy_adaptive
+      rho: 0.95
+      normalization: rank
+      eps: 1.0e-8
+  supervision:
+    type: cross_entropy
+    weight: 0.2
+    include_void: true
+    weight_schedule:
+      type: linear
+      initial: 3.0
+      final: 0.2
+      steps: 16000
+
+wandb:
+  name: dfm-segformer-endpoint-full-proposed-160k

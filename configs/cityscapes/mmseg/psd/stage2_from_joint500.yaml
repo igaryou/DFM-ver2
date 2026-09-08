@@ -1,4 +1,0 @@
-extends: ../../psd/stage2_from_joint500.yaml
-
-dataset:
-  protocol: mmseg

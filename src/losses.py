@@ -857,7 +857,12 @@ def compute_consistency_loss(
         raise ValueError(f"Unknown consistency loss: {loss_type}")
     if image_feat is not None:
         assert image_feat.shape[0] == x_s.shape[0]
-        assert image_feat.shape[-2:] == x_s.shape[-2:]
+        expected_image_size = (
+            model.expected_image_feature_size(image)
+            if hasattr(model, "expected_image_feature_size")
+            else x_s.shape[-2:]
+        )
+        assert image_feat.shape[-2:] == expected_image_size
     if valid_mask is not None:
         assert valid_mask.shape == x_s.shape[:1] + x_s.shape[-2:], (
             f"consistency mask {valid_mask.shape} != state pixels "

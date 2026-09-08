@@ -1,0 +1,15 @@
+extends: joint_bounded_gaussian_ce_160k.yaml
+
+experiment:
+  name: dfm_segformer_endpoint_bounded_gaussian_align_160k
+  output_dir: /home/igarashi_25/DFM/results/cityscapes/segformer_endpoint_bounded_gaussian_align_160k
+
+source:
+  use_loss_align: true
+  supervision:
+    type: align
+    weight: 0.15
+    include_void: false
+
+wandb:
+  name: dfm-segformer-endpoint-bounded-gaussian-align-160k

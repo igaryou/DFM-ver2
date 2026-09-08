@@ -1,0 +1,28 @@
+extends: ../original/joint_swin_t_segformer_b1_standard_ce_160k.yaml
+
+model:
+  image_encoder:
+    type: rrdb
+    pretrained: false
+    freeze: false
+    input_already_normalized: false
+  endpoint:
+    type: segformer
+    segformer_variant: b2
+    pretrained: false
+    image_encoder:
+      type: rrdb
+      channels: 64
+      blocks: 3
+      growth_channels: 32
+    state_encoder:
+      channels: 64
+      blocks: 2
+    fusion:
+      type: concat
+      channels: 128
+    decoder_channels: 256
+    time_embedding_dim: 256
+
+source:
+  segformer_variant: b1

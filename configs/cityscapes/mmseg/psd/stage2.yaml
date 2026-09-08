@@ -1,4 +1,0 @@
-extends: ../../psd/stage2.yaml
-
-dataset:
-  protocol: mmseg

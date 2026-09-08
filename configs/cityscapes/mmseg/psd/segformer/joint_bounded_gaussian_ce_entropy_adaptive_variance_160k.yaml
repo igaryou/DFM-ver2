@@ -1,0 +1,17 @@
+extends: joint_bounded_gaussian_ce_160k.yaml
+
+experiment:
+  name: dfm_segformer_endpoint_bounded_gaussian_ce_entropy-variance_160k
+  output_dir: /home/igarashi_25/DFM/results/cityscapes/segformer_endpoint_bounded_gaussian_ce_entropy_variance_160k
+
+source:
+  bounded_gaussian:
+    variance:
+      type: entropy_adaptive
+      rho: 0.95
+      normalization: rank
+      eps: 1.0e-8
+
+wandb:
+  name: dfm-segformer-endpoint-bounded-gaussian-ce-entropy-variance-160k
+

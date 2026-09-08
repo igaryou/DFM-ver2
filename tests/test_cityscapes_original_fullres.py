@@ -23,7 +23,7 @@ ORIGINAL = ROOT / (
     "configs/cityscapes/original/psd/"
     "joint_bounded_gaussian_b1_exponential_path_adaptive_std_trainable.yaml"
 )
-MMSEG = ROOT / "configs/cityscapes/mmseg/psd/swin_t_linear_160k.yaml"
+MMSEG = ROOT / "configs/cityscapes/mmseg/psd/original/swin_t_linear_160k.yaml"
 
 
 def test_original_full_resolution_state_fields_have_cfm_shapes():

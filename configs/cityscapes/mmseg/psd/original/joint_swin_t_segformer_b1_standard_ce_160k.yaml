@@ -1,0 +1,4 @@
+extends: ../../../psd/joint_swin_t_segformer_b1_standard_ce_160k.yaml
+
+dataset:
+  protocol: mmseg

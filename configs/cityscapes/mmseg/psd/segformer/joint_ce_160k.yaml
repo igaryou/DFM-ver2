@@ -1,0 +1,26 @@
+extends: _base_segformer_endpoint_160k.yaml
+
+experiment:
+  name: dfm_segformer_endpoint_ce_160k
+  output_dir: /home/igarashi_25/DFM/results/cityscapes/segformer_endpoint_ce_160k
+
+source:
+  prior_type: image_gaussian
+  checkpoint: null
+  freeze: false
+  fixed_std: 1.0
+  learned_logvar: false
+  mu_tanh_scale: 0.0
+  supervision:
+    type: cross_entropy
+    weight: 0.2
+    include_void: true
+
+flow:
+  path:
+    type: power
+    exponent: 1.0
+
+wandb:
+  name: dfm-segformer-endpoint-ce-160k
+

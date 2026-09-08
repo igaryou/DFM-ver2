@@ -1,4 +1,0 @@
-extends: ../../psd/joint_simplex_b1_ce_smoothed_target_p08_ignore_void_160k.yaml
-
-dataset:
-  protocol: mmseg

@@ -35,6 +35,8 @@ def model_signature(config: dict) -> dict[str, Any]:
     # defaults are omitted so old Stage-1 checkpoints still compare identically.
     if image_encoder is not None and image_encoder.get("type") == "rrdb":
         model_config.pop("image_encoder")
+    if model_config.get("endpoint", {}).get("type") == "unet":
+        model_config.pop("endpoint")
     source_keys = [
         "prior_type", "prior_noise_std", "backbone", "segformer_variant",
         "pretrained", "freeze_encoder", "decoder_channels",

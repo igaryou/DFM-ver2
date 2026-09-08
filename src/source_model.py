@@ -9,6 +9,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from model import group_norm
+from segformer_architecture import (
+    SEGFORMER_DECODER_HIDDEN,
+    SEGFORMER_DEPTHS,
+    SEGFORMER_HIDDEN_SIZES,
+    SEGFORMER_MODEL_NAMES,
+    build_segformer_config,
+)
 from state_space import state_spatial_size
 
 
@@ -67,20 +74,10 @@ class UNetSourceGenerator(nn.Module):
 class SegFormerSourceGenerator(nn.Module):
     """SegFormer image-conditioned Gaussian source ported from CFM/segv4."""
 
-    MODEL_NAMES = {f"b{i}": f"nvidia/mit-b{i}" for i in range(6)}
-    DEPTHS = {
-        "b0": [2, 2, 2, 2], "b1": [2, 2, 2, 2], "b2": [3, 4, 6, 3],
-        "b3": [3, 4, 18, 3], "b4": [3, 8, 27, 3], "b5": [3, 6, 40, 3],
-    }
-    HIDDEN = {
-        "b0": [32, 64, 160, 256], "b1": [64, 128, 320, 512],
-        "b2": [64, 128, 320, 512], "b3": [64, 128, 320, 512],
-        "b4": [64, 128, 320, 512], "b5": [64, 128, 320, 512],
-    }
-    DECODER_HIDDEN = {
-        "b0": 256, "b1": 256, "b2": 768, "b3": 768,
-        "b4": 768, "b5": 768,
-    }
+    MODEL_NAMES = SEGFORMER_MODEL_NAMES
+    DEPTHS = SEGFORMER_DEPTHS
+    HIDDEN = SEGFORMER_HIDDEN_SIZES
+    DECODER_HIDDEN = SEGFORMER_DECODER_HIDDEN
 
     def __init__(
         self, num_classes: int, variant: str, pretrained: bool, decoder_channels: int,
@@ -95,21 +92,13 @@ class SegFormerSourceGenerator(nn.Module):
         if decoder_type not in {"custom", "standard"}:
             raise ValueError("decoder_type must be custom or standard")
         try:
-            from transformers import SegformerConfig, SegformerModel
+            from transformers import SegformerModel
         except ImportError as exc:
             raise RuntimeError("source.backbone=segformer requires transformers") from exc
         if pretrained:
             self.encoder = SegformerModel.from_pretrained(self.MODEL_NAMES[variant])
         else:
-            heads = [1, 2, 5, 8]
-            self.encoder = SegformerModel(SegformerConfig(
-                num_channels=3, num_encoder_blocks=4, depths=self.DEPTHS[variant],
-                sr_ratios=[8, 4, 2, 1], hidden_sizes=self.HIDDEN[variant],
-                patch_sizes=[7, 3, 3, 3], strides=[4, 2, 2, 2],
-                num_attention_heads=heads, mlp_ratios=[4, 4, 4, 4],
-                hidden_dropout_prob=0.0, attention_probs_dropout_prob=0.0,
-                drop_path_rate=0.1,
-            ))
+            self.encoder = SegformerModel(build_segformer_config(variant, 3))
         self.num_classes = num_classes
         self.fixed_std = None if learned_logvar else fixed_std
         self.mu_tanh_scale = mu_tanh_scale

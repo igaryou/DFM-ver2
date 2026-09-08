@@ -1,4 +1,0 @@
-extends: ../../psd/entropy_adaptive_rank_128k.yaml
-
-dataset:
-  protocol: mmseg

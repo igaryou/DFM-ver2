@@ -1,0 +1,21 @@
+extends: joint_bounded_gaussian_ce_160k.yaml
+
+experiment:
+  name: dfm_segformer_endpoint_bounded_gaussian_ce_exponential_path_160k
+  output_dir: /home/igarashi_25/DFM/results/cityscapes/segformer_endpoint_bounded_gaussian_ce_exponential_path_160k
+
+flow:
+  path:
+    type: entropy_adaptive
+    entropy:
+      normalization: rank
+      exclude_ignore: false
+      exclude_predicted_void: false
+    scheduler:
+      type: exponential
+      beta: 2.0
+      difficulty_gamma: 1.0
+
+wandb:
+  name: dfm-segformer-endpoint-bounded-gaussian-ce-exponential-path-160k
+

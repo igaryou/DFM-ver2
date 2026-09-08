@@ -280,7 +280,7 @@ def compute_model_training_objectives(
         )
     image_feat = endpoint.encode_image(image)
     assert x0.shape == x1_state.shape == targets.one_hot_state.shape
-    assert image_feat.shape[-2:] == state_size
+    assert image_feat.shape[-2:] == endpoint.expected_image_feature_size(image)
     zero = _zero(image)
     consistency_result = None
     u = None

@@ -1,4 +1,0 @@
-extends: ../../psd/simplex_source_rank_128k.yaml
-
-dataset:
-  protocol: mmseg

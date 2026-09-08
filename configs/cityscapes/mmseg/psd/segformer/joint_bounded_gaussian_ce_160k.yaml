@@ -1,0 +1,18 @@
+extends: joint_ce_160k.yaml
+
+experiment:
+  name: dfm_segformer_endpoint_bounded_gaussian_ce_160k
+  output_dir: /home/igarashi_25/DFM/results/cityscapes/segformer_endpoint_bounded_gaussian_ce_160k
+
+source:
+  prior_type: image_bounded_gaussian
+  fixed_std: 1.0
+  bounded_gaussian:
+    amplitude: 0.5
+    temperature: 4.0
+    variance:
+      type: fixed
+
+wandb:
+  name: dfm-segformer-endpoint-bounded-gaussian-ce-160k
+

@@ -1,0 +1,4 @@
+extends: ../../../psd/swin_t_power2_160k.yaml
+
+dataset:
+  protocol: mmseg

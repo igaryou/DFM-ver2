@@ -4,7 +4,7 @@ experiment:
   output_dir: /home/igarashi_25/DFM/results/cityscapes/original/bounded_gaussian_joint_800ep
 source:
   segformer_variant: b1
-  segformer_decoder: standard
+  segformer_decoder: custom
   checkpoint: null
   freeze: false
   prior_type: image_bounded_gaussian

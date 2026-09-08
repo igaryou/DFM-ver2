@@ -44,7 +44,7 @@ STAGE2_FROM_150 = ROOT / (
     "stage2_from_epoch0150.yaml"
 )
 MMSEG = ROOT / "configs/_base_/cityscapes/swin_t_160k.yaml"
-MMSEG_WRAPPER = ROOT / "configs/cityscapes/mmseg/psd/swin_t_linear_160k.yaml"
+MMSEG_WRAPPER = ROOT / "configs/cityscapes/mmseg/psd/original/swin_t_linear_160k.yaml"
 
 
 def _synthetic_dataset(config: dict, *, augment: bool):
@@ -440,7 +440,17 @@ def test_resume_epoch_recomputes_stage_without_transition_state():
 
 def test_all_mmseg_wrappers_preserve_resolved_semantics():
     import yaml
-    for wrapper in (ROOT / "configs/cityscapes/mmseg").rglob("*.yaml"):
+    wrapper_roots = [
+        ROOT / "configs/cityscapes/mmseg/csd",
+        ROOT / "configs/cityscapes/mmseg/diagonal",
+        ROOT / "configs/cityscapes/mmseg/ecld",
+        ROOT / "configs/cityscapes/mmseg/esd",
+        ROOT / "configs/cityscapes/mmseg/psd/original",
+        ROOT / "configs/cityscapes/mmseg/source",
+    ]
+    for wrapper in (
+        path for root in wrapper_roots for path in root.rglob("*.yaml")
+    ):
         raw = yaml.safe_load(wrapper.read_text())
         target = (wrapper.parent / raw["extends"]).resolve()
         wrapped = load_config(wrapper)

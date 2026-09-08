@@ -8,6 +8,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from state_space import state_spatial_size
+from segformer_architecture import build_segformer_config
 
 
 def group_norm(channels: int) -> nn.GroupNorm:
@@ -88,6 +89,77 @@ class ImageEncoder(nn.Module):
         for layer in self.downsample:
             first = F.leaky_relu(layer(first), 0.2)
         return self.out(F.leaky_relu(first + self.body_out(self.body(first)), 0.2))
+
+
+class StateResidualBlock(nn.Module):
+    def __init__(self, channels: int) -> None:
+        super().__init__()
+        self.conv1 = nn.Conv2d(channels, channels, 3, padding=1)
+        self.conv2 = nn.Conv2d(channels, channels, 3, padding=1)
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        return inputs + self.conv2(F.silu(self.conv1(F.silu(inputs))))
+
+
+class FullResolutionStateEncoder(nn.Module):
+    def __init__(self, in_channels: int, channels: int, blocks: int) -> None:
+        super().__init__()
+        self.input = nn.Conv2d(in_channels, channels, 3, padding=1)
+        self.blocks = nn.Sequential(*(
+            StateResidualBlock(channels) for _ in range(blocks)
+        ))
+        self.output_channels = channels
+
+    def forward(self, state: torch.Tensor) -> torch.Tensor:
+        return self.blocks(F.silu(self.input(state)))
+
+
+class TimeConditionedSegFormer(nn.Module):
+    """MiT encoder with stage-wise conditioning on s and t-s."""
+
+    def __init__(
+        self, variant: str, in_channels: int, time_dim: int, pretrained: bool = False,
+    ) -> None:
+        super().__init__()
+        if pretrained:
+            raise ValueError(
+                "Endpoint SegFormer consumes fused features and cannot load RGB pretrained weights"
+            )
+        try:
+            from transformers import SegformerModel
+        except ImportError as exc:
+            raise RuntimeError(
+                "model.endpoint.type=segformer requires transformers"
+            ) from exc
+        config = build_segformer_config(variant, in_channels)
+        self.encoder = SegformerModel(config)
+        self.hidden_sizes = list(config.hidden_sizes)
+        base_dim = self.hidden_sizes[0]
+        self.embed_s = nn.Sequential(
+            SinusoidalTimeEmbedding(base_dim), nn.Linear(base_dim, time_dim),
+            nn.SiLU(), nn.Linear(time_dim, time_dim),
+        )
+        self.embed_delta = nn.Sequential(
+            SinusoidalTimeEmbedding(base_dim), nn.Linear(base_dim, time_dim),
+            nn.SiLU(), nn.Linear(time_dim, time_dim),
+        )
+        self.stage_time = nn.ModuleList(
+            nn.Linear(time_dim, channels) for channels in self.hidden_sizes
+        )
+
+    def forward(
+        self, inputs: torch.Tensor, s: torch.Tensor, t: torch.Tensor,
+    ) -> list[torch.Tensor]:
+        time_embedding = self.embed_s(s) + self.embed_delta(t - s)
+        hidden = inputs
+        features = []
+        for stage, projection in zip(self.encoder.stages, self.stage_time):
+            hidden = stage(hidden)
+            hidden = hidden + projection(time_embedding)[:, :, None, None].to(
+                hidden.dtype
+            )
+            features.append(hidden)
+        return features
 
 
 TRANSFORMER_IMAGE_ENCODER_MODEL_IDS = {
@@ -565,9 +637,50 @@ class DiscreteFlowMapModel(nn.Module):
         super().__init__()
         channels = config["fusion_channels"]
         num_classes = config["num_classes"]
-        unet = config["unet"]
         self.num_classes = num_classes
         self.state_downsample_factor = config.get("state_downsample_factor", 4)
+        endpoint = config.get("endpoint", {})
+        self.endpoint_type = endpoint.get("type", "unet")
+        if self.endpoint_type == "segformer":
+            image_config = endpoint["image_encoder"]
+            state_config = endpoint["state_encoder"]
+            fusion_config = endpoint["fusion"]
+            self.segformer_variant = endpoint["segformer_variant"]
+            self.image_encoder = ImageEncoder(
+                image_config["channels"], image_config["blocks"],
+                image_config["growth_channels"], downsample_factor=1,
+            )
+            self.state_encoder = FullResolutionStateEncoder(
+                num_classes, state_config["channels"], state_config["blocks"]
+            )
+            if fusion_config["type"] == "concat":
+                projection_channels = (
+                    image_config["channels"] + state_config["channels"]
+                )
+            else:
+                if image_config["channels"] != state_config["channels"]:
+                    raise ValueError("add fusion requires equal image/state encoder channels")
+                projection_channels = image_config["channels"]
+            fused_channels = fusion_config["channels"]
+            self.fusion_type = fusion_config["type"]
+            self.fusion_projection = nn.Conv2d(projection_channels, fused_channels, 1)
+            self.segformer_encoder = TimeConditionedSegFormer(
+                self.segformer_variant, fused_channels,
+                endpoint["time_embedding_dim"], endpoint["pretrained"],
+            )
+            decoder_channels = endpoint["decoder_channels"]
+            self.decode_projections = nn.ModuleList(
+                nn.Conv2d(size, decoder_channels, 1)
+                for size in self.segformer_encoder.hidden_sizes
+            )
+            self.decode_fusion = nn.Sequential(
+                nn.Conv2d(decoder_channels * 4, decoder_channels, 1),
+                group_norm(decoder_channels), nn.SiLU(),
+            )
+            self.classifier = nn.Conv2d(decoder_channels, num_classes, 1)
+            return
+
+        unet = config["unet"]
         self.mask_encoder = nn.Conv2d(num_classes, channels, 3, padding=1)
         self.image_encoder = build_image_encoder(config)
         self.unet = DFMUNet(
@@ -584,11 +697,16 @@ class DiscreteFlowMapModel(nn.Module):
 
     def encode_image(self, image: torch.Tensor) -> torch.Tensor:
         feature = self.image_encoder(image)
-        expected = state_spatial_size(image, self.state_downsample_factor)
+        expected = self.expected_image_feature_size(image)
         assert feature.shape[-2:] == expected, (
             f"image feature {feature.shape[-2:]} != state size {expected}"
         )
         return feature
+
+    def expected_image_feature_size(self, image: torch.Tensor) -> tuple[int, int]:
+        if self.endpoint_type == "segformer":
+            return tuple(image.shape[-2:])
+        return state_spatial_size(image, self.state_downsample_factor)
 
     def forward_logits_with_image_feat(
         self, x_s: torch.Tensor, image_feat: torch.Tensor,
@@ -596,6 +714,31 @@ class DiscreteFlowMapModel(nn.Module):
     ) -> torch.Tensor:
         assert x_s.shape[0] == image_feat.shape[0]
         assert x_s.shape[1] == self.num_classes
+        if self.endpoint_type == "segformer":
+            full_state = F.interpolate(
+                x_s, size=image_feat.shape[-2:], mode="bilinear", align_corners=False
+            )
+            state_feat = self.state_encoder(full_state)
+            fused = (
+                torch.cat((image_feat, state_feat), dim=1)
+                if self.fusion_type == "concat" else image_feat + state_feat
+            )
+            features = self.segformer_encoder(self.fusion_projection(fused), s, t)
+            target_size = features[0].shape[-2:]
+            decoded = [
+                projection(feature) if feature.shape[-2:] == target_size else F.interpolate(
+                    projection(feature), size=target_size,
+                    mode="bilinear", align_corners=False,
+                )
+                for feature, projection in zip(features, self.decode_projections)
+            ]
+            logits = self.classifier(self.decode_fusion(torch.cat(decoded, dim=1)))
+            if logits.shape[-2:] != x_s.shape[-2:]:
+                logits = F.interpolate(
+                    logits, size=x_s.shape[-2:], mode="bilinear", align_corners=False
+                )
+            assert logits.shape == x_s.shape
+            return logits
         assert x_s.shape[-2:] == image_feat.shape[-2:], (
             f"state {x_s.shape[-2:]} != image feature {image_feat.shape[-2:]}"
         )

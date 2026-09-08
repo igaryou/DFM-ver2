@@ -116,6 +116,27 @@ DEFAULT_CONFIG: dict[str, Any] = {
         },
         "rrdb_blocks": 5,
         "rrdb_growth_channels": 32,
+        "endpoint": {
+            "type": "unet",
+            "segformer_variant": "b2",
+            "pretrained": False,
+            "image_encoder": {
+                "type": "rrdb",
+                "channels": 64,
+                "blocks": 3,
+                "growth_channels": 32,
+            },
+            "state_encoder": {
+                "channels": 64,
+                "blocks": 2,
+            },
+            "fusion": {
+                "type": "concat",
+                "channels": 128,
+            },
+            "decoder_channels": 256,
+            "time_embedding_dim": 256,
+        },
         "unet": {
             "base_channels": 64,
             "channel_mults": [1, 2, 4, 4],
@@ -702,6 +723,44 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("distributed.init_method currently supports only env://")
     if config["model"]["backbone"] != "unet":
         raise ValueError("This DFM implementation currently supports model.backbone=unet")
+    endpoint = config["model"]["endpoint"]
+    if endpoint["type"] not in {"unet", "segformer"}:
+        raise ValueError("model.endpoint.type must be unet or segformer")
+    if endpoint["segformer_variant"] not in {f"b{i}" for i in range(6)}:
+        raise ValueError(
+            "model.endpoint.segformer_variant must be b0, b1, b2, b3, b4, or b5"
+        )
+    if not isinstance(endpoint["pretrained"], bool):
+        raise ValueError("model.endpoint.pretrained must be a boolean")
+    if endpoint["type"] == "segformer" and endpoint["pretrained"]:
+        raise ValueError("fused-feature Endpoint SegFormer requires pretrained=false")
+    endpoint_image = endpoint["image_encoder"]
+    if endpoint_image["type"] != "rrdb":
+        raise ValueError("model.endpoint.image_encoder.type must be rrdb")
+    for dotted, value in (
+        ("image_encoder.channels", endpoint_image["channels"]),
+        ("image_encoder.blocks", endpoint_image["blocks"]),
+        ("image_encoder.growth_channels", endpoint_image["growth_channels"]),
+        ("state_encoder.channels", endpoint["state_encoder"]["channels"]),
+        ("state_encoder.blocks", endpoint["state_encoder"]["blocks"]),
+        ("fusion.channels", endpoint["fusion"]["channels"]),
+        ("decoder_channels", endpoint["decoder_channels"]),
+        ("time_embedding_dim", endpoint["time_embedding_dim"]),
+    ):
+        minimum = 0 if dotted.endswith("blocks") else 1
+        if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+            qualifier = "non-negative" if minimum == 0 else "positive"
+            raise ValueError(
+                f"model.endpoint.{dotted} must be a {qualifier} integer"
+            )
+    if endpoint["fusion"]["type"] not in {"concat", "add"}:
+        raise ValueError("model.endpoint.fusion.type must be concat or add")
+    if (
+        endpoint["type"] == "segformer"
+        and endpoint["fusion"]["type"] == "add"
+        and endpoint_image["channels"] != endpoint["state_encoder"]["channels"]
+    ):
+        raise ValueError("add fusion requires equal image/state encoder channels")
     image_encoder = config["model"]["image_encoder"]
     if image_encoder["type"] not in {"rrdb", "swin", "convnext"}:
         raise ValueError("model.image_encoder.type must be rrdb, swin, or convnext")
@@ -853,6 +912,10 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
         )
     if config["source"]["backbone"] not in {"segformer", "unet"}:
         raise ValueError("source.backbone must be segformer or unet")
+    if config["source"]["segformer_variant"] not in {f"b{i}" for i in range(6)}:
+        raise ValueError(
+            "source.segformer_variant must be b0, b1, b2, b3, b4, or b5"
+        )
     if config["source"]["segformer_decoder"] not in {"custom", "standard"}:
         raise ValueError(
             "source.segformer_decoder must be custom or standard"
