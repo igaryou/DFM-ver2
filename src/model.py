@@ -715,10 +715,11 @@ class DiscreteFlowMapModel(nn.Module):
         assert x_s.shape[0] == image_feat.shape[0]
         assert x_s.shape[1] == self.num_classes
         if self.endpoint_type == "segformer":
-            full_state = F.interpolate(
-                x_s, size=image_feat.shape[-2:], mode="bilinear", align_corners=False
+            assert x_s.shape[-2:] == image_feat.shape[-2:], (
+                f"full-resolution state {x_s.shape[-2:]} != image feature "
+                f"{image_feat.shape[-2:]}"
             )
-            state_feat = self.state_encoder(full_state)
+            state_feat = self.state_encoder(x_s)
             fused = (
                 torch.cat((image_feat, state_feat), dim=1)
                 if self.fusion_type == "concat" else image_feat + state_feat
