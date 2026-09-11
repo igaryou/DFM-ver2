@@ -393,7 +393,7 @@ def source_supervision_schedule(
     optimizer_step: int,
     epoch_index: int = 0,
 ) -> tuple[float, float]:
-    """Resolve CE weight from epoch or completed optimizer update count."""
+    """Resolve source supervision weight from epoch or optimizer update count."""
     if int(optimizer_step) < 0:
         raise ValueError("optimizer_step must be non-negative")
     weight = supervision.get("weight")
@@ -581,17 +581,17 @@ def sample_prior(
     else:
         supervision_type = "align" if source.get("use_loss_align", False) else "none"
         supervision_weight = float(source.get("align_weight", 0.0))
-    ce_scheduled_weight, ce_schedule_progress = source_supervision_schedule(
+    scheduled_weight, schedule_progress = source_supervision_schedule(
         supervision, optimizer_step, epoch_index
     )
     if (
-        supervision_type == "cross_entropy"
+        supervision_type in {"align", "cross_entropy"}
         and (
             supervision.get("weight") is not None
             or supervision.get("weight_schedule", {}).get("type") == "linear"
         )
     ):
-        supervision_weight = ce_scheduled_weight
+        supervision_weight = scheduled_weight
     if source_frozen:
         # Frozen sources still run forward for mu/entropy/x0, but never add CE grads.
         supervision_type = "none"
@@ -682,7 +682,7 @@ def sample_prior(
             supervision_weight * loss_ce
             if configured_supervision_type == "cross_entropy" else source_zero
         ).detach(),
-        "source_ce_schedule_progress": mu.new_tensor(ce_schedule_progress),
+        "source_ce_schedule_progress": mu.new_tensor(schedule_progress),
         "source_optimizer_step": mu.new_tensor(float(optimizer_step)),
     }
     if mu_state is not None:

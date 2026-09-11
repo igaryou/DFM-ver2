@@ -1,0 +1,70 @@
+extends: ../_base_/cityscapes_256x512_800ep_rrdb.yaml
+
+experiment:
+  name: dfm_original_cityscapes_b1_image_gaussian_align_150ep_source_then_trainable_800ep
+  output_dir: /home/igarashi_25/DFM/results/cityscapes/original/b1_image_gaussian_align_150ep_source_then_trainable_800ep
+
+source:
+  type: trainable_segformer
+  prior_type: image_gaussian
+  backbone: segformer
+  segformer_variant: b1
+  segformer_decoder: custom
+  pretrained: true
+  checkpoint: null
+  freeze: false
+  freeze_encoder: false
+  learned_logvar: false
+  fixed_std: 1.0
+  mu_tanh_scale: 0.0
+  input_already_normalized: true
+  supervision:
+    type: align
+    weight: 0.15
+    weight_schedule:
+      type: linear
+      unit: epoch
+      start_epoch: 150
+      duration: 50
+      initial: 1.0
+      final: 0.15
+
+flow:
+  path:
+    type: entropy_adaptive
+    entropy:
+      normalization: rank
+      exclude_ignore: false
+      exclude_predicted_void: false
+    scheduler:
+      type: exponential
+      beta: 2.0
+      difficulty_gamma: 1.0
+
+training:
+  epochs: 800
+  scheduler:
+    stage_aware: true
+  stages:
+    enabled: true
+    source_pretrain: {enabled: true, start_epoch: 0, end_epoch: 150, train_source: true, train_flow: false}
+    flow_training: {enabled: true, start_epoch: 150, end_epoch: 800, train_source: true, train_flow: true}
+  flow_weight_schedule:
+    type: linear
+    unit: epoch
+    start_epoch: 150
+    duration: 10
+    initial: 0.0
+    final: 1.0
+
+wandb:
+  name: dfm-original-cityscapes-b1-image-gaussian-align-150ep-source-then-trainable-800ep
+  tags:
+    - cityscapes
+    - original-protocol
+    - image-gaussian
+    - segformer-b1
+    - custom-decoder
+    - align-schedule
+    - entropy-adaptive-path
+    - 800ep

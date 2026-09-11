@@ -261,6 +261,37 @@ def test_trainable_ce_schedule_uses_raw_logits_and_frozen_ce_is_zero():
     assert frozen_stats["weighted_source_supervision"] == 0
 
 
+def test_trainable_align_uses_source_supervision_schedule():
+    image = torch.zeros(1, 3, 8, 12)
+    target = torch.tensor([[[0, 1, 2, 3] * 3] * 8])
+    targets = prepare_state_targets(
+        target,
+        num_classes=4,
+        state_size=(2, 3),
+        ignore_index=3,
+        mask_pixel_losses=True,
+    )
+    config = _sampling_config(freeze=False)
+    config["source"]["supervision"]["type"] = "align"
+    source = _TinySource()
+
+    _, stats = sample_prior(
+        config,
+        image,
+        targets.one_hot_state,
+        source,
+        target_full=target,
+        valid_mask_full=targets.valid_mask_full,
+        optimizer_step=8000,
+    )
+
+    assert stats["loss_source_align"] > 0
+    torch.testing.assert_close(
+        stats["weighted_source_supervision"],
+        1.6 * stats["loss_source_align"],
+    )
+
+
 def test_exponential_entropy_scheduler_production_formula_and_derivative():
     time = torch.tensor([0.37])
     difficulty = torch.tensor([[[-0.8, 0.0, 0.7]]])
