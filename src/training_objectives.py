@@ -41,6 +41,52 @@ def _zero(reference: torch.Tensor) -> torch.Tensor:
     return reference.float().sum() * 0.0
 
 
+def _rank_zero() -> bool:
+    return not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
+
+
+def _debug_first_batch_enabled(adapter: "DDPCompatibleTrainingModel") -> bool:
+    return (
+        bool(adapter.config.get("runtime", {}).get("debug_first_batch_shapes", False))
+        and not adapter._debug_first_batch_shapes_logged
+        and _rank_zero()
+        and getattr(adapter.endpoint_model, "endpoint_type", None) == "segformer"
+    )
+
+
+def _print_first_batch_shapes(
+    *, adapter: "DDPCompatibleTrainingModel", image: torch.Tensor,
+    source_stats: dict[str, Any], x0: torch.Tensor, x1: torch.Tensor,
+    diagonal_state: torch.Tensor,
+) -> None:
+    endpoint_shapes = getattr(adapter.endpoint_model, "_debug_last_shapes", {})
+    shapes = {
+        "image": tuple(image.shape),
+        "mu_raw": source_stats.get("_debug_mu_raw_shape", "unavailable"),
+        "x0": tuple(x0.shape),
+        "x1": tuple(x1.shape),
+        "diagonal_state / xs": tuple(diagonal_state.shape),
+        "image_feat": endpoint_shapes.get("image_feat", "unavailable"),
+        "state_feat": endpoint_shapes.get("state_feat", "unavailable"),
+        "fused": endpoint_shapes.get("fused", "unavailable"),
+        "SegFormer stage1": endpoint_shapes.get("stage1", "unavailable"),
+        "SegFormer stage2": endpoint_shapes.get("stage2", "unavailable"),
+        "SegFormer stage3": endpoint_shapes.get("stage3", "unavailable"),
+        "SegFormer stage4": endpoint_shapes.get("stage4", "unavailable"),
+        "decode head logits (pre-upsample)": endpoint_shapes.get(
+            "decode_head_logits", "unavailable"
+        ),
+        "final endpoint logits": endpoint_shapes.get(
+            "final_endpoint_logits", "unavailable"
+        ),
+    }
+    print("[debug:first-training-batch-shapes][rank=0]", flush=True)
+    for name, shape in shapes.items():
+        print(f"  {name:<37} {shape}", flush=True)
+    adapter._debug_first_batch_shapes_logged = True
+    adapter.endpoint_model._debug_capture_shapes = False
+
+
 @dataclass(frozen=True)
 class PSDValidMasks:
     semantic_full: torch.Tensor
@@ -278,9 +324,17 @@ def compute_model_training_objectives(
             ),
             spatial_size=state_size,
         )
+    capture_debug_shapes = _debug_first_batch_enabled(adapter)
+    if capture_debug_shapes:
+        endpoint._debug_capture_shapes = True
     image_feat = endpoint.encode_image(image)
     assert x0.shape == x1_state.shape == targets.one_hot_state.shape
-    assert image_feat.shape[-2:] == endpoint.expected_image_feature_size(image)
+    expected_image_size = (
+        endpoint.expected_image_feature_size(image)
+        if hasattr(endpoint, "expected_image_feature_size")
+        else state_size
+    )
+    assert image_feat.shape[-2:] == expected_image_size
     zero = _zero(image)
     consistency_result = None
     u = None
@@ -335,6 +389,15 @@ def compute_model_training_objectives(
         diagonal_state, image_feat, diagonal_time, diagonal_time
     )
     assert diagonal_logits.shape == targets.one_hot_state.shape
+    if capture_debug_shapes:
+        _print_first_batch_shapes(
+            adapter=adapter,
+            image=image,
+            source_stats=source_stats,
+            x0=x0,
+            x1=x1_state,
+            diagonal_state=diagonal_state,
+        )
     diagonal_logits_full = resize_continuous(
         diagonal_logits, targets.target_full.shape[-2:]
     )
@@ -617,6 +680,7 @@ class DDPCompatibleTrainingModel(nn.Module):
             )
         else:
             self.consistency_weight_model = None
+        self._debug_first_batch_shapes_logged = False
 
     @property
     def psd_weight_model(self):

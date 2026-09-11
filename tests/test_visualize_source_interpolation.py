@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 import visualize_source_interpolation as diagnostic
 import visualize_simplex_source
@@ -186,6 +187,15 @@ def test_argument_defaults_and_validation():
     assert args.entropy_normalization is None
     assert args.variance_type == "fixed"
     assert args.variance_rho == 0.8
+    assert args.experiment is None
+    comparison = diagnostic.parse_args([
+        "--config", "x", "--checkpoint", "y", "--output-dir", "z",
+        "--experiment", "compare",
+    ])
+    assert comparison.experiment == "compare"
+    assert diagnostic.experiment_conditions("compare") == (
+        "baseline", "path_only", "path_variance"
+    )
     raw = diagnostic.parse_args([
         "--config", "x", "--checkpoint", "y", "--output-dir", "z",
         "--mode", "raw_gaussian",
@@ -303,6 +313,93 @@ def test_joint_checkpoint_loads_only_source_model(tmp_path, monkeypatch):
     assert "model" in loaded_checkpoint
     torch.testing.assert_close(loaded.weight, expected.weight)
     assert not any(parameter.requires_grad for parameter in loaded.parameters())
+
+
+def test_comparison_settings_default_to_training_config_and_allow_explicit_override():
+    config = diagnostic.load_config(
+        Path(__file__).parents[1]
+        / "configs/cityscapes/original/psd/"
+        "joint_bounded_gaussian_b1_exponential_path_adaptive_std_trainable.yaml"
+    )
+    defaults = diagnostic.parse_args([
+        "--config", "x", "--checkpoint", "y", "--output-dir", "z",
+        "--experiment", "compare",
+    ])
+    settings = diagnostic.resolve_experiment_settings(defaults, config)
+    assert settings == {
+        "amplitude": 0.5,
+        "temperature": 4.0,
+        "base_std": 1.0,
+        "rho": 0.95,
+        "variance_normalization": "rank",
+        "variance_eps": 1.0e-8,
+        "path_normalization": "rank",
+        "path_eps": 1.0e-8,
+        "zscore_clip": 3.0,
+        "exclude_ignore": False,
+        "exclude_predicted_void": False,
+        "scheduler": "exponential",
+        "beta": 2.0,
+        "difficulty_gamma": 1.0,
+    }
+    overridden = diagnostic.parse_args([
+        "--config", "x", "--checkpoint", "y", "--output-dir", "z",
+        "--experiment", "compare", "--sigma", "0.7",
+        "--variance-rho", "0.4", "--entropy-beta", "1.5",
+    ])
+    override_settings = diagnostic.resolve_experiment_settings(overridden, config)
+    assert override_settings["base_std"] == 0.7
+    assert override_settings["rho"] == 0.4
+    assert override_settings["beta"] == 1.5
+
+
+def test_comparison_conditions_share_epsilon_and_match_production_endpoints():
+    config = diagnostic.load_config(
+        Path(__file__).parents[1]
+        / "configs/cityscapes/original/psd/"
+        "joint_bounded_gaussian_b1_exponential_path_adaptive_std_trainable.yaml"
+    )
+    args = diagnostic.parse_args([
+        "--config", "x", "--checkpoint", "y", "--output-dir", "z",
+        "--experiment", "compare",
+    ])
+    settings = diagnostic.resolve_experiment_settings(args, config)
+    torch.manual_seed(7)
+    mu_raw = torch.randn(2, 20, 4, 6)
+    target = torch.randint(0, 19, (2, 4, 6))
+    x1 = F.one_hot(target, 20).permute(0, 3, 1, 2).float()
+    epsilon = diagnostic.shared_standard_normal(mu_raw, [11, 19])
+    repeated = diagnostic.shared_standard_normal(mu_raw, [11, 19])
+    assert torch.equal(epsilon, repeated)
+
+    times = [0.0, 0.25, 0.5, 1.0]
+    result = diagnostic.build_comparison_trajectories(
+        mu_raw, x1, target, times,
+        diagnostic.experiment_conditions("compare"), settings, config, epsilon,
+    )
+    assert torch.equal(result["epsilon"], epsilon)
+    assert result["fixed_std"].shape == result["adaptive_std"].shape == (2, 4, 6)
+    assert result["variance_map"].shape == (2, 4, 6)
+    assert result["lambda"]["path_only"][1].shape == (2, 4, 6)
+    assert result["x0"]["path_only"].shape == result["x0"]["path_variance"].shape
+    for condition in diagnostic.COMPARISON_CONDITIONS:
+        assert len(result["states"][condition]) == len(times)
+        assert result["states"][condition][0].shape == x1.shape
+        torch.testing.assert_close(
+            result["states"][condition][0], result["x0"][condition],
+            rtol=0, atol=0,
+        )
+        torch.testing.assert_close(
+            result["states"][condition][-1], x1, rtol=0, atol=0
+        )
+    fixed_epsilon = (
+        result["x0"]["path_only"] - result["mu_state"]
+    ) / result["fixed_std"][:, None]
+    adaptive_epsilon = (
+        result["x0"]["path_variance"] - result["mu_state"]
+    ) / result["adaptive_std"][:, None]
+    torch.testing.assert_close(fixed_epsilon, epsilon)
+    torch.testing.assert_close(adaptive_epsilon, epsilon)
 
 
 class _SyntheticVisualizationDataset:

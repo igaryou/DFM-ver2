@@ -21,6 +21,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "amp_dtype": "bf16",
         "compile": False,
         "deterministic": False,
+        "debug_first_batch_shapes": False,
         "config_path": None,
     },
     "distributed": {
@@ -595,6 +596,8 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("dataset.crop_size must be null or [height, width]")
     if config["runtime"]["amp_dtype"] not in {"bf16", "fp16"}:
         raise ValueError("runtime.amp_dtype must be bf16 or fp16")
+    if not isinstance(config["runtime"]["debug_first_batch_shapes"], bool):
+        raise ValueError("runtime.debug_first_batch_shapes must be a boolean")
     training = config["training"]
     if training["schedule_unit"] not in {"auto", "epoch", "step", "optimizer_step"}:
         raise ValueError("training.schedule_unit must be auto, epoch, step, or optimizer_step")

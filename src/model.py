@@ -701,6 +701,8 @@ class DiscreteFlowMapModel(nn.Module):
         assert feature.shape[-2:] == expected, (
             f"image feature {feature.shape[-2:]} != state size {expected}"
         )
+        if getattr(self, "_debug_capture_shapes", False):
+            self._debug_last_shapes = {"image_feat": tuple(feature.shape)}
         return feature
 
     def expected_image_feature_size(self, image: torch.Tensor) -> tuple[int, int]:
@@ -734,10 +736,22 @@ class DiscreteFlowMapModel(nn.Module):
                 for feature, projection in zip(features, self.decode_projections)
             ]
             logits = self.classifier(self.decode_fusion(torch.cat(decoded, dim=1)))
+            if getattr(self, "_debug_capture_shapes", False):
+                self._debug_last_shapes.update({
+                    "state_feat": tuple(state_feat.shape),
+                    "fused": tuple(fused.shape),
+                    **{
+                        f"stage{index}": tuple(feature.shape)
+                        for index, feature in enumerate(features, start=1)
+                    },
+                    "decode_head_logits": tuple(logits.shape),
+                })
             if logits.shape[-2:] != x_s.shape[-2:]:
                 logits = F.interpolate(
                     logits, size=x_s.shape[-2:], mode="bilinear", align_corners=False
                 )
+            if getattr(self, "_debug_capture_shapes", False):
+                self._debug_last_shapes["final_endpoint_logits"] = tuple(logits.shape)
             assert logits.shape == x_s.shape
             return logits
         assert x_s.shape[-2:] == image_feat.shape[-2:], (

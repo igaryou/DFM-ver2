@@ -712,6 +712,9 @@ def sample_prior(
     if entropy_adaptive_enabled(config):
         # Internal non-scalar payload consumed by training/inference in this batch.
         stats["_path_source_state"] = mu.detach()
+    # A tuple retains no tensor storage and lets optional first-batch diagnostics
+    # report the source resolution without changing the source model API.
+    stats["_debug_mu_raw_shape"] = tuple(mu.shape)
     return x0, stats
 
 

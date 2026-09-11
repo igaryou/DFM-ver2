@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import csv
 import json
 import math
 from pathlib import Path
+import sys
 from typing import Any
 
 import matplotlib.pyplot as plt
@@ -12,14 +14,21 @@ import numpy as np
 import torch
 
 from adaptive_path import (
-    adaptive_lambda,
     bounded_gaussian_variance_maps,
+    emphasize_difficulty as production_emphasize_difficulty,
+    entropy_scheduler_lambda as production_entropy_scheduler_lambda,
+    source_entropy_difficulty,
     normalize_entropy,
     shannon_entropy,
 )
 from config import DEFAULT_CONFIG, load_config
 from dataset import build_dataset
-from discrete_flow_maps import sample_image_simplex_components
+from discrete_flow_maps import (
+    linear_path,
+    path_coefficient,
+    sample_image_bounded_gaussian,
+    sample_image_simplex_components,
+)
 from source_model import source_statistics
 from state_space import prepare_state_targets, smooth_categorical_target
 from utils import resolve_device
@@ -32,9 +41,11 @@ from visualize_simplex_source import (
 )
 
 
-DEFAULT_TIMES = (0.0, 0.25, 0.35, 0.5, 0.65, 0.75, 0.85, 0.95)
+DEFAULT_TIMES = (0.0, 0.25, 0.5, 0.75, 0.9, 0.95, 1.0)
 MODES = ("simplex", "bounded_gaussian")
 RAW_GAUSSIAN_MODE = "raw_gaussian"
+EXPERIMENTS = ("baseline", "path_only", "path_variance", "compare")
+COMPARISON_CONDITIONS = ("baseline", "path_only", "path_variance")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -48,6 +59,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-dir", required=True)
     parser.add_argument(
         "--mode", choices=(*MODES, RAW_GAUSSIAN_MODE, "both"), default="both"
+    )
+    parser.add_argument(
+        "--experiment", choices=EXPERIMENTS, default=None,
+        help="Run a config-driven bounded-Gaussian path comparison",
     )
     parser.add_argument("--times", type=float, nargs="+", default=DEFAULT_TIMES)
     parser.add_argument(
@@ -112,7 +127,11 @@ def validate_entropy_beta(beta: float, scheduler: str, *, label: str) -> None:
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    args = build_parser().parse_args(argv)
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
+    args = build_parser().parse_args(raw_argv)
+    args._provided_options = {
+        token.split("=", 1)[0] for token in raw_argv if token.startswith("--")
+    }
     if args.num_images <= 0:
         raise ValueError("--num-images must be positive")
     if args.batch_size <= 0:
@@ -121,7 +140,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         raise ValueError("--indices must be non-negative")
     if args.path_exponent <= 0:
         raise ValueError("--path-exponent must be positive")
-    if args.entropy_beta is not None:
+    if args.entropy_beta is not None and (
+        args.experiment is None or "--entropy-scheduler" in args._provided_options
+    ):
         validate_entropy_beta(
             args.entropy_beta, args.entropy_scheduler, label="--entropy-beta"
         )
@@ -211,6 +232,206 @@ def resolve_entropy_scheduler_settings(
     return settings
 
 
+def _explicit_or_config(
+    args: argparse.Namespace, option: str, argument: str, configured: Any,
+) -> Any:
+    return getattr(args, argument) if option in args._provided_options else configured
+
+
+def resolve_experiment_settings(
+    args: argparse.Namespace, config: dict,
+) -> dict[str, Any]:
+    """Resolve comparison parameters from training config, then explicit CLI."""
+    bounded = config["source"]["bounded_gaussian"]
+    variance = bounded["variance"]
+    path = config["flow"]["path"]
+    entropy = path["entropy"]
+    scheduler = path["scheduler"]
+    fixed_std = config["source"]["fixed_std"]
+    if fixed_std is None:
+        raise ValueError("Comparison experiments require source.fixed_std")
+    settings = {
+        "amplitude": float(_explicit_or_config(
+            args, "--amplitude", "amplitude", bounded["amplitude"]
+        )),
+        "temperature": float(_explicit_or_config(
+            args, "--tanh-temperature", "tanh_temperature",
+            bounded["temperature"],
+        )),
+        "base_std": float(_explicit_or_config(
+            args, "--sigma", "sigma", fixed_std
+        )),
+        "rho": float(_explicit_or_config(
+            args, "--variance-rho", "variance_rho", variance["rho"]
+        )),
+        "variance_normalization": str(variance["normalization"]),
+        "variance_eps": float(variance["eps"]),
+        "path_normalization": str(_explicit_or_config(
+            args, "--entropy-normalization", "entropy_normalization",
+            entropy["normalization"],
+        )),
+        "path_eps": float(_explicit_or_config(
+            args, "--entropy-eps", "entropy_eps", entropy["eps"]
+        )),
+        "zscore_clip": float(_explicit_or_config(
+            args, "--entropy-zscore-clip", "entropy_zscore_clip",
+            entropy["zscore_clip"],
+        )),
+        "exclude_ignore": bool(
+            entropy["exclude_ignore"]
+            if args.entropy_exclude_ignore is None
+            else args.entropy_exclude_ignore
+        ),
+        "exclude_predicted_void": bool(entropy["exclude_predicted_void"]),
+        "scheduler": str(_explicit_or_config(
+            args, "--entropy-scheduler", "entropy_scheduler",
+            scheduler["type"],
+        )),
+        "beta": float(_explicit_or_config(
+            args, "--entropy-beta", "entropy_beta", scheduler["beta"]
+        )),
+        "difficulty_gamma": float(_explicit_or_config(
+            args, "--difficulty-gamma", "difficulty_gamma",
+            scheduler.get("difficulty_gamma", 1.0),
+        )),
+    }
+    validate_entropy_beta(
+        settings["beta"], settings["scheduler"], label="entropy beta"
+    )
+    if not 0.0 <= settings["rho"] < 1.0:
+        raise ValueError("variance rho must satisfy 0 <= rho < 1")
+    return settings
+
+
+def experiment_conditions(experiment: str) -> tuple[str, ...]:
+    if experiment == "compare":
+        return COMPARISON_CONDITIONS
+    if experiment not in COMPARISON_CONDITIONS:
+        raise ValueError(f"Unknown comparison experiment: {experiment}")
+    return (experiment,)
+
+
+def _comparison_path_config(
+    config: dict, condition: str, settings: dict[str, Any],
+) -> dict:
+    result = copy.deepcopy(config)
+    if condition == "baseline":
+        result["flow"]["path"] = {"type": "linear", "exponent": 1.0}
+        return result
+    path = result["flow"]["path"]
+    path["type"] = "entropy_adaptive"
+    path["entropy"].update({
+        "normalization": settings["path_normalization"],
+        "eps": settings["path_eps"],
+        "zscore_clip": settings["zscore_clip"],
+        "exclude_ignore": settings["exclude_ignore"],
+        "exclude_predicted_void": settings["exclude_predicted_void"],
+    })
+    path["scheduler"].update({
+        "type": settings["scheduler"],
+        "beta": settings["beta"],
+        "difficulty_gamma": settings["difficulty_gamma"],
+    })
+    return result
+
+
+def shared_standard_normal(
+    reference: torch.Tensor, sample_seeds: list[int],
+) -> torch.Tensor:
+    """Generate one reproducible epsilon per dataset sample."""
+    samples = []
+    devices = [] if reference.device.type != "cuda" else [reference.device.index or 0]
+    for offset, seed in enumerate(sample_seeds):
+        with torch.random.fork_rng(devices=devices):
+            torch.manual_seed(int(seed))
+            samples.append(torch.randn_like(reference[offset:offset + 1]))
+    return torch.cat(samples, dim=0)
+
+
+def build_comparison_trajectories(
+    mu_raw: torch.Tensor,
+    x1: torch.Tensor,
+    target: torch.Tensor,
+    times: list[float],
+    conditions: tuple[str, ...],
+    settings: dict[str, Any],
+    config: dict,
+    epsilon: torch.Tensor,
+) -> dict[str, Any]:
+    """Build all conditions with production variance, sampling, and path code."""
+    if epsilon.shape != mu_raw.shape:
+        raise ValueError("epsilon and mu_raw must have identical shapes")
+    valid = target != config["dataset"]["void_class_index"]
+    adaptive_config = _comparison_path_config(config, "path_only", settings)
+    entropy, difficulty = source_entropy_difficulty(
+        mu_raw, adaptive_config, valid_mask=valid, spatial_size=target.shape[-2:]
+    )
+    variance_entropy, variance_difficulty, variance_map, adaptive_std = (
+        bounded_gaussian_variance_maps(
+            mu_raw,
+            base_std=settings["base_std"],
+            variance_type="entropy_adaptive",
+            rho=settings["rho"],
+            normalization=settings["variance_normalization"],
+            eps=settings["variance_eps"],
+        )
+    )
+    fixed_std = torch.full_like(adaptive_std, settings["base_std"])
+    mu_state, x0_fixed = sample_image_bounded_gaussian(
+        mu_raw,
+        amplitude=settings["amplitude"],
+        temperature=settings["temperature"],
+        sigma=settings["base_std"],
+        epsilon=epsilon,
+    )
+    adaptive_mu_state, x0_adaptive = sample_image_bounded_gaussian(
+        mu_raw,
+        amplitude=settings["amplitude"],
+        temperature=settings["temperature"],
+        sigma=adaptive_std,
+        epsilon=epsilon,
+    )
+    torch.testing.assert_close(adaptive_mu_state, mu_state, rtol=0, atol=0)
+    result: dict[str, Any] = {
+        "epsilon": epsilon,
+        "mu_state": mu_state,
+        "entropy": entropy,
+        "difficulty": difficulty,
+        "variance_entropy": variance_entropy,
+        "variance_difficulty": variance_difficulty,
+        "variance_map": variance_map,
+        "adaptive_std": adaptive_std,
+        "fixed_std": fixed_std,
+        "x0": {},
+        "states": {},
+        "lambda": {},
+    }
+    for condition in conditions:
+        initial = x0_adaptive if condition == "path_variance" else x0_fixed
+        path_config = _comparison_path_config(config, condition, settings)
+        condition_difficulty = None if condition == "baseline" else difficulty
+        states = []
+        coefficients = []
+        for time in times:
+            batch_time = mu_raw.new_full(
+                (mu_raw.shape[0],), float(time), dtype=torch.float32
+            )
+            coefficients.append(path_coefficient(
+                batch_time, path_config, condition_difficulty
+            ))
+            states.append(linear_path(
+                initial, x1, batch_time, path_config, condition_difficulty
+            ))
+        if times[0] == 0.0:
+            torch.testing.assert_close(states[0], initial, rtol=0, atol=0)
+        if times[-1] == 1.0:
+            torch.testing.assert_close(states[-1], x1, rtol=0, atol=0)
+        result["x0"][condition] = initial
+        result["states"][condition] = states
+        result["lambda"][condition] = coefficients
+    return result
+
+
 def source_entropy_difficulty_from_raw_logits(
     mu_raw: torch.Tensor,
     *,
@@ -244,11 +465,8 @@ def source_entropy_difficulty_from_raw_logits(
 def emphasize_difficulty(
     difficulty: torch.Tensor, gamma: float
 ) -> torch.Tensor:
-    """Return ``sign(d) * abs(d)**gamma`` without changing its sign/range."""
-    gamma = float(gamma)
-    if gamma <= 0:
-        raise ValueError("difficulty gamma must be positive")
-    return difficulty.sign() * difficulty.abs().pow(gamma)
+    """Backward-compatible wrapper around the production path helper."""
+    return production_emphasize_difficulty(difficulty, gamma)
 
 
 def entropy_scheduler_lambda(
@@ -258,18 +476,11 @@ def entropy_scheduler_lambda(
     beta: float,
     scheduler: str,
 ) -> torch.Tensor:
-    """Compute additive or exponential entropy-adaptive progress maps."""
-    if scheduler == "additive":
-        return adaptive_lambda(time, difficulty, beta=beta)
-    if scheduler != "exponential":
-        raise ValueError(f"Unknown entropy scheduler: {scheduler}")
-    if time.ndim != 1 or difficulty.ndim != 3:
-        raise ValueError("time must be [B] and difficulty must be [B,H,W]")
-    if time.shape[0] != difficulty.shape[0]:
-        raise ValueError("time and difficulty batch sizes must match")
-    t = time.float()[:, None, None]
-    exponent = torch.exp(float(beta) * difficulty.float())
-    return t.pow(exponent)
+    """Backward-compatible wrapper around the production path helper."""
+    return production_entropy_scheduler_lambda(
+        time, difficulty, beta=beta, scheduler_type=scheduler,
+        difficulty_gamma=1.0,
+    )
 
 
 def interpolation_path(
@@ -534,6 +745,23 @@ def _semantic_display(state: torch.Tensor, sample: dict) -> torch.Tensor:
     return _state_to_display(state, sample).argmax(dim=1)[0].cpu()
 
 
+def _as_visualization_sample(item: Any, index: int) -> dict[str, Any]:
+    if isinstance(item, dict):
+        return item
+    if (
+        isinstance(item, (tuple, list))
+        and len(item) >= 2
+        and torch.is_tensor(item[0])
+        and torch.is_tensor(item[1])
+    ):
+        return {
+            "image": item[0],
+            "target": item[1],
+            "sample_id": str(index),
+        }
+    raise TypeError("Visualization dataset item must be a dict or image/target pair")
+
+
 def _save_mode_figure(
     path: Path,
     image: torch.Tensor,
@@ -725,6 +953,167 @@ def _save_hard_target_comparison(
     figure.tight_layout(); figure.savefig(path, dpi=120, bbox_inches="tight"); plt.close(figure)
 
 
+def _save_experiment_comparison(
+    path: Path,
+    image: torch.Tensor,
+    target: torch.Tensor,
+    source: torch.Tensor,
+    trajectories: dict[str, list[torch.Tensor]],
+    x0: dict[str, torch.Tensor],
+    x1: torch.Tensor,
+    times: list[float],
+    sample: dict,
+) -> None:
+    conditions = tuple(trajectories)
+    interior = [index for index, time in enumerate(times) if 0.0 < time < 1.0]
+    columns = 5 + len(interior)
+    figure, axes = plt.subplots(
+        len(conditions), columns,
+        figsize=(3.0 * columns, 3.0 * len(conditions)), squeeze=False,
+    )
+    for row, condition in enumerate(conditions):
+        panels: list[tuple[str, torch.Tensor | np.ndarray]] = [
+            ("Input", image.permute(1, 2, 0)),
+            ("GT", target),
+            ("Source argmax(mu_raw)", source),
+            ("x0", _semantic_display(x0[condition], sample)),
+        ]
+        panels.extend(
+            (f"t={times[index]:g}", _semantic_display(
+                trajectories[condition][index], sample
+            ))
+            for index in interior
+        )
+        panels.append(("x1", _semantic_display(x1, sample)))
+        for axis, (title, values) in zip(axes[row], panels, strict=True):
+            axis.imshow(
+                values if title == "Input" else colorize(values, "cityscapes")
+            )
+            axis.set_title(title)
+            axis.axis("off")
+        axes[row, 0].set_ylabel(condition.replace("_", " ").title())
+    path.parent.mkdir(parents=True, exist_ok=True)
+    figure.tight_layout()
+    figure.savefig(path, dpi=140, bbox_inches="tight")
+    plt.close(figure)
+
+
+def _save_path_variance_comparison(
+    path: Path,
+    target: torch.Tensor,
+    trajectories: dict[str, list[torch.Tensor]],
+    x0: dict[str, torch.Tensor],
+    times: list[float],
+    sample: dict,
+) -> None:
+    conditions = ("path_only", "path_variance")
+    interior = [index for index, time in enumerate(times) if 0.0 < time < 1.0]
+    columns = 2 + len(interior)
+    figure, axes = plt.subplots(2, columns, figsize=(3.0 * columns, 6.0))
+    for row, condition in enumerate(conditions):
+        panels = [("x0", x0[condition])]
+        panels.extend(
+            (f"x_t(t={times[index]:g})", trajectories[condition][index])
+            for index in interior
+        )
+        for column, (title, state) in enumerate(panels):
+            axes[row, column].imshow(colorize(
+                _semantic_display(state, sample), "cityscapes"
+            ))
+            axes[row, column].set_title(title)
+        axes[row, -1].imshow(colorize(target, "cityscapes"))
+        axes[row, -1].set_title("GT")
+        axes[row, 0].set_ylabel(condition.replace("_", " ").title())
+        for axis in axes[row]:
+            axis.axis("off")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    figure.tight_layout()
+    figure.savefig(path, dpi=160, bbox_inches="tight")
+    plt.close(figure)
+
+
+def _save_experiment_variance_figure(
+    path: Path,
+    image: torch.Tensor,
+    entropy: torch.Tensor,
+    difficulty: torch.Tensor,
+    std: torch.Tensor,
+    variance: torch.Tensor,
+    x0_fixed: torch.Tensor,
+    x0_adaptive: torch.Tensor,
+    sample: dict,
+) -> None:
+    figure, axes = plt.subplots(1, 7, figsize=(21, 3.4))
+    panels = (
+        ("Input", image.permute(1, 2, 0), None),
+        ("Entropy", entropy, "viridis"),
+        ("Difficulty", difficulty, "coolwarm"),
+        ("sigma_i", std, "viridis"),
+        ("sigma_i^2", variance, "viridis"),
+        ("argmax(x0 fixed)", colorize(
+            _semantic_display(x0_fixed, sample), "cityscapes"
+        ), None),
+        ("argmax(x0 adaptive)", colorize(
+            _semantic_display(x0_adaptive, sample), "cityscapes"
+        ), None),
+    )
+    for axis, (title, values, cmap) in zip(axes, panels, strict=True):
+        limits = {"vmin": -1.0, "vmax": 1.0} if title == "Difficulty" else {}
+        plot = axis.imshow(values, cmap=cmap, **limits)
+        axis.set_title(title)
+        axis.axis("off")
+        if cmap is not None:
+            figure.colorbar(plot, ax=axis, fraction=0.046, pad=0.04)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    figure.tight_layout()
+    figure.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close(figure)
+
+
+def _save_difference_figure(
+    path: Path,
+    path_only: list[torch.Tensor],
+    path_variance: list[torch.Tensor],
+    times: list[float],
+    valid: torch.Tensor,
+) -> list[float]:
+    ratios = []
+    maps = []
+    for left, right in zip(path_only, path_variance, strict=True):
+        difference = left.argmax(dim=1) != right.argmax(dim=1)
+        denominator = int(valid.sum())
+        ratios.append(
+            float((difference & valid).sum()) / denominator
+            if denominator else float("nan")
+        )
+        maps.append((difference & valid)[0].cpu())
+    figure, axes = plt.subplots(
+        1, len(times), figsize=(3.0 * len(times), 3.2), squeeze=False
+    )
+    for axis, time, values, ratio in zip(
+        axes[0], times, maps, ratios, strict=True
+    ):
+        axis.imshow(values, cmap="gray", vmin=0, vmax=1)
+        axis.set_title(f"t={time:g}\ndiff={ratio:.3%}")
+        axis.axis("off")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    figure.tight_layout()
+    figure.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close(figure)
+    return ratios
+
+
+def _write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
+    if not rows:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fieldnames = list(dict.fromkeys(key for row in rows for key in row))
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
 def _aggregate_rows(rows: list[dict[str, Any]], times: list[float]) -> list[dict[str, Any]]:
     result = []
     for mode in dict.fromkeys(row["mode"] for row in rows):
@@ -816,8 +1205,258 @@ def _save_summary_plots(rows: list[dict[str, Any]], output: Path) -> None:
 
 
 @torch.inference_mode()
+def run_comparison_experiment(
+    args: argparse.Namespace, config: dict,
+) -> dict[str, Any]:
+    """Visualize config-faithful bounded-Gaussian path ablations."""
+    settings = resolve_experiment_settings(args, config)
+    conditions = experiment_conditions(args.experiment)
+    if config["dataset"]["name"] != "cityscapes":
+        raise ValueError("This diagnostic currently supports Cityscapes")
+    if config["source"]["type"] != "trainable_segformer":
+        raise ValueError("Comparison requires a trainable SegFormer source config")
+    device = resolve_device(args.device or config["runtime"]["device"])
+    checkpoint_path = resolve_checkpoint(args.checkpoint, args.checkpoint_dir)
+    checkpoint, source_model = load_source_checkpoint(
+        config, checkpoint_path, device
+    )
+    source_model.eval().requires_grad_(False)
+    dataset = build_dataset(config, args.split, augment=False)
+    indices = args.indices or list(range(min(args.num_images, len(dataset))))
+    if any(index >= len(dataset) for index in indices):
+        raise IndexError(f"Dataset index exceeds split size {len(dataset)}")
+    output = Path(args.output_dir).expanduser().resolve()
+    output.mkdir(parents=True, exist_ok=True)
+    times = [float(time) for time in args.times]
+    smoothing = config["flow"].get("target_smoothing", {})
+    smoothing_p = (
+        args.target_smoothing_p
+        if "--target-smoothing-p" in args._provided_options
+        else float(smoothing.get("p", 0.0)) if smoothing.get("enabled", False)
+        else 0.0
+    )
+    rows: list[dict[str, Any]] = []
+    source_accuracies: list[float] = []
+    shared_epsilon_verified = True
+    shapes: dict[str, list[int]] = {}
+
+    for batch_start in range(0, len(indices), args.batch_size):
+        batch_indices = indices[batch_start:batch_start + args.batch_size]
+        samples = [
+            _as_visualization_sample(dataset[index], index)
+            for index in batch_indices
+        ]
+        image = torch.stack([sample["image"] for sample in samples]).to(device)
+        target_full = torch.stack([
+            sample["target"].long() for sample in samples
+        ]).to(device)
+        mu_raw, _ = source_statistics(source_model, image)
+        targets = prepare_state_targets(
+            target_full,
+            num_classes=config["dataset"]["num_classes"],
+            state_size=mu_raw.shape[-2:],
+            ignore_index=config["dataset"]["void_class_index"],
+            mask_pixel_losses=True,
+        )
+        x1 = smooth_categorical_target(targets.one_hot_state, smoothing_p)
+        target = targets.target_state
+        source_prediction = mu_raw.argmax(dim=1)
+        epsilon = shared_standard_normal(
+            mu_raw, [args.seed + index for index in batch_indices]
+        )
+        comparison = build_comparison_trajectories(
+            mu_raw, x1, target, times, conditions, settings, config, epsilon
+        )
+        shared_epsilon_verified = shared_epsilon_verified and torch.equal(
+            comparison["epsilon"], epsilon
+        )
+        batch_stats = {
+            condition: batched_interpolation_statistics(
+                comparison["states"][condition], times, target,
+                source_prediction, config["dataset"]["void_class_index"],
+            )
+            for condition in conditions
+        }
+
+        for offset, (dataset_index, sample) in enumerate(
+            zip(batch_indices, samples, strict=True)
+        ):
+            ordinal = batch_start + offset
+            sample_dir = output / f"sample_{ordinal:03d}"
+            sample_dir.mkdir(parents=True, exist_ok=True)
+            valid = target[offset:offset + 1] != config["dataset"]["void_class_index"]
+            source_correct = source_prediction[offset:offset + 1] == target[offset:offset + 1]
+            valid_count = int(valid.sum())
+            source_accuracy = (
+                float((source_correct & valid).sum()) / valid_count
+                if valid_count else float("nan")
+            )
+            source_accuracies.append(source_accuracy)
+            difference_ratios = [float("nan")] * len(times)
+            if {"path_only", "path_variance"}.issubset(conditions):
+                difference_ratios = _save_difference_figure(
+                    sample_dir / "difference.png",
+                    [state[offset:offset + 1] for state in comparison["states"]["path_only"]],
+                    [state[offset:offset + 1] for state in comparison["states"]["path_variance"]],
+                    times, valid,
+                )
+
+            sample_rows = []
+            for condition in conditions:
+                condition_rows = batch_stats[condition][offset][0]
+                sigma = (
+                    comparison["adaptive_std"]
+                    if condition == "path_variance" else comparison["fixed_std"]
+                )[offset:offset + 1]
+                coefficients = comparison["lambda"][condition]
+                for time_index, row in enumerate(condition_rows):
+                    coefficient = coefficients[time_index]
+                    if coefficient.ndim == 1:
+                        coefficient = coefficient[:, None, None].expand_as(
+                            comparison["difficulty"]
+                        )
+                    scheduler_stats = adaptive_scheduler_statistics(
+                        comparison["entropy"], comparison["difficulty"],
+                        coefficient, target != config["dataset"]["void_class_index"],
+                    )[offset]
+                    sigma_values = sigma[valid]
+                    enriched = {
+                        "mode": condition,
+                        "condition": condition,
+                        "image_index": dataset_index,
+                        "sample_id": str(sample.get("sample_id", dataset_index)),
+                        "source_accuracy": source_accuracy,
+                        "sigma_mean": float(sigma_values.mean()),
+                        "sigma_min": float(sigma_values.min()),
+                        "sigma_max": float(sigma_values.max()),
+                        "path_only_vs_path_variance_difference_ratio": (
+                            difference_ratios[time_index]
+                        ),
+                        **row,
+                        **scheduler_stats,
+                    }
+                    rows.append(enriched)
+                    sample_rows.append(enriched)
+            _write_csv(sample_dir / "stats.csv", sample_rows)
+
+            display_image = _inverse_normalized_image(sample["image"], config)
+            display_image = _state_to_display(
+                display_image[None], sample
+            )[0].cpu()
+            display_target = sample["target"].cpu()
+            source_display = _semantic_display(
+                mu_raw[offset:offset + 1], sample
+            )
+            sample_states = {
+                condition: [state[offset:offset + 1] for state in states]
+                for condition, states in comparison["states"].items()
+            }
+            sample_x0 = {
+                condition: state[offset:offset + 1]
+                for condition, state in comparison["x0"].items()
+            }
+            sample_x1 = x1[offset:offset + 1]
+            _save_experiment_comparison(
+                sample_dir / "comparison.png", display_image, display_target,
+                source_display, sample_states, sample_x0, sample_x1, times, sample,
+            )
+            if {"path_only", "path_variance"}.issubset(conditions):
+                _save_path_variance_comparison(
+                    sample_dir / "path_vs_path_variance.png", display_target,
+                    sample_states, sample_x0, times, sample,
+                )
+            if "path_only" in conditions or "path_variance" in conditions:
+                adaptive_condition = (
+                    "path_only" if "path_only" in conditions else "path_variance"
+                )
+                _save_scheduler_figure(
+                    sample_dir / "scheduler.png", display_image, source_display,
+                    comparison["entropy"][offset].cpu(),
+                    comparison["difficulty"][offset].cpu(),
+                    [
+                        coefficient[offset].cpu()
+                        for coefficient in comparison["lambda"][adaptive_condition]
+                    ],
+                    times,
+                    "Entropy Adaptive | exponential | config-driven",
+                )
+            if "path_variance" in conditions:
+                _save_experiment_variance_figure(
+                    sample_dir / "variance.png", display_image,
+                    comparison["variance_entropy"][offset].cpu(),
+                    comparison["variance_difficulty"][offset].cpu(),
+                    comparison["adaptive_std"][offset].cpu(),
+                    comparison["variance_map"][offset].cpu(),
+                    comparison["x0"].get("path_only", comparison["x0"]["path_variance"])[offset:offset + 1],
+                    comparison["x0"]["path_variance"][offset:offset + 1], sample,
+                )
+        shapes = {
+            "mu_raw": [1, *mu_raw.shape[1:]],
+            "epsilon": [1, *epsilon.shape[1:]],
+            "x0": [1, *next(iter(comparison["x0"].values())).shape[1:]],
+            "x1": [1, *x1.shape[1:]],
+            "lambda": [1, *comparison["difficulty"].shape[1:]],
+            "sigma": [1, *comparison["adaptive_std"].shape[1:]],
+        }
+
+    aggregate = _aggregate_rows(rows, times)
+    for aggregate_row in aggregate:
+        selected = [
+            row for row in rows
+            if row["mode"] == aggregate_row["mode"]
+            and row["t"] == aggregate_row["t"]
+        ]
+        for key in (
+            "source_accuracy", "sigma_mean",
+            "path_only_vs_path_variance_difference_ratio",
+        ):
+            finite = [float(row[key]) for row in selected if math.isfinite(row[key])]
+            aggregate_row[key] = (
+                sum(finite) / len(finite) if finite else float("nan")
+            )
+        aggregate_row["sigma_min"] = min(
+            (float(row["sigma_min"]) for row in selected), default=float("nan")
+        )
+        aggregate_row["sigma_max"] = max(
+            (float(row["sigma_max"]) for row in selected), default=float("nan")
+        )
+    _write_csv(output / "summary.csv", aggregate)
+    plots = output / "summary_plots"
+    plots.mkdir(parents=True, exist_ok=True)
+    _save_summary_plots(aggregate, plots)
+    summary = {
+        "experiment": args.experiment,
+        "conditions": list(conditions),
+        "checkpoint": str(checkpoint_path),
+        "checkpoint_stage": checkpoint.get("stage"),
+        "indices": indices,
+        "times": times,
+        "settings": settings,
+        "shapes": shapes,
+        "shared_epsilon": shared_epsilon_verified,
+        "source_accuracy_mean": (
+            float(np.nanmean(source_accuracies)) if source_accuracies else float("nan")
+        ),
+        "definitions": {
+            "baseline": "fixed variance + linear path",
+            "path_only": "fixed variance + entropy-adaptive exponential path",
+            "path_variance": (
+                "entropy-adaptive variance + entropy-adaptive exponential path"
+            ),
+        },
+        "trajectory": aggregate,
+    }
+    with (output / "summary.json").open("w", encoding="utf-8") as handle:
+        json.dump(summary, handle, indent=2, allow_nan=True)
+    print(json.dumps(summary, indent=2, allow_nan=True))
+    return summary
+
+
+@torch.inference_mode()
 def run(args: argparse.Namespace) -> dict[str, Any]:
     config = load_config(args.config, args.set)
+    if args.experiment is not None:
+        return run_comparison_experiment(args, config)
     scheduler_settings = (
         resolve_entropy_scheduler_settings(args, config)
         if args.path_type == "entropy_adaptive" else None
@@ -852,7 +1491,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 
     for batch_start in range(0, len(indices), args.batch_size):
         batch_indices = indices[batch_start:batch_start + args.batch_size]
-        samples = [dataset[dataset_index] for dataset_index in batch_indices]
+        samples = [
+            _as_visualization_sample(dataset[index], index)
+            for index in batch_indices
+        ]
         image = torch.stack([sample["image"] for sample in samples]).to(device)
         target_full = torch.stack(
             [sample["target"].long() for sample in samples]

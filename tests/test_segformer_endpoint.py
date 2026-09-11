@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 import torch
 
+import training_objectives as training_objectives_module
 from adaptive_path import bounded_gaussian_variance_maps, source_entropy_difficulty
 from config import load_config
 from model import DiscreteFlowMapModel
@@ -120,8 +121,60 @@ def test_segformer_endpoint_rejects_quarter_resolution_state():
 def test_endpoint_segformer_pretrained_is_false_by_default_and_rgb_pretraining_rejected():
     config = load_config(CONFIG)
     assert config["model"]["endpoint"]["pretrained"] is False
+    assert config["runtime"]["debug_first_batch_shapes"] is False
+    assert load_config(
+        CONFIG, ["runtime.debug_first_batch_shapes=true"]
+    )["runtime"]["debug_first_batch_shapes"] is True
     with pytest.raises(ValueError, match="requires pretrained=false"):
         load_config(CONFIG, ["model.endpoint.pretrained=true"])
+
+
+def test_debug_shapes_print_once_on_rank_zero(capsys):
+    config = load_config(CONFIG, [
+        "runtime.debug_first_batch_shapes=true",
+        "model.endpoint.segformer_variant=b0",
+        "model.endpoint.image_encoder.channels=4",
+        "model.endpoint.image_encoder.blocks=0",
+        "model.endpoint.image_encoder.growth_channels=2",
+        "model.endpoint.state_encoder.channels=4",
+        "model.endpoint.state_encoder.blocks=0",
+        "model.endpoint.fusion.channels=8",
+        "model.endpoint.decoder_channels=8",
+        "model.endpoint.time_embedding_dim=16",
+    ])
+    endpoint = DiscreteFlowMapModel(config["model"])
+    source = UNetSourceGenerator(20, 4, False, 1.0, 1)
+    adapter = DDPCompatibleTrainingModel(endpoint, source, config)
+    kwargs = {
+        "operation": "stage1_objectives",
+        "image": torch.randn(1, 3, 32, 64),
+        "target": torch.randint(0, 20, (1, 32, 64)),
+        "epoch_index": 0,
+        "progress_in_epoch": 0.0,
+    }
+    compute_model_training_objectives(adapter, **kwargs)
+    first = capsys.readouterr().out
+    compute_model_training_objectives(adapter, **kwargs)
+    second = capsys.readouterr().out
+
+    assert first.count("[debug:first-training-batch-shapes][rank=0]") == 1
+    for name in (
+        "image", "mu_raw", "x0", "x1", "diagonal_state / xs",
+        "image_feat", "state_feat", "fused", "SegFormer stage1",
+        "SegFormer stage2", "SegFormer stage3", "SegFormer stage4",
+        "decode head logits (pre-upsample)", "final endpoint logits",
+    ):
+        assert name in first
+    assert "(1, 20, 32, 64)" in first
+    assert second == ""
+    assert adapter._debug_first_batch_shapes_logged
+    assert endpoint._debug_capture_shapes is False
+
+
+def test_debug_shapes_rank_check(monkeypatch):
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda: 1)
+    assert training_objectives_module._rank_zero() is False
 
 
 @pytest.mark.parametrize(

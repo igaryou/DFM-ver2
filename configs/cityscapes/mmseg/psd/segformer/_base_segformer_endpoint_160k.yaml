@@ -1,5 +1,9 @@
 extends: ../original/joint_swin_t_segformer_b1_standard_ce_160k.yaml
 
+runtime:
+  # Set true (or override from the CLI) to print rank-0 shapes for one batch.
+  debug_first_batch_shapes: false
+
 model:
   # Flow states stay at image resolution. Only the endpoint SegFormer creates
   # H/4--H/32 representations internally.
@@ -11,7 +15,7 @@ model:
     input_already_normalized: false
   endpoint:
     type: segformer
-    segformer_variant: b2
+    segformer_variant: b3
     pretrained: false
     image_encoder:
       type: rrdb
