@@ -21,18 +21,19 @@ from distributed import (
     validate_global_batch_size,
 )
 from inference import (
-    sample_segmentation, sample_segmentation_ensemble,
+    sample_lidc_distribution, sample_segmentation, sample_segmentation_ensemble,
     terminal_state_to_original_prediction,
 )
-from metrics import SegmentationMetrics
+from metrics import LIDCStochasticMetrics, SegmentationMetrics
 from model_factory import build_models
-from utils import autocast_context, seed_everything
+from utils import autocast_context, init_wandb, seed_everything
 from visualization import save_prediction
 
 
 @torch.no_grad()
 def evaluate(config: dict, checkpoint_path: str | Path) -> dict:
     context = setup_distributed(config)
+    wandb_run = None
     try:
         assert_config_equal_across_ranks(config, context)
         device = context.device
@@ -107,6 +108,11 @@ def evaluate(config: dict, checkpoint_path: str | Path) -> dict:
                 "exclude_void_from_prediction"
             ],
         )
+        stochastic_counts = config["evaluation"]["stochastic_num_samples"]
+        lidc_metrics = (
+            LIDCStochasticMetrics(stochastic_counts, device=device)
+            if stochastic_counts else None
+        )
         checkpoint_stem = Path(checkpoint_path).stem
         output_dir = (
             Path(config["experiment"]["output_dir"])
@@ -152,7 +158,11 @@ def evaluate(config: dict, checkpoint_path: str | Path) -> dict:
                 image = image.to(device, non_blocking=True)
                 target = target.to(device, non_blocking=True)
                 with autocast_context(config, device):
-                    if config["evaluation"]["num_samples"] == 1:
+                    if lidc_metrics is not None:
+                        prediction_samples, prediction = sample_lidc_distribution(
+                            model, source_model, image, config, stochastic_counts
+                        )
+                    elif config["evaluation"]["num_samples"] == 1:
                         prediction = sample_segmentation(
                             model, source_model, image, config
                         )
@@ -161,6 +171,10 @@ def evaluate(config: dict, checkpoint_path: str | Path) -> dict:
                             model, source_model, image, config
                         )
                 metrics.update(prediction, target)
+                if lidc_metrics is not None:
+                    lidc_metrics.update(
+                        prediction_samples, batch["masks"], prediction
+                    )
                 items = [(image, target, prediction)]
             if context.is_main_process and config["evaluation"]["save_predictions"]:
                 remaining = config["evaluation"]["max_visualizations"] - visualized
@@ -188,6 +202,9 @@ def evaluate(config: dict, checkpoint_path: str | Path) -> dict:
             metrics.confusion_matrix, context
         )
         result = metrics.compute()
+        if lidc_metrics is not None:
+            lidc_metrics.synchronize()
+            result.update(lidc_metrics.compute())
         result.update({
             "dataset_protocol": config["dataset"].get("protocol", "mmseg"),
             "evaluation_resolution": list(config["dataset"]["image_size"]),
@@ -201,9 +218,22 @@ def evaluate(config: dict, checkpoint_path: str | Path) -> dict:
             ) as handle:
                 json.dump(result, handle, indent=2)
             print(json.dumps(result, indent=2))
+            wandb_run = (
+                init_wandb(config)
+                if config["dataset"].get("protocol") == "lidc" else None
+            )
+            if wandb_run is not None:
+                split = config["evaluation"]["split"]
+                wandb_run.log({
+                    f"{split}/{key}": value
+                    for key, value in result.items()
+                    if isinstance(value, (int, float))
+                })
         barrier(context)
         return result
     finally:
+        if wandb_run is not None:
+            wandb_run.finish()
         cleanup_distributed(context)
 
 

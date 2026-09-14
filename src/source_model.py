@@ -86,6 +86,7 @@ class SegFormerSourceGenerator(nn.Module):
         input_already_normalized: bool = False,
         state_downsample_factor: int = 4,
         decoder_type: str = "custom",
+        in_channels: int = 3,
     ) -> None:
         super().__init__()
         if variant not in self.MODEL_NAMES:
@@ -96,10 +97,15 @@ class SegFormerSourceGenerator(nn.Module):
             from transformers import SegformerModel
         except ImportError as exc:
             raise RuntimeError("source.backbone=segformer requires transformers") from exc
+        if pretrained and in_channels != 3:
+            raise ValueError(
+                "pretrained SegFormer source currently requires a 3-channel input; "
+                "use source.pretrained=false for 1-channel LIDC CT images"
+            )
         if pretrained:
             self.encoder = SegformerModel.from_pretrained(self.MODEL_NAMES[variant])
         else:
-            self.encoder = SegformerModel(build_segformer_config(variant, 3))
+            self.encoder = SegformerModel(build_segformer_config(variant, in_channels))
         self.num_classes = num_classes
         self.fixed_std = None if learned_logvar else fixed_std
         self.mu_tanh_scale = mu_tanh_scale
@@ -136,12 +142,16 @@ class SegFormerSourceGenerator(nn.Module):
             # Match SegformerForSemanticSegmentation.post_init() while avoiding
             # construction of a second, immediately discarded MiT encoder.
             self.decode_head.apply(self.encoder._init_weights)
+        normalization = (
+            ([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+            if in_channels == 3 else ([0.5], [0.5])
+        )
         self.register_buffer(
-            "mean", torch.tensor([0.485, 0.456, 0.406])[None, :, None, None],
+            "mean", torch.tensor(normalization[0])[None, :, None, None],
             persistent=False,
         )
         self.register_buffer(
-            "std", torch.tensor([0.229, 0.224, 0.225])[None, :, None, None],
+            "std", torch.tensor(normalization[1])[None, :, None, None],
             persistent=False,
         )
         if freeze_encoder:
@@ -362,6 +372,7 @@ def build_source_model(config: dict):
             source["input_already_normalized"],
             config["model"].get("state_downsample_factor", 4),
             source["segformer_decoder"],
+            config["dataset"].get("in_channels", 3),
         )
     checkpoint_loaded = False
     if source["checkpoint"]:

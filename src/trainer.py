@@ -40,12 +40,13 @@ from distributed import (
     wrap_ddp,
 )
 from inference import (
+    sample_lidc_distribution,
     sample_segmentation,
     sample_segmentation_ensemble,
     state_to_original_continuous,
     terminal_state_to_original_prediction,
 )
-from metrics import SegmentationMetrics
+from metrics import LIDCStochasticMetrics, SegmentationMetrics
 from model_factory import build_models
 from source_model import source_statistics
 from training_objectives import (
@@ -1120,6 +1121,11 @@ def validate(
             "exclude_void_from_prediction"
         ],
     )
+    stochastic_counts = config["evaluation"]["stochastic_num_samples"]
+    lidc_metrics = (
+        LIDCStochasticMetrics(stochastic_counts, device=context.device)
+        if stochastic_counts else None
+    )
     visualized = 0
     maximum_batches = config["evaluation"]["max_batches"]
     for batch_index, batch in enumerate(loader):
@@ -1167,13 +1173,23 @@ def validate(
                 context.device, non_blocking=True
             )
             with autocast_context(config, context.device):
-                if config["evaluation"]["num_samples"] == 1:
+                if lidc_metrics is not None:
+                    prediction_samples, prediction = sample_lidc_distribution(
+                        endpoint, source, image, config, stochastic_counts
+                    )
+                elif config["evaluation"]["num_samples"] == 1:
                     prediction = sample_segmentation(endpoint, source, image, config)
                 else:
                     prediction = sample_segmentation_ensemble(
                         endpoint, source, image, config
                     )
             metrics.update(prediction, target)
+            if lidc_metrics is not None:
+                lidc_metrics.update(
+                    prediction_samples,
+                    validation_items[0]["masks"],
+                    prediction,
+                )
             visualization_items = [(image, target, prediction)]
         if context.is_main_process:
             remaining = config["evaluation"]["max_visualizations"] - visualized
@@ -1203,6 +1219,9 @@ def validate(
         metrics.confusion_matrix, context
     )
     result = metrics.compute()
+    if lidc_metrics is not None:
+        lidc_metrics.synchronize()
+        result.update(lidc_metrics.compute())
     endpoint.train(endpoint_was_training)
     if source is not None:
         source.train(source_was_training)
@@ -1529,6 +1548,17 @@ def run_training(config: dict, *, joint_entrypoint: bool = False) -> dict:
                     displayed_epoch, state.global_step, trigger,
                     result["mIoU"], result["pixel_acc"], result["mAcc"],
                 )
+                if config["dataset"].get("protocol") == "lidc":
+                    lidc_summary = " ".join(
+                        f"{key}={value:.6g}"
+                        for key, value in result.items()
+                        if key.startswith(("ged", "hm_iou", "mdm"))
+                        or key in {
+                            "dice", "foreground_iou", "precision",
+                            "sensitivity", "specificity",
+                        }
+                    )
+                    logger.info("validation LIDC %s", lidc_summary)
                 if wandb_run is not None:
                     wandb_payload = {
                         "validation/mIoU": result["mIoU"],
@@ -1541,6 +1571,18 @@ def run_training(config: dict, *, joint_entrypoint: bool = False) -> dict:
                         if (key.startswith("source_") or key.startswith("flow_"))
                         and isinstance(value, (int, float))
                     })
+                    if config["dataset"].get("protocol") == "lidc":
+                        wandb_payload.update({
+                            f"val/{key}": value
+                            for key, value in result.items()
+                            if isinstance(value, (int, float)) and (
+                                key.startswith(("ged", "hm_iou", "mdm"))
+                                or key in {
+                                    "dice", "foreground_iou", "precision",
+                                    "sensitivity", "specificity",
+                                }
+                            )
+                        })
                     if math.isfinite(state.best_source_miou):
                         wandb_payload["best/source_mIoU"] = state.best_source_miou
                     if math.isfinite(state.best_flow_miou):

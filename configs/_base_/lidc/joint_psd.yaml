@@ -1,0 +1,51 @@
+extends: diagonal.yaml
+
+experiment:
+  name: dfm_joint_psd_lidc_base
+  output_dir: /home/igarashi_25/DFM/results/lidc/joint_psd
+  stage: joint_training
+
+source:
+  type: trainable_segformer
+  backbone: segformer
+  segformer_variant: b1
+  segformer_decoder: custom
+  pretrained: false
+  checkpoint: null
+  freeze: false
+  freeze_encoder: false
+  prior_type: image_gaussian
+  learned_logvar: false
+  fixed_std: 1.0
+  use_loss_align: true
+  detach_from_flow: true
+  input_already_normalized: true
+  supervision:
+    type: align
+    weight: 0.15
+    include_void: false
+
+loss:
+  primary:
+    type: diagonal_ce
+    weight: 1.0
+  consistency:
+    enabled: true
+    type: psd
+    weight: 0.5
+    start_epoch: 0
+    start: {unit: epoch, value: 0}
+    warmup_epochs: 0
+    schedule: linear
+    max_weight: 1.0
+    psd:
+      loss_resolution: state
+      ignore_void: false
+
+evaluation:
+  stochastic_num_samples: [16, 32]
+  aggregation: probability_mean
+
+wandb:
+  name: dfm-joint-psd-lidc-base
+  tags: [lidc, 2-class, joint, psd, segformer-source, rrdb, unet, full-resolution-state]

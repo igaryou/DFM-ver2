@@ -1,0 +1,25 @@
+extends: ../../_base_/lidc/joint_psd.yaml
+
+experiment:
+  name: dfm_lidc_segformer_source_align_psd
+  output_dir: /home/igarashi_25/DFM/results/lidc/segformer_source_align_psd
+
+model:
+  state_downsample_factor: 1
+  image_encoder:
+    type: rrdb
+    pretrained: false
+    freeze: false
+    input_already_normalized: true
+  endpoint:
+    type: unet
+
+source:
+  segformer_variant: b1
+  checkpoint: null
+
+training:
+  batch_size: 16
+
+wandb:
+  name: dfm-lidc-segformer-source-align-psd

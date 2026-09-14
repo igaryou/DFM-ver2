@@ -390,6 +390,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "batch_size": 4,
         "num_steps": 15,
         "num_samples": 1,
+        "stochastic_num_samples": [],
         "aggregation": "probability_mean",
         "sampler": "flow_map",
         "save_predictions": True,
@@ -609,8 +610,10 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
             raise ValueError("LIDC evaluation.eval_class_indices must be [0, 1]")
         if config["evaluation"]["exclude_void_from_prediction"]:
             raise ValueError("LIDC must not exclude a prediction class as void")
-        if config["source"]["backbone"] != "unet":
-            raise ValueError("LIDC currently uses the 1-channel-capable UNet source")
+        if config["source"]["backbone"] not in {"unet", "segformer"}:
+            raise ValueError("LIDC source.backbone must be unet or segformer")
+        if config["source"]["backbone"] == "segformer" and config["source"]["pretrained"]:
+            raise ValueError("LIDC 1-channel SegFormer source requires pretrained=false")
         if config["model"]["image_encoder"]["type"] != "rrdb":
             raise ValueError("LIDC currently uses the 1-channel-capable RRDB image encoder")
     fixed_resize = dataset["fixed_resize"]
@@ -744,6 +747,20 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("evaluation.num_steps must be a positive integer")
     if isinstance(evaluation["num_samples"], bool) or not isinstance(evaluation["num_samples"], int) or evaluation["num_samples"] <= 0:
         raise ValueError("evaluation.num_samples must be a positive integer")
+    stochastic_counts = evaluation["stochastic_num_samples"]
+    if not isinstance(stochastic_counts, list) or any(
+        isinstance(value, bool) or not isinstance(value, int) or value <= 0
+        for value in stochastic_counts
+    ):
+        raise ValueError(
+            "evaluation.stochastic_num_samples must be a list of positive integers"
+        )
+    if stochastic_counts != sorted(set(stochastic_counts)):
+        raise ValueError(
+            "evaluation.stochastic_num_samples must be sorted and contain no duplicates"
+        )
+    if stochastic_counts and dataset["protocol"] != "lidc":
+        raise ValueError("stochastic_num_samples is currently supported only for LIDC")
     if evaluation["aggregation"] not in {"probability_mean", "majority_vote"}:
         raise ValueError("evaluation.aggregation must be probability_mean or majority_vote")
     evaluation_interval = config["evaluation"]["interval"]

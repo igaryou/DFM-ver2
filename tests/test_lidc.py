@@ -20,6 +20,10 @@ from training_objectives import (
 
 
 CONFIG_PATH = Path(__file__).parents[1] / "configs/lidc/diagonal/standard.yaml"
+JOINT_CONFIG_PATH = (
+    Path(__file__).parents[1]
+    / "configs/lidc/psd/segformer_source_align_joint.yaml"
+)
 REAL_CACHE = Path("/home/igarashi_25/datasets/LIDC/LIDC_data/lidc_memmap_v1")
 
 
@@ -96,6 +100,98 @@ def test_lidc_resolved_config_is_independent_and_full_resolution():
     assert config["model"]["num_classes"] == 2
     assert config["model"]["state_downsample_factor"] == 1
     assert config["training"]["batch_size"] == 16
+
+
+def test_lidc_joint_psd_config_contract():
+    config = load_config(JOINT_CONFIG_PATH)
+    assert config["experiment"]["stage"] == "joint_training"
+    assert config["dataset"]["in_channels"] == 1
+    assert config["model"]["state_downsample_factor"] == 1
+    assert config["model"]["image_encoder"]["type"] == "rrdb"
+    assert config["model"]["endpoint"]["type"] == "unet"
+    assert config["source"]["backbone"] == "segformer"
+    assert config["source"]["segformer_variant"] == "b1"
+    assert config["source"]["pretrained"] is False
+    assert config["source"]["fixed_std"] == 1.0
+    assert config["source"]["detach_from_flow"] is True
+    assert config["source"]["supervision"]["type"] == "align"
+    assert config["source"]["supervision"]["weight"] == 0.15
+    assert config["loss"]["consistency"]["type"] == "psd"
+    assert config["loss"]["consistency"]["weight"] == 0.5
+    assert config["evaluation"]["stochastic_num_samples"] == [16, 32]
+
+
+def test_lidc_segformer_source_is_one_channel_and_full_resolution():
+    config = load_config(JOINT_CONFIG_PATH)
+    _, source = build_models(config, torch.device("cpu"))
+    first_projection = source.encoder.stages[0].patch_embeddings.proj
+    assert first_projection.in_channels == 1
+    with torch.no_grad():
+        x0, mu, logvar = source(torch.randn(1, 1, 128, 128))
+    assert x0.shape == mu.shape == logvar.shape == (1, 2, 128, 128)
+
+
+def test_three_channel_segformer_source_regression():
+    from source_model import SegFormerSourceGenerator
+
+    source = SegFormerSourceGenerator(
+        num_classes=2, variant="b0", pretrained=False, decoder_channels=8,
+        freeze_encoder=False, learned_logvar=False, fixed_std=1.0,
+        mu_tanh_scale=0.0, input_already_normalized=True,
+        state_downsample_factor=1, decoder_type="custom", in_channels=3,
+    )
+    assert source.encoder.stages[0].patch_embeddings.proj.in_channels == 3
+    with torch.no_grad():
+        x0, mu, logvar = source(torch.randn(1, 3, 32, 32))
+    assert x0.shape == mu.shape == logvar.shape == (1, 2, 32, 32)
+
+
+def test_lidc_real_modules_obey_joint_gradient_boundaries():
+    config = load_config(JOINT_CONFIG_PATH)
+    config["dataset"]["image_size"] = [32, 32]
+    config["model"]["fusion_channels"] = 8
+    config["model"]["rrdb_blocks"] = 0
+    config["model"]["rrdb_growth_channels"] = 4
+    config["model"]["unet"].update({
+        "base_channels": 8, "channel_mults": [1, 2], "num_res_blocks": 1,
+        "attention_levels": [], "num_heads": 1, "time_embedding_dim": 16,
+    })
+    config["source"]["segformer_variant"] = "b0"
+    config["source"]["decoder_channels"] = 8
+    endpoint, source = build_models(config, torch.device("cpu"))
+    adapter = DDPCompatibleTrainingModel(endpoint, source, config)
+    target = torch.randint(0, 2, (1, 32, 32))
+    result = compute_model_training_objectives(
+        adapter, operation="joint_objectives",
+        image=torch.randn(1, 1, 32, 32),
+        target=target,
+        spatial_valid_mask=torch.ones_like(target, dtype=torch.bool),
+        epoch_index=0, progress_in_epoch=0.0, optimizer_step=0,
+    )
+    source_parameters = [parameter for parameter in source.parameters() if parameter.requires_grad]
+    rrdb_parameters = [
+        parameter for parameter in endpoint.image_encoder.parameters()
+        if parameter.requires_grad
+    ]
+    unet_parameters = [
+        parameter for name, parameter in endpoint.named_parameters()
+        if parameter.requires_grad and not name.startswith("image_encoder.")
+    ]
+
+    def grad_norm(loss, parameters, *, retain_graph=True):
+        gradients = torch.autograd.grad(
+            loss, parameters, allow_unused=True, retain_graph=retain_graph
+        )
+        return sum(float(gradient.norm()) for gradient in gradients if gradient is not None)
+
+    assert grad_norm(result["source_objective"], source_parameters) > 0.0
+    flow_objective = result["diagonal_objective"] + result["psd_objective"]
+    assert grad_norm(flow_objective, source_parameters) == 0.0
+    assert grad_norm(flow_objective, rrdb_parameters) > 0.0
+    assert grad_norm(flow_objective, unet_parameters) > 0.0
+    assert grad_norm(result["loss"], source_parameters) > 0.0
+    assert grad_norm(result["loss"], rrdb_parameters) > 0.0
+    assert grad_norm(result["loss"], unet_parameters, retain_graph=False) > 0.0
 
 
 def test_lidc_full_resolution_training_and_sampling(tmp_path, monkeypatch):

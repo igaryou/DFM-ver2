@@ -234,6 +234,37 @@ def sample_segmentation_ensemble(
     return aggregate.argmax(dim=1)
 
 
+@torch.no_grad()
+def sample_lidc_distribution(
+    model,
+    source_model,
+    image: torch.Tensor,
+    config: dict,
+    sample_counts: list[int],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Generate one LIDC batch up to max(N), without retaining other batches."""
+    if config.get("dataset", {}).get("protocol") != "lidc":
+        raise ValueError("sample_lidc_distribution is LIDC-only")
+    if not sample_counts or sample_counts != sorted(set(sample_counts)):
+        raise ValueError("sample_counts must be a non-empty sorted unique list")
+    maximum = sample_counts[-1]
+    predictions = []
+    foreground_probability_sum = torch.zeros(
+        image.shape[0], *image.shape[-2:], device=image.device, dtype=torch.float32
+    )
+    for _ in range(maximum):
+        probability = sample_segmentation_probabilities(
+            model, source_model, image, config
+        )
+        if probability.shape[1] != 2:
+            raise AssertionError("LIDC distribution sampling requires two classes")
+        predictions.append(probability.argmax(dim=1))
+        foreground_probability_sum += probability[:, 1]
+    stacked = torch.stack(predictions, dim=1)
+    deterministic = (foreground_probability_sum / maximum >= 0.5).long()
+    return stacked, deterministic
+
+
 def state_to_original_continuous(
     state: torch.Tensor,
     model_shape: tuple[int, int] | list[int],
