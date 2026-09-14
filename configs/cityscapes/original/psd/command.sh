@@ -18,6 +18,17 @@ uv run torchrun \
   src/train_joint.py \
   --config configs/cityscapes/original/psd/joint_bounded_gaussian_b1_exponential_path_trainable_stage2_from_epoch0150.yaml
 
+cd /home/igarashi_25/DFM
+
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+CUDA_VISIBLE_DEVICES=2,3 \
+uv run torchrun \
+  --standalone \
+  --nproc_per_node=2 \
+  src/train_joint.py \
+  --config configs/cityscapes/original/psd/joint_image_gaussian_b1_align_150ep_source_then_trainable_800ep.yaml
+
+
 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
 CUDA_VISIBLE_DEVICES=2,3 \
 uv run torchrun \

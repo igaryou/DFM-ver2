@@ -6,5 +6,12 @@ uv run torchrun \
   --standalone \
   --nproc_per_node=2 \
   src/train_joint.py \
-  --config configs/cityscapes/mmseg/psd/segformer/joint_ce_160k.yaml \
-  --set runtime.debug_first_batch_shapes=true
+  --config configs/cityscapes/mmseg/psd/segformer/joint_ce_160k.yaml 
+
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+CUDA_VISIBLE_DEVICES=2,3 \
+uv run torchrun \
+  --standalone \
+  --nproc_per_node=2 \
+  src/train_joint.py \
+  --config configs/cityscapes/mmseg/psd/segformer/joint_align_160k.yaml 
