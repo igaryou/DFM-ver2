@@ -116,3 +116,14 @@ python scripts/diagnose_psd_time_maps.py \
   --psd-weight 0.5 \
   --teacher-confidence-threshold 0.9 \
   --seed 42
+
+
+cd /home/igarashi_25/DFM
+
+CUDA_VISIBLE_DEVICES=2  python src/diagnose_cityscapes_endpoint.py \
+  --config configs/cityscapes/mmseg/psd/segformer/joint_align_160k.yaml \
+  --checkpoint results/cityscapes/segformer_endpoint_align_160k/step_016000.pt \
+  --output-dir results/cityscapes/segformer_endpoint_align_160k/diagnostics_16k \
+  --t-values 0 0.1 0.25 0.5 0.75 \
+  --num-visualizations 16 \
+  --seed 42

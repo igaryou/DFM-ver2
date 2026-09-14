@@ -36,7 +36,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "name": "cityscapes",
         "protocol": "mmseg",
         "root": "",
+        "pickle_path": None,
+        "split_path": None,
+        "cache_dir": None,
         "num_classes": 20,
+        "in_channels": 3,
         "eval_num_classes": 19,
         "void_class_index": 19,
         "background_index": None,
@@ -59,6 +63,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "augmentation": {
         "enabled": True,
         "horizontal_flip": {"enabled": True, "probability": 0.5},
+        "vertical_flip": {"enabled": False, "probability": 0.5},
+        "random_rotation_90": {"enabled": False},
         "color_jitter": {
             "enabled": True,
             "brightness": 0.2,
@@ -158,6 +164,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "pretrained": True,
         "checkpoint": None,
         "freeze": False,
+        "detach_from_flow": False,
         "freeze_encoder": False,
         "decoder_channels": 128,
         "learned_logvar": False,
@@ -488,12 +495,14 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
     if stage not in valid_stages:
         raise ValueError(f"experiment.stage must be one of {sorted(valid_stages)}")
     dataset = config["dataset"]
-    if dataset["name"] not in {"cityscapes", "ade20k"}:
-        raise ValueError("dataset.name must be cityscapes or ade20k")
+    if dataset["name"] not in {"cityscapes", "ade20k", "lidc"}:
+        raise ValueError("dataset.name must be cityscapes, ade20k, or lidc")
     if dataset["protocol"] not in {"mmseg", "original"}:
         raise ValueError("dataset.protocol must be mmseg or original")
     if dataset["name"] != "cityscapes" and dataset["protocol"] != "mmseg":
         raise ValueError("dataset.protocol=original is currently Cityscapes-only")
+    if dataset["in_channels"] not in {1, 3}:
+        raise ValueError("dataset.in_channels must be 1 or 3")
     if dataset["num_classes"] != config["model"]["num_classes"]:
         raise ValueError("dataset.num_classes and model.num_classes must match")
     exclude_void = config["evaluation"]["exclude_void_from_prediction"]
@@ -543,7 +552,7 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
                 "Normalized Cityscapes input requires "
                 "source.input_already_normalized=true for SegFormer"
             )
-    else:
+    elif dataset["name"] == "ade20k":
         if dataset["num_classes"] != 151 or dataset["eval_num_classes"] != 150:
             raise ValueError("ADE20K 151-state protocol requires 151 model and 150 eval classes")
         if dataset["background_index"] != 0 or dataset["ignore_index"] != 0:
@@ -574,6 +583,27 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
             raise ValueError("ADE20K random_crop.ignore_index must be 0")
         if config["augmentation"]["pad"]["mask_value"] != 0:
             raise ValueError("ADE20K padding mask value must be 0")
+    else:
+        if dataset["num_classes"] != 2 or dataset["eval_num_classes"] != 2:
+            raise ValueError("LIDC requires exactly two model/evaluation classes")
+        if dataset["in_channels"] != 1:
+            raise ValueError("LIDC requires dataset.in_channels=1")
+        if not dataset["pickle_path"] or not dataset["split_path"] or not dataset["cache_dir"]:
+            raise ValueError("LIDC requires dataset.pickle_path, split_path, and cache_dir")
+        if dataset["train_split"] != "train" or dataset["val_split"] != "val":
+            raise ValueError("LIDC uses the fixed train/val/test split names")
+        if dataset["void_class_index"] != -1 or dataset["ignore_index"] is not None:
+            raise ValueError("LIDC has no void/ignore class")
+        if config["loss"]["ignore_index"] is not None:
+            raise ValueError("LIDC loss.ignore_index must be null")
+        if config["evaluation"]["eval_class_indices"] != [0, 1]:
+            raise ValueError("LIDC evaluation.eval_class_indices must be [0, 1]")
+        if config["evaluation"]["exclude_void_from_prediction"]:
+            raise ValueError("LIDC must not exclude a prediction class as void")
+        if config["source"]["backbone"] != "unet":
+            raise ValueError("LIDC currently uses the 1-channel-capable UNet source")
+        if config["model"]["image_encoder"]["type"] != "rrdb":
+            raise ValueError("LIDC currently uses the 1-channel-capable RRDB image encoder")
     fixed_resize = dataset["fixed_resize"]
     if fixed_resize["image_interpolation"] != "bilinear":
         raise ValueError("dataset.fixed_resize.image_interpolation must be bilinear")

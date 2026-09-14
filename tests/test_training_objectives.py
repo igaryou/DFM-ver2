@@ -6,7 +6,8 @@ import torch
 import torch.nn as nn
 
 import losses
-from config import load_config, validate_config
+import training_objectives
+from config import DEFAULT_CONFIG, load_config, validate_config
 from training_objectives import (
     DDPCompatibleTrainingModel,
     compute_model_training_objectives,
@@ -36,6 +37,17 @@ class TinyEndpoint(nn.Module):
         return self.forward_logits_with_image_feat(
             x, self.encode_image(image), s, t
         )
+
+
+class TinySource(nn.Module):
+    def __init__(self, classes=4):
+        super().__init__()
+        self.mu = nn.Conv2d(3, classes, 1)
+        self.logvar = nn.Conv2d(3, classes, 1)
+
+    def forward(self, image):
+        mu = self.mu(image)
+        return mu, mu, self.logvar(image)
 
 
 def _config(loss_type: str, stage: str = "joint_training"):
@@ -98,6 +110,113 @@ def _batch(classes=4):
     image = torch.randn(2, 3, 4, 5)
     target = torch.randint(0, classes, (2, 4, 5))
     return image, target
+
+
+def _source_config(*, detach_from_flow: bool, align_weight: float = 0.0):
+    config = _config("psd")
+    config["source"].update({
+        "prior_type": "image_gaussian",
+        "detach_from_flow": detach_from_flow,
+        "freeze": False,
+        "fixed_std": None,
+        "type": "trainable",
+        "align_eps": 1.0e-8,
+        "align_weight": align_weight,
+        "use_loss_align": align_weight > 0.0,
+        "supervision": {
+            "type": "align" if align_weight > 0.0 else "none",
+            "weight": align_weight,
+        },
+    })
+    return config
+
+
+def _grad_norm(module):
+    return sum(
+        float(parameter.grad.norm())
+        for parameter in module.parameters()
+        if parameter.grad is not None
+    )
+
+
+def _source_objectives(config):
+    source = TinySource()
+    endpoint = TinyEndpoint()
+    adapter = DDPCompatibleTrainingModel(endpoint, source, config)
+    image, target = _batch()
+    result = compute_model_training_objectives(
+        adapter, operation="joint_objectives", image=image, target=target,
+        epoch_index=0, progress_in_epoch=0.0,
+    )
+    return source, endpoint, result
+
+
+def test_source_detach_from_flow_primary_gradient_boundary():
+    attached_source, _, attached = _source_objectives(
+        _source_config(detach_from_flow=False)
+    )
+    attached["diagonal_objective"].backward()
+    assert _grad_norm(attached_source) > 0.0
+
+    detached_source, endpoint, detached = _source_objectives(
+        _source_config(detach_from_flow=True)
+    )
+    detached["diagonal_objective"].backward()
+    assert _grad_norm(detached_source) == 0.0
+    assert _grad_norm(endpoint) > 0.0
+    assert float(detached["stats"]["source_detach_from_flow"]) == 1.0
+
+
+def test_source_detach_from_flow_preserves_align_gradient():
+    source, _, result = _source_objectives(
+        _source_config(detach_from_flow=True, align_weight=0.5)
+    )
+    result["loss"].backward()
+    assert _grad_norm(source) > 0.0
+
+
+def test_source_detach_from_flow_blocks_psd_but_not_endpoint_gradient():
+    source, endpoint, result = _source_objectives(
+        _source_config(detach_from_flow=True)
+    )
+    result["psd_objective"].backward()
+    assert _grad_norm(source) == 0.0
+    assert _grad_norm(endpoint) > 0.0
+
+
+def test_source_detach_default_false_and_forward_values_are_unchanged(monkeypatch):
+    assert DEFAULT_CONFIG["source"]["detach_from_flow"] is False
+    implicit = _source_config(detach_from_flow=False)
+    del implicit["source"]["detach_from_flow"]
+    detached = _source_config(detach_from_flow=True)
+    source = TinySource()
+    endpoint = TinyEndpoint()
+    image, target = _batch()
+    sampled_x0 = []
+    original_sample_prior = training_objectives.sample_prior
+
+    def capture_sample_prior(*args, **kwargs):
+        x0, stats = original_sample_prior(*args, **kwargs)
+        sampled_x0.append(x0.detach().clone())
+        return x0, stats
+
+    monkeypatch.setattr(training_objectives, "sample_prior", capture_sample_prior)
+
+    torch.manual_seed(123)
+    implicit_result = compute_model_training_objectives(
+        DDPCompatibleTrainingModel(endpoint, source, implicit),
+        operation="joint_objectives", image=image, target=target,
+        epoch_index=0, progress_in_epoch=0.0,
+    )
+    torch.manual_seed(123)
+    detached_result = compute_model_training_objectives(
+        DDPCompatibleTrainingModel(endpoint, source, detached),
+        operation="joint_objectives", image=image, target=target,
+        epoch_index=0, progress_in_epoch=0.0,
+    )
+    assert float(implicit_result["stats"]["source_detach_from_flow"]) == 0.0
+    assert float(detached_result["stats"]["source_detach_from_flow"]) == 1.0
+    torch.testing.assert_close(sampled_x0[0], sampled_x0[1])
 
 
 def test_stage1_composite_forward_never_calls_consistency(monkeypatch):

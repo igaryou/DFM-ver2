@@ -145,7 +145,10 @@ def evaluate(config: dict, checkpoint_path: str | Path) -> dict:
                     metrics.update(prediction, target)
                     items.append((image, target, prediction))
             else:
-                image, target = batch
+                if isinstance(batch, dict):
+                    image, target = batch["image"], batch["target"]
+                else:
+                    image, target = batch
                 image = image.to(device, non_blocking=True)
                 target = target.to(device, non_blocking=True)
                 with autocast_context(config, device):

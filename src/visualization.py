@@ -69,6 +69,7 @@ ADE20K_PALETTE = np.concatenate(
 _PALETTES = {
     "cityscapes": (CITYSCAPES_PALETTE, 19),
     "ade20k": (ADE20K_PALETTE, 0),
+    "lidc": (np.asarray([[0, 0, 0], [255, 80, 80]], dtype=np.uint8), 0),
 }
 
 
@@ -94,12 +95,17 @@ def save_prediction(
     dataset_name: str = "cityscapes",
 ) -> None:
     image = image.detach().cpu()
-    if imagenet_normalize:
+    if dataset_name == "lidc":
+        image = (image + 1.0) / 2.0
+    elif imagenet_normalize:
         mean = image.new_tensor([0.485, 0.456, 0.406])[:, None, None]
         std = image.new_tensor([0.229, 0.224, 0.225])[:, None, None]
         image = image * std + mean
     figure, axes = plt.subplots(1, 3, figsize=(12, 4))
-    axes[0].imshow(image.clamp(0, 1).permute(1, 2, 0))
+    display = image.clamp(0, 1).permute(1, 2, 0)
+    axes[0].imshow(
+        display.squeeze(-1), cmap="gray" if display.shape[-1] == 1 else None
+    )
     axes[1].imshow(colorize(target, dataset_name))
     axes[2].imshow(colorize(prediction, dataset_name))
     for axis, title in zip(axes, ("image", "ground truth", "DFM prediction")):

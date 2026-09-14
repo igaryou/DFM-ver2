@@ -8,7 +8,7 @@ source:
   use_loss_align: true
   supervision:
     type: align
-    weight: 0.20
+    weight: 0.30
     include_void: false
 
 wandb:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import math
 from pathlib import Path
 
@@ -653,6 +654,194 @@ class ADE20KDataset(Dataset):
         return self._validation_item(image, mask, index)
 
 
+class LIDCDataset(Dataset):
+    """LIDC-IDRI samples backed by worker-safe read-only NumPy memmaps."""
+
+    EXPECTED_SAMPLE_COUNTS = {"train": 9348, "val": 2748, "test": 3000}
+    EXPECTED_SERIES_COUNTS = {"train": 560, "val": 140, "test": 175}
+    IMAGE_SHAPE = (128, 128)
+    ANNOTATIONS = 4
+
+    def __init__(
+        self, cache_dir: str, split_path: str, split: str, config: dict,
+        augment: bool, return_spatial_valid_mask: bool = False,
+    ) -> None:
+        if split not in self.EXPECTED_SAMPLE_COUNTS:
+            raise ValueError(f"Unknown LIDC split: {split}")
+        self.cache_dir = Path(cache_dir)
+        self.split_path = Path(split_path)
+        self.split = split
+        self.config = config
+        self.augment = augment and split == "train"
+        self.return_spatial_valid_mask = return_spatial_valid_mask
+        self._images = None
+        self._masks = None
+
+        split_data = self._load_and_validate_split(self.split_path)
+        self.sample_ids = list(split_data["samples"][split])
+        self.series_uids = list(split_data["series"][split])
+        metadata_path = self.cache_dir / "metadata.json"
+        manifest_path = self.cache_dir / "manifest.json"
+        if not metadata_path.is_file() or not manifest_path.is_file():
+            raise FileNotFoundError(
+                f"LIDC cache is incomplete under {self.cache_dir}. Run "
+                "scripts/convert_lidc_pickle.py first."
+            )
+        with metadata_path.open(encoding="utf-8") as handle:
+            metadata = json.load(handle)
+        with manifest_path.open(encoding="utf-8") as handle:
+            manifest = json.load(handle)
+        cached_ids = metadata.get("sample_ids", [])
+        cached_series = metadata.get("series_uids", [])
+        expected_total = sum(self.EXPECTED_SAMPLE_COUNTS.values())
+        if (
+            len(cached_ids) != expected_total
+            or len(set(cached_ids)) != expected_total
+            or len(cached_series) != len(cached_ids)
+        ):
+            raise RuntimeError(
+                f"LIDC cache metadata must contain {expected_total} unique samples"
+            )
+        source_pickle = manifest.get("source_pickle")
+        configured_pickle = self.config["dataset"].get("pickle_path")
+        if source_pickle and configured_pickle and (
+            Path(source_pickle).resolve() != Path(configured_pickle).resolve()
+        ):
+            raise RuntimeError("LIDC cache was built from a different pickle")
+        if manifest.get("image_shape") != [expected_total, 128, 128]:
+            raise RuntimeError("LIDC cache has an unexpected image shape")
+        if manifest.get("mask_shape") != [expected_total, 4, 128, 128]:
+            raise RuntimeError("LIDC cache has an unexpected mask shape")
+        id_to_index = {sample_id: index for index, sample_id in enumerate(cached_ids)}
+        missing = [
+            sample_id for sample_id in self.sample_ids
+            if sample_id not in id_to_index
+        ]
+        if missing:
+            raise RuntimeError(f"LIDC split sample is missing from cache: {missing[0]}")
+        self.indices = [id_to_index[sample_id] for sample_id in self.sample_ids]
+        self.sample_series_uids = [cached_series[index] for index in self.indices]
+        allowed_series = set(self.series_uids)
+        mismatched = [
+            sample_id for sample_id, index in zip(self.sample_ids, self.indices)
+            if cached_series[index] not in allowed_series
+        ]
+        if mismatched:
+            raise RuntimeError(
+                f"LIDC sample/series mismatch in fixed split: {mismatched[0]}"
+            )
+
+    @classmethod
+    def _load_and_validate_split(cls, path: Path) -> dict:
+        with path.open(encoding="utf-8") as handle:
+            data = json.load(handle)
+        if data.get("seed") != 42:
+            raise RuntimeError("LIDC fixed split must have seed=42")
+        if set(data.get("samples", {})) != set(cls.EXPECTED_SAMPLE_COUNTS):
+            raise RuntimeError("LIDC split JSON must contain train/val/test samples")
+        if set(data.get("series", {})) != set(cls.EXPECTED_SERIES_COUNTS):
+            raise RuntimeError("LIDC split JSON must contain train/val/test series")
+        for split, expected in cls.EXPECTED_SAMPLE_COUNTS.items():
+            if len(data["samples"][split]) != expected:
+                raise RuntimeError(
+                    f"LIDC {split} expected {expected} samples, "
+                    f"found {len(data['samples'][split])}"
+                )
+        series_sets = {}
+        for split, expected in cls.EXPECTED_SERIES_COUNTS.items():
+            values = data["series"][split]
+            if len(values) != expected or len(set(values)) != expected:
+                raise RuntimeError(
+                    f"LIDC {split} expected {expected} unique series, "
+                    f"found {len(set(values))}"
+                )
+            series_sets[split] = set(values)
+        assert series_sets["train"].isdisjoint(series_sets["val"])
+        assert series_sets["train"].isdisjoint(series_sets["test"])
+        assert series_sets["val"].isdisjoint(series_sets["test"])
+        sample_sets = {name: set(values) for name, values in data["samples"].items()}
+        if any(
+            len(sample_sets[name]) != cls.EXPECTED_SAMPLE_COUNTS[name]
+            for name in cls.EXPECTED_SAMPLE_COUNTS
+        ):
+            raise RuntimeError("LIDC sample IDs must be unique within each split")
+        assert sample_sets["train"].isdisjoint(sample_sets["val"])
+        assert sample_sets["train"].isdisjoint(sample_sets["test"])
+        assert sample_sets["val"].isdisjoint(sample_sets["test"])
+        expected_total = sum(cls.EXPECTED_SAMPLE_COUNTS.values())
+        if len(set().union(*sample_sets.values())) != expected_total:
+            raise RuntimeError(
+                f"LIDC fixed split must cover all {expected_total} samples"
+            )
+        return data
+
+    def _open_arrays(self) -> None:
+        if self._images is None:
+            self._images = np.load(
+                self.cache_dir / "images.npy", mmap_mode="r", allow_pickle=False
+            )
+            self._masks = np.load(
+                self.cache_dir / "masks.npy", mmap_mode="r", allow_pickle=False
+            )
+
+    def __getstate__(self) -> dict:
+        state = self.__dict__.copy()
+        state["_images"] = None
+        state["_masks"] = None
+        return state
+
+    def __len__(self) -> int:
+        return len(self.indices)
+
+    def _augment_pair(
+        self, image: torch.Tensor, masks: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        augmentation = self.config["augmentation"]
+        horizontal = augmentation["horizontal_flip"]
+        if horizontal["enabled"] and torch.rand(()) < horizontal["probability"]:
+            image = torch.flip(image, (-1,))
+            masks = torch.flip(masks, (-1,))
+        vertical = augmentation["vertical_flip"]
+        if vertical["enabled"] and torch.rand(()) < vertical["probability"]:
+            image = torch.flip(image, (-2,))
+            masks = torch.flip(masks, (-2,))
+        if augmentation["random_rotation_90"]["enabled"]:
+            turns = int(torch.randint(0, 4, ()))
+            image = torch.rot90(image, turns, (-2, -1))
+            masks = torch.rot90(masks, turns, (-2, -1))
+        return image, masks
+
+    def __getitem__(self, index: int):
+        self._open_arrays()
+        cache_index = self.indices[index]
+        image = torch.from_numpy(np.array(
+            self._images[cache_index], dtype=np.float32, copy=True
+        ))[None]
+        masks = torch.from_numpy(
+            (np.array(self._masks[cache_index], copy=True) > 0).astype(np.int64)
+        )
+        if image.shape != (1, *self.IMAGE_SHAPE):
+            raise RuntimeError(f"Unexpected LIDC image shape: {tuple(image.shape)}")
+        if masks.shape != (self.ANNOTATIONS, *self.IMAGE_SHAPE):
+            raise RuntimeError(f"Unexpected LIDC mask shape: {tuple(masks.shape)}")
+        if self.augment:
+            image, masks = self._augment_pair(image, masks)
+        image = image * 2.0 - 1.0
+        if self.augment:
+            target = masks[int(torch.randint(0, self.ANNOTATIONS, ()))]
+            if self.return_spatial_valid_mask:
+                return image, target, torch.ones_like(target, dtype=torch.bool)
+            return image, target
+        return {
+            "image": image,
+            # Keep a deterministic target for the existing single-GT metrics.
+            "target": masks[0],
+            "masks": masks,
+            "sample_id": self.sample_ids[index],
+            "series_uid": self.sample_series_uids[index],
+        }
+
+
 def ade20k_eval_collate(batch: list[dict]) -> list[dict]:
     """Keep original-resolution evaluation samples separate until inference."""
     return batch
@@ -668,6 +857,13 @@ def build_dataset(
         enabled = config["augmentation"]["enabled"] if augment is None else augment
         return ADE20KDataset(
             config["dataset"]["root"], split, config, enabled,
+            return_spatial_valid_mask=return_spatial_valid_mask,
+        )
+    if config["dataset"]["name"] == "lidc":
+        enabled = config["augmentation"]["enabled"] if augment is None else augment
+        return LIDCDataset(
+            config["dataset"]["cache_dir"], config["dataset"]["split_path"],
+            split, config, enabled,
             return_spatial_valid_mask=return_spatial_valid_mask,
         )
 

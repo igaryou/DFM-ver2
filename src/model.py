@@ -66,7 +66,8 @@ class ImageEncoder(nn.Module):
     """Downsample inside the encoder, then run the original RRDB trunk."""
 
     def __init__(
-        self, channels: int, blocks: int, growth: int, downsample_factor: int = 4
+        self, channels: int, blocks: int, growth: int, downsample_factor: int = 4,
+        in_channels: int = 3,
     ) -> None:
         super().__init__()
         stages = int(math.log2(downsample_factor))
@@ -74,7 +75,7 @@ class ImageEncoder(nn.Module):
             raise ValueError("ImageEncoder downsample_factor must be a power of two")
         self.downsample_factor = downsample_factor
         self.first = nn.Conv2d(
-            3, channels, 3, stride=2 if stages else 1, padding=1
+            in_channels, channels, 3, stride=2 if stages else 1, padding=1
         )
         self.downsample = nn.ModuleList(
             nn.Conv2d(channels, channels, 3, stride=2, padding=1)
@@ -465,6 +466,7 @@ def build_image_encoder(config: dict) -> nn.Module:
             config["rrdb_blocks"],
             config["rrdb_growth_channels"],
             config.get("state_downsample_factor", 4),
+            config.get("in_channels", 3),
         )
     neck = encoder["neck"]
     return TransformerImageEncoder(
@@ -649,6 +651,7 @@ class DiscreteFlowMapModel(nn.Module):
             self.image_encoder = ImageEncoder(
                 image_config["channels"], image_config["blocks"],
                 image_config["growth_channels"], downsample_factor=1,
+                in_channels=config.get("in_channels", 3),
             )
             self.state_encoder = FullResolutionStateEncoder(
                 num_classes, state_config["channels"], state_config["blocks"]

@@ -61,6 +61,9 @@ def _print_first_batch_shapes(
 ) -> None:
     endpoint_shapes = getattr(adapter.endpoint_model, "_debug_last_shapes", {})
     shapes = {
+        "source.detach_from_flow": bool(
+            adapter.config["source"].get("detach_from_flow", False)
+        ),
         "image": tuple(image.shape),
         "mu_raw": source_stats.get("_debug_mu_raw_shape", "unavailable"),
         "x0": tuple(x0.shape),
@@ -247,6 +250,15 @@ def compute_model_training_objectives(
             active_stage.train_source if active_stage is not None else None
         ),
     )
+    detach_source_from_flow = bool(
+        config["source"].get("detach_from_flow", False)
+    )
+    # Keep x0 itself attached for source supervision and diagnostics. Only the
+    # state passed into the endpoint trajectory is optionally graph-isolated.
+    x0_flow = x0.detach() if detach_source_from_flow else x0
+    source_stats["source_detach_from_flow"] = x0.new_tensor(
+        float(detach_source_from_flow)
+    )
     x1_state = target_state_from_config(targets.one_hot_state, config)
     smoothing = config.get("flow", {}).get("target_smoothing", {})
     smoothing_enabled = bool(smoothing.get("enabled", False))
@@ -347,7 +359,7 @@ def compute_model_training_objectives(
             time_config["min_time"], time_config["max_time"],
         )
         diagonal_state = linear_path(
-            x0, x1_state, diagonal_time, config, path_difficulty
+            x0_flow, x1_state, diagonal_time, config, path_difficulty
         )
         schedule_weight = 0.0
         effective_weight = 0.0
@@ -358,7 +370,7 @@ def compute_model_training_objectives(
             time_config["min_gap"],
         )
         consistency_state = linear_path(
-            x0, x1_state, consistency_s, config, path_difficulty
+            x0_flow, x1_state, consistency_s, config, path_difficulty
         )
         if operation == "joint_objectives":
             # Joint training intentionally samples an independent diagonal time.
@@ -367,7 +379,7 @@ def compute_model_training_objectives(
                 time_config["min_time"], time_config["max_time"],
             )
             diagonal_state = linear_path(
-                x0, x1_state, diagonal_time, config, path_difficulty
+                x0_flow, x1_state, diagonal_time, config, path_difficulty
             )
         else:
             # Preserve the original Stage 2 diagonal-at-s behavior.

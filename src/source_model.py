@@ -29,6 +29,7 @@ class UNetSourceGenerator(nn.Module):
         learned_logvar: bool,
         fixed_std,
         state_downsample_factor: int = 4,
+        in_channels: int = 3,
     ):
         super().__init__()
         self.num_classes = num_classes
@@ -39,15 +40,15 @@ class UNetSourceGenerator(nn.Module):
             raise ValueError("source state_downsample_factor must be a power of two")
         self.state_downsample_factor = state_downsample_factor
         layers: list[nn.Module] = []
-        in_channels = 3
+        current_channels = in_channels
         for _ in range(stages):
             layers.extend((
-                nn.Conv2d(in_channels, channels, 3, stride=2, padding=1),
+                nn.Conv2d(current_channels, channels, 3, stride=2, padding=1),
                 nn.SiLU(),
             ))
-            in_channels = channels
+            current_channels = channels
         if not stages:
-            layers.extend((nn.Conv2d(3, channels, 3, padding=1), nn.SiLU()))
+            layers.extend((nn.Conv2d(in_channels, channels, 3, padding=1), nn.SiLU()))
         layers.extend((
             nn.Conv2d(channels, channels, 3, padding=1), nn.SiLU(),
             nn.Conv2d(channels, output_channels, 1),
@@ -351,6 +352,7 @@ def build_source_model(config: dict):
             config["dataset"]["num_classes"], source["decoder_channels"],
             source["learned_logvar"], fixed_std,
             config["model"].get("state_downsample_factor", 4),
+            config["dataset"].get("in_channels", 3),
         )
     else:
         model = SegFormerSourceGenerator(

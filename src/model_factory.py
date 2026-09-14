@@ -7,7 +7,9 @@ from source_model import build_source_model
 
 
 def build_models(config: dict, device: torch.device):
-    model = DiscreteFlowMapModel(config["model"]).to(device)
+    model_config = dict(config["model"])
+    model_config["in_channels"] = config["dataset"].get("in_channels", 3)
+    model = DiscreteFlowMapModel(model_config).to(device)
     if not config.get("training", {}).get("train_endpoint", True):
         model.requires_grad_(False)
         model.eval()

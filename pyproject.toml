@@ -15,6 +15,7 @@ full = [
     "torchvision==0.26.0",
     "transformers==5.10.2",
     "wandb==0.27.0",
+    "pydicom>=2.4,<4",
 ]
 
 [tool.uv]
