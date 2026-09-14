@@ -1,82 +1,9 @@
-extends: ../../_base_/ade20k/joint_psd.yaml
+extends: ../../_base_/lidc/diagonal.yaml
 
 experiment:
   name: dfm_diagonal_lidc_2class
   output_dir: /home/igarashi_25/DFM/results/diagonal_lidc
-  stage: diagonal_pretrain
-
-dataset:
-  name: lidc
-  protocol: mmseg
-  root: /home/igarashi_25/datasets/LIDC/LIDC_data
-  pickle_path: /home/igarashi_25/datasets/LIDC/LIDC_data/data_lidc.pickle
-  split_path: /home/igarashi_25/datasets/LIDC/LIDC_data/lidc_split_seed42.json
-  cache_dir: /home/igarashi_25/datasets/LIDC/LIDC_data/lidc_memmap_v1
-  num_classes: 2
-  in_channels: 1
-  eval_num_classes: 2
-  void_class_index: -1
-  background_index: 0
-  ignore_index: null
-  reduce_zero_label: false
-  train_split: train
-  val_split: val
-  image_size: [128, 128]
-  crop_size: null
-  num_workers: 4
-  pin_memory: true
-  persistent_workers: true
-  fixed_resize:
-    enabled: false
-    image_interpolation: bilinear
-    mask_interpolation: nearest
-    antialias: true
-
-augmentation:
-  enabled: true
-  horizontal_flip: {enabled: true, probability: 0.5}
-  vertical_flip: {enabled: true, probability: 0.5}
-  random_rotation_90: {enabled: true}
-  color_jitter: {enabled: false, brightness: 0.0, contrast: 0.0, saturation: 0.0, hue: 0.0}
-  imagenet_normalize: false
-  random_resize: {enabled: false, base_scale: {width: 128, height: 128}, ratio_range: [1.0, 1.0], keep_ratio: true}
-  random_crop: {enabled: false, size: [128, 128], cat_max_ratio: 1.0, ignore_index: 0, max_attempts: 1}
-  photometric_distortion: {enabled: false, brightness_delta: 0, contrast_range: [1.0, 1.0], saturation_range: [1.0, 1.0], hue_delta: 0}
-  normalize: {enabled: false, mean: [0.5], std: [0.5]}
-  pad: {enabled: false, size: [128, 128], image_value: -1.0, mask_value: 0}
-
-model:
-  num_classes: 2
-  image_encoder:
-    type: rrdb
-
-source:
-  type: trainable_segformer
-  backbone: unet
-  pretrained: false
-  freeze_encoder: false
-  input_already_normalized: true
-
-training:
-  batch_size: 16
-
-loss:
-  ignore_index: null
-  mask_pixel_losses: false
-  primary: {type: diagonal_ce, weight: 1.0}
-  consistency: {enabled: false, weight: 0.0}
-
-evaluation:
-  split: val
-  batch_size: 16
-  resize: {width: 128, height: 128, keep_ratio: true}
-  size_divisor: null
-  original_resolution: false
-  eval_class_indices: [0, 1]
-  ignore_index: null
-  exclude_void_from_prediction: false
-  test_time_augmentation: {enabled: false, flip: false}
 
 wandb:
   name: dfm-diagonal-lidc-2class
-  tags: [lidc, 2-class, diagonal]
+  tags: [lidc, 2-class, diagonal, full-resolution-state]

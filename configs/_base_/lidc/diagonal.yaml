@@ -1,0 +1,229 @@
+experiment:
+  name: dfm_diagonal_lidc_base
+  seed: 42
+  output_dir: /home/igarashi_25/DFM/results/diagonal_lidc
+  stage: diagonal_pretrain
+
+runtime:
+  device: auto
+  amp: true
+  amp_dtype: bf16
+  compile: false
+  deterministic: false
+  debug_first_batch_shapes: false
+
+distributed:
+  enabled: auto
+  backend: nccl
+  init_method: env://
+  find_unused_parameters: false
+  broadcast_buffers: false
+  gradient_as_bucket_view: true
+
+dataset:
+  name: lidc
+  protocol: lidc
+  root: /home/igarashi_25/datasets/LIDC/LIDC_data
+  pickle_path: /home/igarashi_25/datasets/LIDC/LIDC_data/data_lidc.pickle
+  split_path: /home/igarashi_25/datasets/LIDC/LIDC_data/lidc_split_seed42.json
+  cache_dir: /home/igarashi_25/datasets/LIDC/LIDC_data/lidc_memmap_v1
+  num_classes: 2
+  in_channels: 1
+  eval_num_classes: 2
+  void_class_index: -1
+  background_index: 0
+  ignore_index: null
+  reduce_zero_label: false
+  train_split: train
+  val_split: val
+  image_size: [128, 128]
+  crop_size: null
+  num_workers: 4
+  pin_memory: true
+  persistent_workers: true
+  fixed_resize:
+    enabled: false
+    image_interpolation: bilinear
+    mask_interpolation: nearest
+    antialias: true
+
+augmentation:
+  enabled: true
+  horizontal_flip: {enabled: true, probability: 0.5}
+  vertical_flip: {enabled: true, probability: 0.5}
+  random_rotation_90: {enabled: true}
+  color_jitter:
+    enabled: false
+    brightness: 0.0
+    contrast: 0.0
+    saturation: 0.0
+    hue: 0.0
+  imagenet_normalize: false
+  random_resize:
+    enabled: false
+    base_scale: {width: 128, height: 128}
+    ratio_range: [1.0, 1.0]
+    keep_ratio: true
+  random_crop:
+    enabled: false
+    size: [128, 128]
+    cat_max_ratio: 1.0
+    ignore_index: 0
+    max_attempts: 1
+  photometric_distortion:
+    enabled: false
+    brightness_delta: 0
+    contrast_range: [1.0, 1.0]
+    saturation_range: [1.0, 1.0]
+    hue_delta: 0
+  normalize: {enabled: false, mean: [0.5], std: [0.5]}
+  pad: {enabled: false, size: [128, 128], image_value: -1.0, mask_value: 0}
+
+model:
+  backbone: unet
+  num_classes: 2
+  state_downsample_factor: 1
+  fusion_channels: 128
+  image_encoder:
+    type: rrdb
+    variant: tiny
+    pretrained: false
+    freeze: false
+    input_already_normalized: true
+    neck: {type: none, channels: 256}
+  rrdb_blocks: 5
+  rrdb_growth_channels: 32
+  endpoint:
+    type: unet
+  unet:
+    base_channels: 64
+    channel_mults: [1, 2, 4, 4]
+    num_res_blocks: 2
+    attention_levels: [3]
+    num_heads: 4
+    dropout: 0.0
+    time_embedding_dim: 256
+
+source:
+  type: trainable_segformer
+  prior_type: image_gaussian
+  prior_noise_std: 1.0
+  backbone: unet
+  segformer_variant: b0
+  segformer_decoder: custom
+  pretrained: false
+  checkpoint: null
+  freeze: false
+  freeze_encoder: false
+  decoder_channels: 128
+  learned_logvar: false
+  fixed_std: 1.0
+  mu_tanh_scale: 0.0
+  use_loss_align: true
+  align_weight: 0.15
+  var_weight: 0.0
+  align_eps: 1.0e-8
+  input_already_normalized: true
+  supervision: {type: align, weight: 0.15, include_void: false}
+
+flow:
+  time_eps: 1.0e-5
+  probability_eps: 1.0e-8
+  start_time: 0.0
+  target_smoothing: {enabled: false, p: 0.0}
+  path:
+    type: power
+    exponent: 1.0
+
+time_sampling:
+  distribution: uniform_sorted
+  min_time: 0.0
+  max_time: 1.0
+  min_gap: 1.0e-5
+
+training:
+  train_endpoint: true
+  schedule_unit: epoch
+  epochs: 150
+  max_iterations: null
+  max_optimizer_steps: null
+  max_batches_per_epoch: null
+  batch_size: 16
+  grad_accum_steps: 1
+  optimizer:
+    name: adamw
+    lr: 5.0e-5
+    weight_decay: 1.0e-4
+    betas: [0.9, 0.999]
+    parameter_groups:
+      model: {lr: null}
+      source: {lr: null}
+  scheduler:
+    name: cosine
+    step_unit: epoch
+    stage_aware: false
+    warmup_epochs: 20
+    warmup_steps: 0
+    warmup_start_factor: 0.1
+    power: 1.0
+    min_lr: 0.0
+    eta_min: 1.0e-6
+  grad_clip: 1.0
+  label_smoothing: 0.0
+  log_interval: 50
+  checkpoint_interval_epochs: 10
+  checkpoint_interval_steps: null
+  validation_epochs: [50, 100, 150]
+
+loss:
+  ignore_index: null
+  mask_pixel_losses: false
+  primary: {type: diagonal_ce, weight: 1.0}
+  consistency:
+    enabled: false
+    type: psd
+    weight: 0.0
+    start_epoch: 0
+    precision:
+      jvp_dtype: null
+      numerical_dtype: fp32
+      debug_assertions: false
+
+checkpoint:
+  resume: null
+  init_from: null
+  load_optimizer: true
+  load_scheduler: true
+  strict_model: true
+
+evaluation:
+  source_only: false
+  split: val
+  batch_size: 16
+  num_steps: 1
+  num_samples: 1
+  aggregation: probability_mean
+  sampler: flow_map
+  save_predictions: true
+  max_visualizations: 16
+  max_batches: null
+  checkpoint: null
+  resize: {width: 128, height: 128, keep_ratio: true}
+  size_divisor: null
+  original_resolution: false
+  interpolation: bilinear
+  align_corners: false
+  eval_class_indices: [0, 1]
+  ignore_index: null
+  nanmean: false
+  exclude_void_from_prediction: false
+  interval: {unit: epoch, value: null}
+  test_time_augmentation: {enabled: false, flip: false}
+
+wandb:
+  enabled: true
+  project: DFM
+  name: dfm-diagonal-lidc-base
+  entity: null
+  mode: online
+  tags: [lidc, 2-class, diagonal, full-resolution-state]

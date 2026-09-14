@@ -497,9 +497,14 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
     dataset = config["dataset"]
     if dataset["name"] not in {"cityscapes", "ade20k", "lidc"}:
         raise ValueError("dataset.name must be cityscapes, ade20k, or lidc")
-    if dataset["protocol"] not in {"mmseg", "original"}:
-        raise ValueError("dataset.protocol must be mmseg or original")
-    if dataset["name"] != "cityscapes" and dataset["protocol"] != "mmseg":
+    if dataset["protocol"] not in {"mmseg", "original", "lidc"}:
+        raise ValueError("dataset.protocol must be mmseg, original, or lidc")
+    if dataset["name"] == "lidc":
+        if dataset["protocol"] != "lidc":
+            raise ValueError("LIDC requires dataset.protocol=lidc")
+    elif dataset["protocol"] == "lidc":
+        raise ValueError("dataset.protocol=lidc is LIDC-only")
+    elif dataset["name"] != "cityscapes" and dataset["protocol"] != "mmseg":
         raise ValueError("dataset.protocol=original is currently Cityscapes-only")
     if dataset["in_channels"] not in {1, 3}:
         raise ValueError("dataset.in_channels must be 1 or 3")
@@ -584,10 +589,14 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
         if config["augmentation"]["pad"]["mask_value"] != 0:
             raise ValueError("ADE20K padding mask value must be 0")
     else:
+        if dataset["protocol"] != "lidc":
+            raise ValueError("LIDC requires dataset.protocol=lidc")
         if dataset["num_classes"] != 2 or dataset["eval_num_classes"] != 2:
             raise ValueError("LIDC requires exactly two model/evaluation classes")
         if dataset["in_channels"] != 1:
             raise ValueError("LIDC requires dataset.in_channels=1")
+        if config["model"]["state_downsample_factor"] != 1:
+            raise ValueError("LIDC requires model.state_downsample_factor=1")
         if not dataset["pickle_path"] or not dataset["split_path"] or not dataset["cache_dir"]:
             raise ValueError("LIDC requires dataset.pickle_path, split_path, and cache_dir")
         if dataset["train_split"] != "train" or dataset["val_split"] != "val":

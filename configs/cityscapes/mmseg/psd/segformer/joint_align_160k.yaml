@@ -10,6 +10,7 @@ source:
     type: align
     weight: 0.30
     include_void: false
+  detach_from_flow: true
 
 wandb:
   name: dfm-segformer-endpoint-align-160k

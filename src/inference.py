@@ -100,8 +100,15 @@ def sample_segmentation_from_x0(
         x = flow_result
     if return_terminal_state:
         return x
-    full_resolution = resize_continuous(x, image.shape[-2:])
     evaluation = config.get("evaluation", {})
+    if config.get("dataset", {}).get("protocol") == "lidc":
+        if x.shape[-2:] != image.shape[-2:]:
+            raise AssertionError(
+                "LIDC terminal state must already match the 128x128 image"
+            )
+        full_resolution = x
+    else:
+        full_resolution = resize_continuous(x, image.shape[-2:])
     prediction = state_to_prediction(
         full_resolution,
         void_class_index=config.get("dataset", {}).get("void_class_index"),
@@ -174,9 +181,16 @@ def sample_segmentation_probabilities(
         model, image, x0, config, num_steps or config["evaluation"]["num_steps"],
         path_difficulty=path_difficulty, return_final_probability=True,
     )
-    full_resolution = resize_continuous(
-        final_probability.float(), image.shape[-2:]
-    ).clamp_min(0.0)
+    if config.get("dataset", {}).get("protocol") == "lidc":
+        if final_probability.shape[-2:] != image.shape[-2:]:
+            raise AssertionError(
+                "LIDC final probability must already match the 128x128 image"
+            )
+        full_resolution = final_probability.float().clamp_min(0.0)
+    else:
+        full_resolution = resize_continuous(
+            final_probability.float(), image.shape[-2:]
+        ).clamp_min(0.0)
     return full_resolution / full_resolution.sum(dim=1, keepdim=True).clamp_min(1.0e-12)
 
 

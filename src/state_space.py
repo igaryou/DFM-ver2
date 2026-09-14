@@ -99,9 +99,13 @@ def prepare_state_targets(
             f"target_full must have shape [B,H,W], got {tuple(target_full.shape)}"
         )
     state_size = tuple(int(value) for value in state_size)
-    target_state = F.interpolate(
-        target_full[:, None].float(), size=state_size, mode="nearest"
-    )[:, 0].long()
+    target_state = (
+        target_full.long()
+        if target_full.shape[-2:] == state_size
+        else F.interpolate(
+            target_full[:, None].float(), size=state_size, mode="nearest"
+        )[:, 0].long()
+    )
     if target_state.numel() and (
         int(target_state.min()) < 0 or int(target_state.max()) >= num_classes
     ):
@@ -123,11 +127,15 @@ def prepare_state_targets(
             )
         if spatial_valid_mask_full.dtype != torch.bool:
             raise ValueError("spatial_valid_mask_full must have dtype bool")
-        spatial_valid_mask_state = F.interpolate(
-            spatial_valid_mask_full[:, None].float(),
-            size=state_size,
-            mode="nearest",
-        )[:, 0].bool()
+        spatial_valid_mask_state = (
+            spatial_valid_mask_full
+            if spatial_valid_mask_full.shape[-2:] == state_size
+            else F.interpolate(
+                spatial_valid_mask_full[:, None].float(),
+                size=state_size,
+                mode="nearest",
+            )[:, 0].bool()
+        )
 
     assert target_state.shape[-2:] == state_size
     assert one_hot_state.shape[-2:] == state_size

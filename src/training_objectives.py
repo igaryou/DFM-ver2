@@ -410,9 +410,16 @@ def compute_model_training_objectives(
             x1=x1_state,
             diagonal_state=diagonal_state,
         )
-    diagonal_logits_full = resize_continuous(
-        diagonal_logits, targets.target_full.shape[-2:]
-    )
+    if config["dataset"].get("protocol") == "lidc":
+        if diagonal_logits.shape[-2:] != targets.target_full.shape[-2:]:
+            raise AssertionError(
+                "LIDC endpoint logits must already match the 128x128 target"
+            )
+        diagonal_logits_full = diagonal_logits
+    else:
+        diagonal_logits_full = resize_continuous(
+            diagonal_logits, targets.target_full.shape[-2:]
+        )
     diagonal_config = config["loss"]["primary"].get(
         "adaptive_weighting", {"enabled": False, "r": 0.5, "c": 0.01}
     )
