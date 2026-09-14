@@ -144,9 +144,9 @@ time_sampling:
 training:
   train_endpoint: true
   schedule_unit: epoch
-  epochs: 500
+  epochs: 800
   max_iterations: null
-  max_optimizer_steps: null
+  max_optimizer_steps: 468000
   max_batches_per_epoch: null
   batch_size: 16
   grad_accum_steps: 1
