@@ -1,7 +1,7 @@
 experiment:
   name: dfm_diagonal_lidc_base
   seed: 42
-  output_dir: /home/igarashi_25/DFM/results/diagonal_lidc
+  output_dir: /home/igarashi_25/DFM/results/lidc/diagonal_lidc
   stage: diagonal_pretrain
 
 runtime:
@@ -91,25 +91,25 @@ model:
     freeze: false
     input_already_normalized: true
     neck: {type: none, channels: 256}
-  rrdb_blocks: 5
+  rrdb_blocks: 3
   rrdb_growth_channels: 32
   endpoint:
     type: unet
   unet:
-    base_channels: 64
-    channel_mults: [1, 2, 4, 4]
+    base_channels: 45
+    channel_mults: [1, 2, 4, 4, 8]
     num_res_blocks: 2
-    attention_levels: [3]
+    attention_levels: [3, 4]
     num_heads: 4
     dropout: 0.0
-    time_embedding_dim: 256
+    time_embedding_dim: 512
 
 source:
   type: trainable_segformer
   prior_type: image_gaussian
   prior_noise_std: 1.0
   backbone: unet
-  segformer_variant: b0
+  segformer_variant: b1
   segformer_decoder: custom
   pretrained: false
   checkpoint: null
@@ -143,8 +143,8 @@ time_sampling:
 
 training:
   train_endpoint: true
-  schedule_unit: epoch
-  epochs: 150
+  schedule_unit: optimizer_step
+  epochs: 500
   max_iterations: null
   max_optimizer_steps: null
   max_batches_per_epoch: null
@@ -152,17 +152,17 @@ training:
   grad_accum_steps: 1
   optimizer:
     name: adamw
-    lr: 5.0e-5
+    lr: 1.0e-4
     weight_decay: 1.0e-4
     betas: [0.9, 0.999]
     parameter_groups:
       model: {lr: null}
       source: {lr: null}
   scheduler:
-    name: cosine
+    name: poly
     step_unit: epoch
     stage_aware: false
-    warmup_epochs: 20
+    warmup_epochs: 0
     warmup_steps: 0
     warmup_start_factor: 0.1
     power: 1.0
@@ -173,7 +173,7 @@ training:
   log_interval: 50
   checkpoint_interval_epochs: 10
   checkpoint_interval_steps: null
-  validation_epochs: [50, 100, 150]
+  validation_epochs: [100, 200, 300, 400, 500]
 
 loss:
   ignore_index: null

@@ -43,7 +43,7 @@ loss:
       ignore_void: false
 
 evaluation:
-  stochastic_num_samples: [16, 32]
+  stochastic_num_samples: [16]
   aggregation: probability_mean
 
 wandb:
