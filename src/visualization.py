@@ -118,6 +118,62 @@ def save_prediction(
     plt.close(figure)
 
 
+def save_lidc_source_mu_x0(
+    mu: torch.Tensor,
+    x0: torch.Tensor,
+    path: str | Path,
+    foreground_channel: int = 1,
+    *,
+    image: torch.Tensor | None = None,
+) -> None:
+    """Save raw LIDC source mean and its corresponding sampled source state."""
+    if mu.ndim != 3 or x0.ndim != 3:
+        raise ValueError("mu and x0 must have shape [C,H,W]")
+    if mu.shape != x0.shape:
+        raise ValueError("mu and x0 must have identical shapes")
+    if not 0 <= foreground_channel < mu.shape[0]:
+        raise ValueError("foreground_channel is outside the source channel range")
+
+    mu_fg = mu[foreground_channel].detach().float().cpu()
+    x0_fg = x0[foreground_channel].detach().float().cpu()
+    vmin = min(float(mu_fg.min()), float(x0_fg.min()))
+    vmax = max(float(mu_fg.max()), float(x0_fg.max()))
+
+    columns = 3 if image is not None else 2
+    figure, axes = plt.subplots(1, columns, figsize=(5 * columns, 4))
+    axes = np.asarray(axes).reshape(-1)
+    offset = 0
+    if image is not None:
+        if image.ndim != 3 or image.shape[0] != 1:
+            raise ValueError("LIDC image must have shape [1,H,W]")
+        image_display = ((image.detach().float().cpu() + 1.0) / 2.0).clamp(0, 1)
+        axes[0].imshow(image_display[0], cmap="gray", vmin=0.0, vmax=1.0)
+        axes[0].set_title("Input CT")
+        offset = 1
+
+    mu_image = axes[offset].imshow(
+        mu_fg, cmap="viridis", vmin=vmin, vmax=vmax
+    )
+    axes[offset].set_title(
+        "μ (foreground)\n"
+        f"min={mu_fg.min():.4f}, mean={mu_fg.mean():.4f}, max={mu_fg.max():.4f}"
+    )
+    axes[offset + 1].imshow(x0_fg, cmap="viridis", vmin=vmin, vmax=vmax)
+    axes[offset + 1].set_title(
+        "x0 (foreground)\n"
+        f"min={x0_fg.min():.4f}, mean={x0_fg.mean():.4f}, max={x0_fg.max():.4f}"
+    )
+    for axis in axes:
+        axis.axis("off")
+    figure.colorbar(
+        mu_image, ax=list(axes[offset:]), fraction=0.046, pad=0.04
+    )
+    destination = Path(path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    figure.savefig(destination, bbox_inches="tight")
+    plt.close(figure)
+
+
 def save_adaptive_path_debug(
     image: torch.Tensor,
     target: torch.Tensor,

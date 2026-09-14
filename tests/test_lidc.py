@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -17,6 +18,7 @@ from training_objectives import (
     DDPCompatibleTrainingModel,
     compute_model_training_objectives,
 )
+from trainer import _should_capture_lidc_source
 
 
 CONFIG_PATH = Path(__file__).parents[1] / "configs/lidc/diagonal/standard.yaml"
@@ -277,6 +279,58 @@ def test_lidc_full_resolution_training_and_sampling(tmp_path, monkeypatch):
     )
     assert terminal.shape == expected_state
     assert prediction.shape == (1, 128, 128)
+
+
+def test_lidc_sampling_returns_exact_source_forward_state_without_resampling():
+    config = load_config(CONFIG_PATH)
+
+    class CountingSource(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.calls = 0
+
+        def forward(self, image):
+            self.calls += 1
+            mu = torch.stack((image[:, 0], image[:, 0] + 2.0), dim=1)
+            logvar = torch.zeros_like(mu)
+            x0 = mu + 7.0
+            return x0, mu, logvar
+
+    class RecordingEndpoint(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.initial_state = None
+
+        def forward_logits(self, state, image, s, t):
+            if self.initial_state is None:
+                self.initial_state = state.detach().clone()
+            return state
+
+    source = CountingSource()
+    endpoint = RecordingEndpoint()
+    image = torch.zeros(1, 1, 128, 128)
+    prediction, x0, mu = sample_segmentation(
+        endpoint, source, image, config, num_steps=1,
+        return_source_sample=True,
+    )
+
+    assert source.calls == 1
+    torch.testing.assert_close(x0, mu + 7.0)
+    torch.testing.assert_close(endpoint.initial_state, x0)
+    assert prediction.shape == (1, 128, 128)
+
+
+def test_lidc_source_visualization_gate_is_rank_zero_and_lidc_only():
+    config = load_config(CONFIG_PATH)
+    config["evaluation"]["max_visualizations"] = 2
+    main = SimpleNamespace(is_main_process=True)
+    worker = SimpleNamespace(is_main_process=False)
+
+    assert _should_capture_lidc_source(config, main, 0)
+    assert not _should_capture_lidc_source(config, worker, 0)
+    assert not _should_capture_lidc_source(config, main, 2)
+    config["dataset"]["name"] = "cityscapes"
+    assert not _should_capture_lidc_source(config, main, 0)
 
 
 def test_lidc_fixed_split_counts_and_disjoint_series():

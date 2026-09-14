@@ -1,3 +1,4 @@
+import matplotlib.pyplot as plt
 import numpy as np
 from PIL import Image
 import pytest
@@ -8,6 +9,7 @@ from visualization import (
     CITYSCAPES_PALETTE,
     colorize,
     save_adaptive_path_debug,
+    save_lidc_source_mu_x0,
     save_prediction,
     save_source_diagnostics,
 )
@@ -128,3 +130,33 @@ def test_source_and_adaptive_diagnostic_visualizations_are_png(tmp_path):
         assert path.is_file()
         with Image.open(path) as saved:
             assert saved.format == "PNG"
+
+
+def test_save_lidc_source_mu_x0_uses_foreground_and_shared_scale(
+    tmp_path, monkeypatch
+):
+    mu = torch.zeros(2, 128, 128)
+    x0 = torch.zeros_like(mu)
+    mu[0].fill_(-100.0)
+    x0[0].fill_(100.0)
+    mu[1] = torch.linspace(-2.0, 1.0, 128 * 128).reshape(128, 128)
+    x0[1] = torch.linspace(-1.0, 4.0, 128 * 128).reshape(128, 128)
+    captured = []
+    original_imshow = plt.Axes.imshow
+
+    def capture_imshow(axis, values, *args, **kwargs):
+        captured.append((torch.as_tensor(np.asarray(values)), kwargs.copy()))
+        return original_imshow(axis, values, *args, **kwargs)
+
+    monkeypatch.setattr(plt.Axes, "imshow", capture_imshow)
+    output = tmp_path / "source_mu_x0.png"
+    save_lidc_source_mu_x0(mu, x0, output)
+
+    assert output.is_file()
+    assert len(captured) == 2
+    torch.testing.assert_close(captured[0][0], mu[1])
+    torch.testing.assert_close(captured[1][0], x0[1])
+    assert captured[0][1]["vmin"] == captured[1][1]["vmin"] == -2.0
+    assert captured[0][1]["vmax"] == captured[1][1]["vmax"] == 4.0
+    with Image.open(output) as saved:
+        assert saved.format == "PNG"

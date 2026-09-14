@@ -71,6 +71,7 @@ from utils import (
 )
 from visualization import (
     save_adaptive_path_debug,
+    save_lidc_source_mu_x0,
     save_prediction,
     save_source_diagnostics,
 )
@@ -868,6 +869,17 @@ def _validation_batch_items(batch) -> list[dict]:
     )
 
 
+def _should_capture_lidc_source(
+    config: dict, context: DistributedContext, visualized: int
+) -> bool:
+    """Gate source-state visualization to LIDC rank zero and its configured cap."""
+    return (
+        config["dataset"]["name"] == "lidc"
+        and context.is_main_process
+        and visualized < config["evaluation"]["max_visualizations"]
+    )
+
+
 def _accumulate_entropy_percentiles(
     entropy: torch.Tensor,
     correct: torch.Tensor,
@@ -1094,6 +1106,7 @@ def validate(
     loader,
     context: DistributedContext,
     output_dir: Path,
+    validation_epoch: int | None = None,
 ) -> dict:
     if config["evaluation"].get("source_only", False):
         return validate_source_only(
@@ -1127,6 +1140,7 @@ def validate(
         if stochastic_counts else None
     )
     visualized = 0
+    source_visualized = 0
     maximum_batches = config["evaluation"]["max_batches"]
     for batch_index, batch in enumerate(loader):
         if maximum_batches is not None and batch_index >= maximum_batches:
@@ -1173,16 +1187,45 @@ def validate(
                 context.device, non_blocking=True
             )
             with autocast_context(config, context.device):
+                capture_source = _should_capture_lidc_source(
+                    config, context, source_visualized
+                )
+                source_sample = None
                 if lidc_metrics is not None:
-                    prediction_samples, prediction = sample_lidc_distribution(
-                        endpoint, source, image, config, stochastic_counts
+                    lidc_result = sample_lidc_distribution(
+                        endpoint, source, image, config, stochastic_counts,
+                        return_source_sample=capture_source,
                     )
+                    if capture_source:
+                        (
+                            prediction_samples,
+                            prediction,
+                            source_x0,
+                            source_mu,
+                        ) = lidc_result
+                        source_sample = (source_x0, source_mu)
+                    else:
+                        prediction_samples, prediction = lidc_result
                 elif config["evaluation"]["num_samples"] == 1:
-                    prediction = sample_segmentation(endpoint, source, image, config)
-                else:
-                    prediction = sample_segmentation_ensemble(
-                        endpoint, source, image, config
+                    segmentation_result = sample_segmentation(
+                        endpoint, source, image, config,
+                        return_source_sample=capture_source,
                     )
+                    if capture_source:
+                        prediction, source_x0, source_mu = segmentation_result
+                        source_sample = (source_x0, source_mu)
+                    else:
+                        prediction = segmentation_result
+                else:
+                    ensemble_result = sample_segmentation_ensemble(
+                        endpoint, source, image, config,
+                        return_source_sample=capture_source,
+                    )
+                    if capture_source:
+                        prediction, source_x0, source_mu = ensemble_result
+                        source_sample = (source_x0, source_mu)
+                    else:
+                        prediction = ensemble_result
             metrics.update(prediction, target)
             if lidc_metrics is not None:
                 lidc_metrics.update(
@@ -1191,6 +1234,26 @@ def validate(
                     prediction,
                 )
             visualization_items = [(image, target, prediction)]
+            if source_sample is not None:
+                source_x0, source_mu = source_sample
+                source_remaining = (
+                    config["evaluation"]["max_visualizations"] - source_visualized
+                )
+                epoch_name = (
+                    f"epoch_{validation_epoch:04d}"
+                    if validation_epoch is not None else "epoch_0000"
+                )
+                for sample_index in range(
+                    min(image.shape[0], max(source_remaining, 0))
+                ):
+                    save_lidc_source_mu_x0(
+                        source_mu[sample_index], source_x0[sample_index],
+                        output_dir / "source_mu_x0" / epoch_name
+                        / f"sample_{source_visualized:04d}.png",
+                        foreground_channel=1,
+                        image=image[sample_index],
+                    )
+                    source_visualized += 1
         if context.is_main_process:
             remaining = config["evaluation"]["max_visualizations"] - visualized
             for item_index, (images, targets, predictions) in enumerate(visualization_items):
@@ -1497,7 +1560,8 @@ def run_training(config: dict, *, joint_entrypoint: bool = False) -> dict:
                 )
             else:
                 result = validate(
-                    config, training_model, val_loader, context, output_dir
+                    config, training_model, val_loader, context, output_dir,
+                    validation_epoch=displayed_epoch,
                 )
                 if staged:
                     result.update({

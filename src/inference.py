@@ -128,12 +128,14 @@ def sample_segmentation(
     num_steps: int | None = None,
     return_trajectory: bool = False,
     return_terminal_state: bool = False,
+    return_source_sample: bool = False,
 ):
     model.eval()
     if source_model is not None:
         source_model.eval()
     x0, source_stats = sample_prior(
-        config, image, None, source_model, sampling_mode="inference"
+        config, image, None, source_model, sampling_mode="inference",
+        retain_source_tensors=return_source_sample,
     )
     path_difficulty = None
     if entropy_adaptive_enabled(config):
@@ -143,7 +145,7 @@ def sample_segmentation(
         _, path_difficulty = source_entropy_difficulty(
             source_state, config, spatial_size=x0.shape[-2:]
         )
-    return sample_segmentation_from_x0(
+    result = sample_segmentation_from_x0(
         model,
         image,
         x0,
@@ -153,6 +155,9 @@ def sample_segmentation(
         return_terminal_state=return_terminal_state,
         path_difficulty=path_difficulty,
     )
+    if return_source_sample:
+        return result, x0.detach(), source_stats["_source_mu"]
+    return result
 
 @torch.no_grad()
 def sample_segmentation_probabilities(
@@ -161,13 +166,15 @@ def sample_segmentation_probabilities(
     image: torch.Tensor,
     config: dict,
     num_steps: int | None = None,
-) -> torch.Tensor:
+    return_source_sample: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Return one stochastic sample as full-image class probabilities."""
     model.eval()
     if source_model is not None:
         source_model.eval()
     x0, source_stats = sample_prior(
-        config, image, None, source_model, sampling_mode="inference"
+        config, image, None, source_model, sampling_mode="inference",
+        retain_source_tensors=return_source_sample,
     )
     path_difficulty = None
     if entropy_adaptive_enabled(config):
@@ -191,7 +198,12 @@ def sample_segmentation_probabilities(
         full_resolution = resize_continuous(
             final_probability.float(), image.shape[-2:]
         ).clamp_min(0.0)
-    return full_resolution / full_resolution.sum(dim=1, keepdim=True).clamp_min(1.0e-12)
+    probability = full_resolution / full_resolution.sum(
+        dim=1, keepdim=True
+    ).clamp_min(1.0e-12)
+    if return_source_sample:
+        return probability, x0.detach(), source_stats["_source_mu"]
+    return probability
 
 
 @torch.no_grad()
@@ -204,7 +216,8 @@ def sample_segmentation_ensemble(
     num_samples: int | None = None,
     aggregation: str | None = None,
     num_steps: int | None = None,
-) -> torch.Tensor:
+    return_source_sample: bool = False,
+):
     """Aggregate stochastic predictions by probability mean or majority vote."""
     count = int(num_samples or config.get("evaluation", {}).get("num_samples", 1))
     mode = aggregation or config.get("evaluation", {}).get(
@@ -214,12 +227,24 @@ def sample_segmentation_ensemble(
         raise ValueError("num_samples must be positive")
     if mode not in {"probability_mean", "majority_vote"}:
         raise ValueError("aggregation must be probability_mean or majority_vote")
-    samples = [
-        sample_segmentation_probabilities(
-            model, source_model, image, config, num_steps=num_steps
-        )
-        for _ in range(count)
-    ]
+    samples = []
+    source_sample = None
+    for sample_index in range(count):
+        if return_source_sample and sample_index == 0:
+            sample_result = sample_segmentation_probabilities(
+                model, source_model, image, config, num_steps=num_steps,
+                return_source_sample=True,
+            )
+        else:
+            sample_result = sample_segmentation_probabilities(
+                model, source_model, image, config, num_steps=num_steps
+            )
+        if return_source_sample and sample_index == 0:
+            probability, x0, mu = sample_result
+            source_sample = (x0, mu)
+        else:
+            probability = sample_result
+        samples.append(probability)
     if mode == "probability_mean":
         aggregate = torch.stack(samples).mean(dim=0)
     else:
@@ -231,7 +256,11 @@ def sample_segmentation_ensemble(
     if evaluation.get("exclude_void_from_prediction", False):
         void_index = config["dataset"]["void_class_index"]
         aggregate[:, void_index] = -torch.inf
-    return aggregate.argmax(dim=1)
+    prediction = aggregate.argmax(dim=1)
+    if return_source_sample:
+        assert source_sample is not None
+        return prediction, *source_sample
+    return prediction
 
 
 @torch.no_grad()
@@ -241,7 +270,9 @@ def sample_lidc_distribution(
     image: torch.Tensor,
     config: dict,
     sample_counts: list[int],
-) -> tuple[torch.Tensor, torch.Tensor]:
+    *,
+    return_source_sample: bool = False,
+):
     """Generate one LIDC batch up to max(N), without retaining other batches."""
     if config.get("dataset", {}).get("protocol") != "lidc":
         raise ValueError("sample_lidc_distribution is LIDC-only")
@@ -252,16 +283,30 @@ def sample_lidc_distribution(
     foreground_probability_sum = torch.zeros(
         image.shape[0], *image.shape[-2:], device=image.device, dtype=torch.float32
     )
-    for _ in range(maximum):
-        probability = sample_segmentation_probabilities(
-            model, source_model, image, config
-        )
+    source_sample = None
+    for sample_index in range(maximum):
+        if return_source_sample and sample_index == 0:
+            sample_result = sample_segmentation_probabilities(
+                model, source_model, image, config, return_source_sample=True
+            )
+        else:
+            sample_result = sample_segmentation_probabilities(
+                model, source_model, image, config
+            )
+        if return_source_sample and sample_index == 0:
+            probability, x0, mu = sample_result
+            source_sample = (x0, mu)
+        else:
+            probability = sample_result
         if probability.shape[1] != 2:
             raise AssertionError("LIDC distribution sampling requires two classes")
         predictions.append(probability.argmax(dim=1))
         foreground_probability_sum += probability[:, 1]
     stacked = torch.stack(predictions, dim=1)
     deterministic = (foreground_probability_sum / maximum >= 0.5).long()
+    if return_source_sample:
+        assert source_sample is not None
+        return stacked, deterministic, *source_sample
     return stacked, deterministic
 
 

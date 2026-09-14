@@ -419,6 +419,7 @@ def sample_prior(
     optimizer_step: int = 0,
     epoch_index: int = 0,
     source_trainable: bool | None = None,
+    retain_source_tensors: bool = False,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Sample state-resolution x0 and compute optional full-resolution supervision."""
     if sampling_mode not in {"training", "inference"}:
@@ -715,6 +716,10 @@ def sample_prior(
     # A tuple retains no tensor storage and lets optional first-batch diagnostics
     # report the source resolution without changing the source model API.
     stats["_debug_mu_raw_shape"] = tuple(mu.shape)
+    if retain_source_tensors:
+        # Inference-only diagnostic payload from the exact source forward that
+        # produced the returned x0. No sampling or forward pass is repeated.
+        stats["_source_mu"] = mu.detach()
     return x0, stats
 
 
