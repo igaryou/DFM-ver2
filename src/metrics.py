@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import math
+
+import numpy as np
 import torch
 import torch.distributed as dist
 
@@ -93,6 +96,96 @@ def _maximum_one_to_one_mean(score: torch.Tensor) -> torch.Tensor:
     return dp[:, -1] / ground_truths
 
 
+def _hungarian_maximum_assignment_mean(score: torch.Tensor) -> torch.Tensor:
+    """Solve an exact maximum-weight assignment for each square score matrix."""
+    if score.ndim != 3 or score.shape[1] != score.shape[2]:
+        raise ValueError("Hungarian score must have shape [B,L,L]")
+    size = score.shape[1]
+    results = []
+    # Evaluation metric only: the O(L^3) Hungarian updates are intentionally
+    # performed on detached CPU doubles for clarity and deterministic indexing.
+    for batch_score_tensor in score.detach().double().cpu():
+        batch_score = batch_score_tensor.numpy()
+        cost = -batch_score
+        row_potential = np.zeros(size + 1, dtype=np.float64)
+        column_potential = np.zeros(size + 1, dtype=np.float64)
+        matched_row = np.zeros(size + 1, dtype=np.int64)
+        predecessor = np.zeros(size + 1, dtype=np.int64)
+        for row in range(1, size + 1):
+            matched_row[0] = row
+            minimum = np.full(size + 1, np.inf, dtype=np.float64)
+            used = np.zeros(size + 1, dtype=np.bool_)
+            column = 0
+            while True:
+                used[column] = True
+                current_row = matched_row[column]
+                delta = float("inf")
+                next_column = 0
+                for candidate in range(1, size + 1):
+                    if used[candidate]:
+                        continue
+                    reduced = (
+                        cost[current_row - 1, candidate - 1]
+                        - row_potential[current_row]
+                        - column_potential[candidate]
+                    )
+                    if reduced < minimum[candidate]:
+                        minimum[candidate] = reduced
+                        predecessor[candidate] = column
+                    candidate_minimum = minimum[candidate]
+                    if candidate_minimum < delta:
+                        # Keep a Python scalar: a tensor view would be mutated
+                        # below when minimum is updated, corrupting potentials.
+                        delta = candidate_minimum
+                        next_column = candidate
+                for candidate in range(size + 1):
+                    if used[candidate]:
+                        row_potential[matched_row[candidate]] += delta
+                        column_potential[candidate] -= delta
+                    else:
+                        minimum[candidate] -= delta
+                column = next_column
+                if matched_row[column] == 0:
+                    break
+            while True:
+                previous_column = predecessor[column]
+                matched_row[column] = matched_row[previous_column]
+                column = previous_column
+                if column == 0:
+                    break
+        assignment = np.empty(size, dtype=np.int64)
+        for column in range(1, size + 1):
+            assignment[matched_row[column] - 1] = column - 1
+        results.append(batch_score[np.arange(size), assignment].mean())
+    return score.new_tensor(results)
+
+
+def ccdm_hungarian_matched_iou(
+    predictions: torch.Tensor, ground_truths: torch.Tensor
+) -> torch.Tensor:
+    """Compute CCDM-compatible HM-IoU for arbitrary prediction/GT counts.
+
+    Predictions and GTs are repeat-interleaved to L=lcm(N,G), then all L
+    samples participate in one exact Hungarian one-to-one matching. This
+    differs from the legacy best-subset DP, which selected only G predictions.
+    """
+    if predictions.ndim != 4 or ground_truths.ndim != 4:
+        raise ValueError("binary mask sets must have shape [B,S,H,W]")
+    predictions_count = predictions.shape[1]
+    ground_truth_count = ground_truths.shape[1]
+    if predictions_count == 0 or ground_truth_count == 0:
+        raise ValueError("prediction and ground-truth sets must not be empty")
+    pairwise = binary_pairwise_iou(predictions, ground_truths)
+    expanded_count = math.lcm(predictions_count, ground_truth_count)
+    expanded = pairwise.repeat_interleave(
+        expanded_count // predictions_count, dim=1
+    ).repeat_interleave(
+        expanded_count // ground_truth_count, dim=2
+    )
+    assert expanded.shape[1:] == (expanded_count, expanded_count)
+    return _hungarian_maximum_assignment_mean(expanded)
+
+
 class LIDCStochasticMetrics:
     """Batch-streaming LIDC distribution and deterministic binary metrics."""
 
@@ -132,7 +225,9 @@ class LIDCStochasticMetrics:
                 - (1.0 - pred_pred_iou).mean(dim=(1, 2))
                 - (1.0 - gt_gt_iou).mean(dim=(1, 2))
             )
-            hm_iou = _maximum_one_to_one_mean(pred_gt_iou)
+            # CCDM HM-IoU includes every sample after LCM expansion, rather
+            # than selecting only the best G predictions from N.
+            hm_iou = ccdm_hungarian_matched_iou(selected, ground_truths)
             mdm = binary_pairwise_dice(selected, ground_truths).amax(dim=1).mean(dim=1)
             self.distribution_sums[index] += torch.stack(
                 (ged_squared.sum(), hm_iou.sum(), mdm.sum())

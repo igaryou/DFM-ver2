@@ -27,37 +27,57 @@ def test_save_source_visualizations_uses_same_forward_mu_x0_and_limit(
             super().__init__()
             self.calls = 0
 
-        def forward(self, image):
+        def forward_statistics(self, image):
             self.calls += 1
             mu = torch.cat((image, image + 2.0), dim=1)
-            x0 = mu + 7.0
-            return x0, mu, torch.zeros_like(mu)
+            return mu, torch.zeros_like(mu)
 
     captured = []
+    visualized_x0_ids = []
+    diagnosed_x0_ids = []
+    original_diagnostics = MODULE.compute_lidc_source_diagnostics
 
-    def capture(mu, x0, path, foreground_channel, image):
+    def capture(image, target, mu, x0_samples, path):
+        visualized_x0_ids.append(id(x0_samples))
         captured.append(
-            (mu.clone(), x0.clone(), Path(path), foreground_channel, image)
+            (mu.clone(), x0_samples.clone(), Path(path), image, target)
         )
 
-    monkeypatch.setattr(MODULE, "save_lidc_source_mu_x0", capture)
+    def capture_diagnostics(mu, logvar, x0_samples, target, **kwargs):
+        diagnosed_x0_ids.append(id(x0_samples))
+        return original_diagnostics(mu, logvar, x0_samples, target, **kwargs)
+
+    monkeypatch.setattr(MODULE, "save_lidc_source_multisample", capture)
+    monkeypatch.setattr(
+        MODULE, "compute_lidc_source_diagnostics", capture_diagnostics
+    )
     source = CountingSource()
     loader = [
-        {"image": torch.zeros(2, 1, 8, 8)},
-        {"image": torch.ones(2, 1, 8, 8)},
+        {
+            "image": torch.zeros(2, 1, 8, 8),
+            "target": torch.zeros(2, 8, 8, dtype=torch.long),
+        },
+        {
+            "image": torch.ones(2, 1, 8, 8),
+            "target": torch.ones(2, 8, 8, dtype=torch.long),
+        },
     ]
-    saved = MODULE.save_source_visualizations(
+    diagnostics = MODULE.save_source_visualizations(
         source, loader, tmp_path, 3, _config(), torch.device("cpu")
     )
 
-    assert saved == 3
+    assert len(diagnostics) == 3
     assert source.calls == 2
+    assert visualized_x0_ids == diagnosed_x0_ids
     assert [item[2].name for item in captured] == [
         "sample_0000.png", "sample_0001.png", "sample_0002.png"
     ]
-    assert all(item[3] == 1 for item in captured)
-    for mu, x0, _, _, _ in captured:
-        torch.testing.assert_close(x0, mu + 7.0)
+    for mu, x0_samples, _, _, target in captured:
+        assert x0_samples.shape == (16, 2, 8, 8)
+        assert target.shape == (8, 8)
+        assert not torch.equal(x0_samples[0], x0_samples[1])
+    assert (tmp_path / "metrics/sample_0000.json").is_file()
+    assert (tmp_path / "metrics/summary.json").is_file()
 
 
 def test_parser_uses_requested_hyphenated_arguments():
@@ -66,11 +86,40 @@ def test_parser_uses_requested_hyphenated_arguments():
         "--checkpoint", "epoch_0100.pt",
         "--output-dir", "outputs",
         "--num-visualizations", "12",
+        "--num-source-samples", "5",
         "--split", "val",
+        "--seed", "123",
     ])
     assert arguments.output_dir == "outputs"
     assert arguments.num_visualizations == 12
+    assert arguments.num_source_samples == 5
     assert arguments.split == "val"
+    assert arguments.seed == 123
+
+
+def test_source_sampling_is_reproducible_per_sample_and_checkpoint_independent():
+    mu_a = torch.zeros(2, 8, 8)
+    mu_b = torch.full((2, 8, 8), 10.0)
+    logvar = torch.zeros_like(mu_a)
+    x0_a, epsilon_a = MODULE.sample_source_distribution(
+        mu_a, logvar, 5, seed=42, sample_index=3
+    )
+    x0_a_repeat, epsilon_repeat = MODULE.sample_source_distribution(
+        mu_a, logvar, 5, seed=42, sample_index=3
+    )
+    x0_b, epsilon_b = MODULE.sample_source_distribution(
+        mu_b, logvar, 5, seed=42, sample_index=3
+    )
+    _, epsilon_other_sample = MODULE.sample_source_distribution(
+        mu_a, logvar, 5, seed=42, sample_index=4
+    )
+
+    torch.testing.assert_close(x0_a, x0_a_repeat)
+    torch.testing.assert_close(epsilon_a, epsilon_repeat)
+    torch.testing.assert_close(epsilon_a, epsilon_b)
+    torch.testing.assert_close(x0_b - mu_b.unsqueeze(0), epsilon_b)
+    assert not torch.equal(epsilon_a, epsilon_other_sample)
+    assert not torch.equal(x0_a[0], x0_a[1])
 
 
 def test_load_checkpoint_source_loads_only_source_model(tmp_path, monkeypatch):

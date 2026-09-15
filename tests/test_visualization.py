@@ -8,8 +8,10 @@ from visualization import (
     ADE20K_PALETTE,
     CITYSCAPES_PALETTE,
     colorize,
+    lidc_source_multisample_states,
     save_adaptive_path_debug,
     save_lidc_source_mu_x0,
+    save_lidc_source_multisample,
     save_prediction,
     save_source_diagnostics,
 )
@@ -141,6 +143,11 @@ def test_save_lidc_source_mu_x0_uses_foreground_and_shared_scale(
     x0[0].fill_(100.0)
     mu[1] = torch.linspace(-2.0, 1.0, 128 * 128).reshape(128, 128)
     x0[1] = torch.linspace(-1.0, 4.0, 128 * 128).reshape(128, 128)
+    # Make channel argmax disagree with a foreground-channel > 0 threshold.
+    mu[:, 0, 0] = torch.tensor([2.0, 1.0])
+    mu[:, 0, 1] = torch.tensor([-2.0, -1.0])
+    x0[:, 0, 0] = torch.tensor([3.0, 2.0])
+    x0[:, 0, 1] = torch.tensor([-3.0, -2.0])
     captured = []
     original_imshow = plt.Axes.imshow
 
@@ -150,13 +157,59 @@ def test_save_lidc_source_mu_x0_uses_foreground_and_shared_scale(
 
     monkeypatch.setattr(plt.Axes, "imshow", capture_imshow)
     output = tmp_path / "source_mu_x0.png"
-    save_lidc_source_mu_x0(mu, x0, output)
+    target = torch.zeros(128, 128, dtype=torch.long)
+    save_lidc_source_mu_x0(
+        mu, x0, output, image=torch.zeros(1, 128, 128), target=target
+    )
 
     assert output.is_file()
-    assert len(captured) == 2
-    torch.testing.assert_close(captured[0][0], mu[1])
-    torch.testing.assert_close(captured[1][0], x0[1])
-    assert captured[0][1]["vmin"] == captured[1][1]["vmin"] == -2.0
-    assert captured[0][1]["vmax"] == captured[1][1]["vmax"] == 4.0
+    assert len(captured) == 6
+    torch.testing.assert_close(captured[1][0], mu[1])
+    torch.testing.assert_close(captured[2][0], x0[1])
+    assert captured[1][1]["vmin"] == captured[2][1]["vmin"] == -2.0
+    assert captured[1][1]["vmax"] == captured[2][1]["vmax"] == 4.0
+    expected_mu_argmax = torch.argmax(mu, dim=0)
+    expected_x0_argmax = torch.argmax(x0, dim=0)
+    np.testing.assert_array_equal(
+        captured[4][0].numpy(), colorize(expected_mu_argmax, "lidc")
+    )
+    np.testing.assert_array_equal(
+        captured[5][0].numpy(), colorize(expected_x0_argmax, "lidc")
+    )
+    assert expected_mu_argmax[0, :2].tolist() == [0, 1]
+    assert expected_x0_argmax[0, :2].tolist() == [0, 1]
+    assert (mu[1, 0, :2] > 0).tolist() == [True, False]
+    assert (x0[1, 0, :2] > 0).tolist() == [True, False]
+    with Image.open(output) as saved:
+        assert saved.format == "PNG"
+
+
+def test_lidc_multisample_states_use_channel_argmax_and_margin(tmp_path):
+    mu = torch.zeros(2, 128, 128)
+    mu[:, 0, 0] = torch.tensor([2.0, 1.0])
+    mu[:, 0, 1] = torch.tensor([-2.0, -1.0])
+    x0_samples = mu.unsqueeze(0).repeat(16, 1, 1, 1)
+    x0_samples[1:, 0, 1, 1] = -2.0
+    x0_samples[1:, 1, 1, 1] = 2.0
+
+    margin, mu_argmax, x0_argmax = lidc_source_multisample_states(
+        mu, x0_samples
+    )
+
+    torch.testing.assert_close(margin, mu[1] - mu[0])
+    assert mu_argmax.shape == (128, 128)
+    assert x0_argmax.shape == (16, 128, 128)
+    assert mu_argmax[0, :2].tolist() == [0, 1]
+    assert (mu[1, 0, :2] > 0).tolist() == [True, False]
+    assert x0_argmax[0, 1, 1] != x0_argmax[1, 1, 1]
+
+    output = tmp_path / "multisample.png"
+    save_lidc_source_multisample(
+        torch.zeros(1, 128, 128),
+        torch.zeros(128, 128, dtype=torch.long),
+        mu,
+        x0_samples,
+        output,
+    )
     with Image.open(output) as saved:
         assert saved.format == "PNG"

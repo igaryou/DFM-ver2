@@ -125,8 +125,9 @@ def save_lidc_source_mu_x0(
     foreground_channel: int = 1,
     *,
     image: torch.Tensor | None = None,
+    target: torch.Tensor | None = None,
 ) -> None:
-    """Save raw LIDC source mean and its corresponding sampled source state."""
+    """Save raw and channel-argmax LIDC source mean/sample visualizations."""
     if mu.ndim != 3 or x0.ndim != 3:
         raise ValueError("mu and x0 must have shape [C,H,W]")
     if mu.shape != x0.shape:
@@ -136,38 +137,152 @@ def save_lidc_source_mu_x0(
 
     mu_fg = mu[foreground_channel].detach().float().cpu()
     x0_fg = x0[foreground_channel].detach().float().cpu()
+    mu_argmax = torch.argmax(mu.detach(), dim=0).cpu()
+    x0_argmax = torch.argmax(x0.detach(), dim=0).cpu()
     vmin = min(float(mu_fg.min()), float(x0_fg.min()))
     vmax = max(float(mu_fg.max()), float(x0_fg.max()))
 
-    columns = 3 if image is not None else 2
-    figure, axes = plt.subplots(1, columns, figsize=(5 * columns, 4))
-    axes = np.asarray(axes).reshape(-1)
-    offset = 0
+    figure, axes = plt.subplots(2, 3, figsize=(15, 8))
     if image is not None:
         if image.ndim != 3 or image.shape[0] != 1:
             raise ValueError("LIDC image must have shape [1,H,W]")
         image_display = ((image.detach().float().cpu() + 1.0) / 2.0).clamp(0, 1)
-        axes[0].imshow(image_display[0], cmap="gray", vmin=0.0, vmax=1.0)
-        axes[0].set_title("Input CT")
-        offset = 1
+        axes[0, 0].imshow(image_display[0], cmap="gray", vmin=0.0, vmax=1.0)
+        axes[0, 0].set_title("Input CT")
 
-    mu_image = axes[offset].imshow(
+    mu_image = axes[0, 1].imshow(
         mu_fg, cmap="viridis", vmin=vmin, vmax=vmax
     )
-    axes[offset].set_title(
-        "μ (foreground)\n"
+    axes[0, 1].set_title(
+        "μ foreground (raw)\n"
         f"min={mu_fg.min():.4f}, mean={mu_fg.mean():.4f}, max={mu_fg.max():.4f}"
     )
-    axes[offset + 1].imshow(x0_fg, cmap="viridis", vmin=vmin, vmax=vmax)
-    axes[offset + 1].set_title(
-        "x0 (foreground)\n"
+    axes[0, 2].imshow(x0_fg, cmap="viridis", vmin=vmin, vmax=vmax)
+    axes[0, 2].set_title(
+        "x0 foreground (raw)\n"
         f"min={x0_fg.min():.4f}, mean={x0_fg.mean():.4f}, max={x0_fg.max():.4f}"
     )
-    for axis in axes:
+    if target is not None:
+        if target.ndim != 2 or target.shape != mu.shape[-2:]:
+            raise ValueError("LIDC target must have shape [H,W] matching mu/x0")
+        axes[1, 0].imshow(colorize(target, "lidc"))
+        axes[1, 0].set_title("Ground Truth (annotation 0)")
+    axes[1, 1].imshow(colorize(mu_argmax, "lidc"))
+    axes[1, 1].set_title("argmax μ")
+    axes[1, 2].imshow(colorize(x0_argmax, "lidc"))
+    axes[1, 2].set_title("argmax x0")
+    for axis in axes.reshape(-1):
         axis.axis("off")
     figure.colorbar(
-        mu_image, ax=list(axes[offset:]), fraction=0.046, pad=0.04
+        mu_image, ax=[axes[0, 1], axes[0, 2]], fraction=0.046, pad=0.04
     )
+    destination = Path(path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    figure.savefig(destination, bbox_inches="tight")
+    plt.close(figure)
+
+
+def lidc_source_multisample_states(
+    mu: torch.Tensor, x0_samples: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return raw class margin and channel-argmax masks for LIDC source states."""
+    if mu.ndim != 3 or mu.shape[0] != 2:
+        raise ValueError("LIDC mu must have shape [2,H,W]")
+    if x0_samples.ndim != 4 or x0_samples.shape[1:] != mu.shape:
+        raise ValueError("LIDC x0_samples must have shape [N,2,H,W]")
+    if x0_samples.shape[0] == 0:
+        raise ValueError("x0_samples must contain at least one source sample")
+    mu_margin = mu[1] - mu[0]
+    mu_argmax = torch.argmax(mu, dim=0)
+    x0_argmax = torch.argmax(x0_samples, dim=1)
+    return mu_margin, mu_argmax, x0_argmax
+
+
+def save_lidc_source_multisample(
+    image: torch.Tensor,
+    target: torch.Tensor,
+    mu: torch.Tensor,
+    x0_samples: torch.Tensor,
+    path: str | Path,
+) -> None:
+    """Save deterministic LIDC source statistics and sampled initial masks."""
+    if image.ndim != 3 or image.shape[0] != 1:
+        raise ValueError("LIDC image must have shape [1,H,W]")
+    if target.ndim != 2 or target.shape != mu.shape[-2:]:
+        raise ValueError("LIDC target must have shape [H,W] matching mu")
+    mu = mu.detach().float().cpu()
+    x0_samples = x0_samples.detach().float().cpu()
+    mu_margin, mu_argmax, x0_argmax = lidc_source_multisample_states(
+        mu, x0_samples
+    )
+    image_display = ((image.detach().float().cpu() + 1.0) / 2.0).clamp(0, 1)
+    target = target.detach().cpu()
+    mu_fg = mu[1]
+    x0_fg = x0_samples[0, 1]
+    raw_vmin = min(float(mu_fg.min()), float(x0_fg.min()))
+    raw_vmax = max(float(mu_fg.max()), float(x0_fg.max()))
+    margin_absmax = float(mu_margin.abs().max())
+    if margin_absmax == 0.0:
+        margin_absmax = 1.0
+
+    sample_columns = 4
+    sample_rows = math.ceil(x0_samples.shape[0] / sample_columns)
+    figure = plt.figure(figsize=(18, 4 + 3.5 * sample_rows))
+    outer = figure.add_gridspec(
+        2, 1, height_ratios=[1.0, float(sample_rows)], hspace=0.25
+    )
+    top_grid = outer[0].subgridspec(1, 6, wspace=0.2)
+    top_axes = [figure.add_subplot(top_grid[0, index]) for index in range(6)]
+    sample_grid = outer[1].subgridspec(
+        sample_rows, sample_columns, wspace=0.05, hspace=0.18
+    )
+    sample_axes = [
+        figure.add_subplot(sample_grid[row, column])
+        for row in range(sample_rows)
+        for column in range(sample_columns)
+    ]
+
+    top_axes[0].imshow(image_display[0], cmap="gray", vmin=0.0, vmax=1.0)
+    top_axes[0].set_title("Input CT")
+    top_axes[1].imshow(colorize(target, "lidc"))
+    top_axes[1].set_title("Ground Truth\n(annotation 0)")
+    top_axes[2].imshow(colorize(mu_argmax, "lidc"))
+    top_axes[2].set_title("argmax μ")
+    margin_image = top_axes[3].imshow(
+        mu_margin,
+        cmap="coolwarm",
+        vmin=-margin_absmax,
+        vmax=margin_absmax,
+    )
+    top_axes[3].set_title(
+        "μ1 - μ0 margin\n"
+        f"min={mu_margin.min():.4f}, mean={mu_margin.mean():.4f}, "
+        f"max={mu_margin.max():.4f}"
+    )
+    raw_image = top_axes[4].imshow(
+        mu_fg, cmap="viridis", vmin=raw_vmin, vmax=raw_vmax
+    )
+    top_axes[4].set_title(
+        "μ foreground (raw)\n"
+        f"min={mu_fg.min():.4f}, mean={mu_fg.mean():.4f}, max={mu_fg.max():.4f}"
+    )
+    top_axes[5].imshow(
+        x0_fg, cmap="viridis", vmin=raw_vmin, vmax=raw_vmax
+    )
+    top_axes[5].set_title(
+        "x0 #01 foreground (raw)\n"
+        f"min={x0_fg.min():.4f}, mean={x0_fg.mean():.4f}, max={x0_fg.max():.4f}"
+    )
+    figure.colorbar(margin_image, ax=top_axes[3], fraction=0.046, pad=0.04)
+    figure.colorbar(raw_image, ax=top_axes[4:6], fraction=0.046, pad=0.04)
+
+    for sample_index, mask in enumerate(x0_argmax):
+        sample_axes[sample_index].imshow(colorize(mask, "lidc"))
+        sample_axes[sample_index].set_title(f"argmax x0 #{sample_index + 1:02d}")
+    for axis in top_axes + sample_axes:
+        axis.axis("off")
+    for axis in sample_axes[x0_samples.shape[0]:]:
+        axis.set_visible(False)
     destination = Path(path)
     destination.parent.mkdir(parents=True, exist_ok=True)
     figure.savefig(destination, bbox_inches="tight")
