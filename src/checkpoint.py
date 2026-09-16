@@ -313,6 +313,32 @@ def _without_module_prefix(state_dict: dict) -> dict:
     return state_dict
 
 
+def _validate_weights_checkpoint(
+    checkpoint: dict, config: dict, path: str | Path
+) -> None:
+    """Validate architecture compatibility without init_from stage constraints."""
+    validate_source_decoder_checkpoint(checkpoint, config, path)
+    if checkpoint.get("model") is None:
+        raise RuntimeError(f"Weights-only checkpoint has no model state: {path}")
+    if checkpoint.get("source_model") is None:
+        raise RuntimeError(f"Weights-only checkpoint has no source_model state: {path}")
+
+    saved_signature = checkpoint.get("model_signature")
+    if saved_signature is None:
+        try:
+            saved_signature = model_signature(checkpoint["config"])
+        except (KeyError, TypeError) as exc:
+            raise RuntimeError(
+                f"Weights-only checkpoint has no usable model signature: {path}"
+            ) from exc
+    current_signature = model_signature(config)
+    if saved_signature != current_signature:
+        raise RuntimeError(
+            "Weights-only checkpoint is incompatible with the current model/source "
+            f"configuration; saved={saved_signature}; current={current_signature}"
+        )
+
+
 def _swin_v5_key_to_v4(key: str) -> str | None:
     prefix = "image_encoder.backbone.swin."
     if not key.startswith(prefix):
@@ -524,9 +550,70 @@ def initialize_or_resume(
     checkpoint_config = config["checkpoint"]
     init_from = checkpoint_config["init_from"]
     resume = checkpoint_config["resume"]
-    if init_from and resume:
-        raise ValueError("checkpoint.init_from and checkpoint.resume are mutually exclusive")
+    weights_from = checkpoint_config.get("weights_from")
+    selected = [value for value in (resume, init_from, weights_from) if value]
+    if len(selected) > 1:
+        raise ValueError(
+            "checkpoint.resume, checkpoint.init_from, and "
+            "checkpoint.weights_from are mutually exclusive"
+        )
     strict = checkpoint_config["strict_model"]
+    if weights_from:
+        checkpoint = torch.load(weights_from, map_location="cpu", weights_only=False)
+        _validate_weights_checkpoint(checkpoint, config, weights_from)
+        model_state = _model_state_for_current_transformers(
+            _without_module_prefix(checkpoint["model"]), model
+        )
+        model.load_state_dict(model_state, strict=strict)
+        if source_model is not None:
+            source_state = _source_state_for_current_transformers(
+                _without_module_prefix(checkpoint["source_model"]), source_model
+            )
+            source_model.load_state_dict(source_state, strict=strict)
+
+        weight_model = (
+            consistency_weight_model
+            if consistency_weight_model is not None else psd_weight_model
+        )
+        saved_weight = checkpoint.get(
+            "consistency_weight_model", checkpoint.get("psd_weight_model")
+        )
+        loaded_states = ["endpoint model", "source model"]
+        if weight_model is not None and saved_weight is not None:
+            weight_model.load_state_dict(
+                _without_module_prefix(saved_weight), strict=True
+            )
+            loaded_states.append("consistency weight model")
+            weight_message = "Consistency weight model: loaded"
+        elif weight_model is not None:
+            weight_message = (
+                "Consistency weight model: newly initialized "
+                "(checkpoint has no weight model state)"
+            )
+        elif saved_weight is not None:
+            weight_message = (
+                "Consistency weight model: ignored "
+                "(disabled in current configuration)"
+            )
+        else:
+            weight_message = "Consistency weight model: not present"
+
+        lines = (
+            f"Loaded weights-only checkpoint: {weights_from}",
+            f"Checkpoint completed epoch: {checkpoint.get('epoch', 'unknown')}",
+            f"Loaded states: {', '.join(loaded_states)}",
+            weight_message,
+            "Optimizer state: newly initialized",
+            "Scheduler state: newly initialized",
+            "Scaler state: newly initialized",
+            "Global step reset to: 0",
+            "Training epoch reset to: 1",
+            "Best metrics reset",
+        )
+        if logger is not None:
+            for line in lines:
+                logger.info(line)
+        return TrainingState()
     if init_from:
         checkpoint = torch.load(init_from, map_location="cpu", weights_only=False)
         _validate_stage2_init_checkpoint(checkpoint, config, init_from)

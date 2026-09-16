@@ -18,6 +18,13 @@ PSD_FROM_JOINT_CONFIG = (
 JOINT_PSD_CITYSCAPES_CONFIG = (
     Path(__file__).parents[1] / "configs" / "_base_" / "cityscapes" / "joint_psd_160k.yaml"
 )
+LIDC_CONTINUE_CONFIG = (
+    Path(__file__).parents[1]
+    / "configs"
+    / "lidc"
+    / "psd"
+    / "segformer_source_align_joint_continue_1200ep.yaml"
+)
 DIAGONAL_ADE20K_CONFIG = (
     Path(__file__).parents[1] / "configs" / "ade20k" / "diagonal" / "standard.yaml"
 )
@@ -312,6 +319,37 @@ def test_init_from_and_resume_are_mutually_exclusive(tmp_path):
     path.write_text(yaml.safe_dump(raw))
     with pytest.raises(ValueError, match="mutually exclusive"):
         load_config(path)
+
+
+@pytest.mark.parametrize("other", ["resume", "init_from"])
+def test_weights_from_is_mutually_exclusive_in_config(tmp_path, other):
+    raw = yaml.safe_load(CONFIG.read_text())
+    raw["checkpoint"]["weights_from"] = "weights.pt"
+    raw["checkpoint"][other] = "other.pt"
+    path = tmp_path / f"bad-weights-{other}.yaml"
+    path.write_text(yaml.safe_dump(raw))
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        load_config(path)
+
+
+def test_lidc_continue_config_uses_fresh_1200_epoch_schedule():
+    config = load_config(LIDC_CONTINUE_CONFIG)
+    assert config["training"]["epochs"] == 1200
+    assert config["training"]["max_optimizer_steps"] == 702000
+    assert config["training"]["optimizer"]["lr"] == 6.0e-5
+    scheduler = config["training"]["scheduler"]
+    assert scheduler["name"] == "poly"
+    assert scheduler["step_unit"] == "optimizer_step"
+    assert scheduler["power"] == 1.0
+    assert scheduler["min_lr"] == 1.0e-6
+    assert scheduler["eta_min"] == 1.0e-6
+    assert scheduler["warmup_steps"] == 0
+    checkpoint = config["checkpoint"]
+    assert checkpoint["resume"] is None
+    assert checkpoint["init_from"] is None
+    assert checkpoint["weights_from"].endswith(
+        "segformer_source_align_psd_nosouce_detach/epoch_0800.pt"
+    )
 
 
 def test_precision_validation_rejects_fake_psd_jvp_and_bf16_numerics():

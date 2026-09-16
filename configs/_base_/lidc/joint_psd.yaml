@@ -18,7 +18,7 @@ source:
   learned_logvar: false
   fixed_std: 1.0
   use_loss_align: true
-  detach_from_flow: true
+  detach_from_flow: false
   input_already_normalized: true
   supervision:
     type: align

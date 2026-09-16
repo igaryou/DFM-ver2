@@ -1,0 +1,27 @@
+extends: segformer_source_align_joint.yaml
+
+experiment:
+  name: dfm_lidc_segformer_source_align_psd_continue_1200ep_initialized_from_epoch_800
+  output_dir: /home/igarashi_25/DFM/results/lidc/segformer_source_align_psd_continue_1200ep
+
+training:
+  epochs: 1200
+  max_optimizer_steps: 702000
+
+  optimizer:
+    lr: 6.0e-5
+
+  scheduler:
+    name: poly
+    step_unit: optimizer_step
+    power: 1.0
+    min_lr: 1.0e-6
+    eta_min: 1.0e-6
+
+checkpoint:
+  resume: null
+  init_from: null
+  weights_from: /home/igarashi_25/DFM/results/lidc/segformer_source_align_psd_nosouce_detach/epoch_0800.pt
+
+wandb:
+  name: dfm-lidc-segformer-source-align-psd-continue-1200ep-initialized-from-epoch-800

@@ -8,7 +8,7 @@ uv run torchrun \
   src/train_joint.py \
   --config configs/lidc/psd/segformer_source_align_joint.yaml
 
-
+DFM/configs/lidc/psd/segformer_souce_no_align.yaml
 cd /home/igarashi_25/DFM
 
 CUDA_VISIBLE_DEVICES=2 \

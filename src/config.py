@@ -379,6 +379,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "checkpoint": {
         "resume": None,
         "init_from": None,
+        "weights_from": None,
         "init_source_only": False,
         "load_optimizer": True,
         "load_scheduler": True,
@@ -1173,8 +1174,16 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
     invalid = config["loss"]["consistency"]["invalid_teacher"]
     if invalid["strategy"] not in {"clamp", "mask_pixel", "skip_batch"}:
         raise ValueError("invalid_teacher.strategy must be clamp, mask_pixel, or skip_batch")
-    if config["checkpoint"]["init_from"] and config["checkpoint"]["resume"]:
-        raise ValueError("checkpoint.init_from and checkpoint.resume are mutually exclusive")
+    checkpoint_sources = {
+        key: config["checkpoint"][key]
+        for key in ("resume", "init_from", "weights_from")
+        if config["checkpoint"][key]
+    }
+    if len(checkpoint_sources) > 1:
+        raise ValueError(
+            "checkpoint.resume, checkpoint.init_from, and "
+            "checkpoint.weights_from are mutually exclusive"
+        )
     init_source_only = config["checkpoint"]["init_source_only"]
     if not isinstance(init_source_only, bool):
         raise ValueError("checkpoint.init_source_only must be boolean")
@@ -1268,8 +1277,14 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
             raise ValueError("Stage 2 requires loss.consistency.enabled=true")
         if stage == "esd_distillation" and consistency["type"] != "esd":
             raise ValueError("Legacy esd_distillation stage requires consistency.type=esd")
-        if not config["checkpoint"]["init_from"] and not config["checkpoint"]["resume"]:
-            raise ValueError("Stage 2 requires checkpoint.init_from or checkpoint.resume")
+        if not any(
+            config["checkpoint"][key]
+            for key in ("init_from", "resume", "weights_from")
+        ):
+            raise ValueError(
+                "Stage 2 requires checkpoint.init_from, checkpoint.resume, or "
+                "checkpoint.weights_from"
+            )
     if stage == "joint_training":
         if not consistency["enabled"]:
             raise ValueError("joint_training requires consistency.enabled=true")

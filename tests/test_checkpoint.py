@@ -528,3 +528,105 @@ def test_legacy_step_scheduler_checkpoint_is_rejected_on_resume(tmp_path):
             scheduler,
             scaler,
         )
+
+
+def test_weights_from_loads_all_model_weights_and_resets_training_state(tmp_path):
+    config = load_config(ROOT / "configs" / "cityscapes" / "ecld" / "joint.yaml")
+    saved_model, saved_optimizer, saved_scheduler, _ = objects()
+    saved_source = torch.nn.Linear(3, 2)
+    saved_weight = torch.nn.Linear(1, 1)
+    with torch.no_grad():
+        saved_model.weight.fill_(2.0)
+        saved_source.weight.fill_(3.0)
+        saved_weight.weight.fill_(4.0)
+    saved_model(torch.ones(1, 3)).sum().backward()
+    saved_optimizer.step()
+    saved_scheduler.step()
+    payload = checkpoint_payload(
+        config=config,
+        epoch=800,
+        global_step=468000,
+        model=saved_model,
+        source_model=saved_source,
+        optimizer=saved_optimizer,
+        scheduler=saved_scheduler,
+        scaler=StateTracker("saved"),
+        metrics={"best_mIoU": 0.9, "best_source_mIoU": 0.8},
+        consistency_weight_model=saved_weight,
+    )
+    path = save_checkpoint(payload, tmp_path, "epoch_0800.pt")
+    config["checkpoint"]["weights_from"] = str(path)
+
+    model, optimizer, scheduler, _ = objects()
+    source = torch.nn.Linear(3, 2)
+    weight = torch.nn.Linear(1, 1)
+    initial_scheduler_state = copy.deepcopy(scheduler.state_dict())
+    scaler = StateTracker("fresh")
+    logger = CapturingLogger()
+    state = initialize_or_resume(
+        config,
+        model,
+        source,
+        optimizer,
+        scheduler,
+        scaler,
+        logger,
+        consistency_weight_model=weight,
+    )
+
+    torch.testing.assert_close(model.weight, saved_model.weight)
+    torch.testing.assert_close(source.weight, saved_source.weight)
+    torch.testing.assert_close(weight.weight, saved_weight.weight)
+    assert optimizer.state == {}
+    assert scheduler.state_dict() == initial_scheduler_state
+    assert scaler.value == "fresh" and scaler.load_calls == 0
+    assert state.start_epoch == 0
+    assert state.global_step == 0
+    assert state.micro_step == 0
+    assert state.best_miou == float("-inf")
+    assert state.best_source_miou == float("-inf")
+    assert state.best_flow_miou == float("-inf")
+    assert logger.messages == [
+        f"Loaded weights-only checkpoint: {path}",
+        "Checkpoint completed epoch: 800",
+        "Loaded states: endpoint model, source model, consistency weight model",
+        "Consistency weight model: loaded",
+        "Optimizer state: newly initialized",
+        "Scheduler state: newly initialized",
+        "Scaler state: newly initialized",
+        "Global step reset to: 0",
+        "Training epoch reset to: 1",
+        "Best metrics reset",
+    ]
+
+
+@pytest.mark.parametrize("other", ["resume", "init_from"])
+def test_weights_from_is_mutually_exclusive_at_load_time(tmp_path, other):
+    config = load_config(ROOT / "configs" / "cityscapes" / "ecld" / "joint.yaml")
+    config["checkpoint"]["weights_from"] = "weights.pt"
+    config["checkpoint"][other] = "other.pt"
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        initialize_or_resume(config, *objects()[:1], None, *objects()[1:])
+
+
+def test_weights_from_rejects_incompatible_architecture(tmp_path):
+    config = load_config(ROOT / "configs" / "cityscapes" / "ecld" / "joint.yaml")
+    model, optimizer, scheduler, scaler = objects()
+    payload = checkpoint_payload(
+        config=config,
+        epoch=800,
+        global_step=468000,
+        model=model,
+        source_model=torch.nn.Linear(3, 2),
+        optimizer=optimizer,
+        scheduler=scheduler,
+        scaler=scaler,
+        metrics={},
+    )
+    payload["model_signature"]["num_classes"] += 1
+    path = save_checkpoint(payload, tmp_path, "wrong-architecture.pt")
+    config["checkpoint"]["weights_from"] = str(path)
+    with pytest.raises(RuntimeError, match="incompatible with the current"):
+        initialize_or_resume(
+            config, model, torch.nn.Linear(3, 2), optimizer, scheduler, scaler
+        )
