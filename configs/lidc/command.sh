@@ -8,6 +8,25 @@ uv run torchrun \
   src/train_joint.py \
   --config configs/lidc/psd/segformer_source_align_joint.yaml
 
+
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+CUDA_VISIBLE_DEVICES=2,3 \
+uv run torchrun \
+  --standalone \
+  --nproc_per_node=2 \
+  src/train_joint.py \
+  --config configs/lidc/psd/segformer_source_no_align.yaml
+
+cd /home/igarashi_25/DFM
+
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+CUDA_VISIBLE_DEVICES=2,3 \
+uv run torchrun \
+  --standalone \
+  --nproc_per_node=2 \
+  src/train_joint.py \
+  --config configs/lidc/psd/segformer_source_align_joint_continue_1200ep.yaml
+
 DFM/configs/lidc/psd/segformer_souce_no_align.yaml
 cd /home/igarashi_25/DFM
 

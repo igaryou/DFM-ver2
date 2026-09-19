@@ -2,7 +2,7 @@ extends: ../../_base_/lidc/joint_psd.yaml
 
 experiment:
   name: dfm_lidc_segformer_source_align_psd
-  output_dir: /home/igarashi_25/DFM/results/lidc/segformer_source_align_psd_nosouce_detach
+  output_dir: /home/igarashi_25/DFM/results/lidc/segformer_source_align_psd_ver2
 
 model:
   state_downsample_factor: 1

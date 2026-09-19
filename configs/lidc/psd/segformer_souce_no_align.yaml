@@ -6,12 +6,28 @@ experiment:
   name: dfm_joint_psd_lidc_no_align
   output_dir: /home/igarashi_25/DFM/results/lidc/segformer_source_no_align_psd
 
+model:
+  state_downsample_factor: 1
+  image_encoder:
+    type: rrdb
+    pretrained: false
+    freeze: false
+    input_already_normalized: true
+  endpoint:
+    type: unet
+
 source:
+  segformer_variant: b1
+  checkpoint: null
   use_loss_align: false
   align_weight: 0.0
   supervision:
     type: align
     weight: 0.0
+  detach_from_flow: false
+
+training:
+  batch_size: 16
 
 wandb:
   name: dfm-lidc-segformer-source-psd
