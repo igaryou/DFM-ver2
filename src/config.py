@@ -397,6 +397,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "save_predictions": True,
         "max_visualizations": 16,
         "max_batches": None,
+        "random_subset_size": None,
+        "random_subset_seed": 42,
         "checkpoint": None,
         "resize": {"width": 2048, "height": 512, "keep_ratio": True},
         "size_divisor": None,

@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader,Subset
 
 from checkpoint import _without_module_prefix
 from config import load_config
@@ -69,6 +69,31 @@ def evaluate(config: dict, checkpoint_path: str | Path) -> dict:
         dataset = build_dataset(
             config, config["evaluation"]["split"], augment=False
         )
+        subset_size = config["evaluation"]["random_subset_size"]
+        if subset_size is not None:
+            if subset_size <= 0:
+                raise ValueError("evaluation.random_subset_size must be positive")
+            if subset_size > len(dataset):
+                raise ValueError(
+                    f"evaluation.random_subset_size={subset_size} exceeds "
+                    f"dataset size {len(dataset)}"
+                    )
+
+            generator = torch.Generator().manual_seed(
+                config["evaluation"]["random_subset_seed"]
+            )
+            indices = torch.randperm(
+                len(dataset), generator=generator
+            )[:subset_size].tolist()
+
+            dataset = Subset(dataset, indices)
+
+            if context.is_main_process:
+                print(
+                    f"Evaluation random subset: "
+                    f"{subset_size}/{len(indices) if False else len(dataset)} samples, "
+                    f"seed={config['evaluation']['random_subset_seed']}"
+                )
         sampler = (
             DistributedEvalSampler(
                 dataset, rank=context.rank, world_size=context.world_size

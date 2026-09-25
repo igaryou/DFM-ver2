@@ -173,7 +173,7 @@ training:
   log_interval: 50
   checkpoint_interval_epochs: 200
   checkpoint_interval_steps: null
-  validation_epochs: [100, 200, 300, 400, 500, 600, 700, 800, 1000, 1200, 1400, 1600, 1800, 2000]
+  validation_epochs: [200, 400, 600, 800, 1000, 1200, 1400, 1600, 1800, 2000]
 
 loss:
   ignore_index: null
@@ -199,14 +199,14 @@ checkpoint:
 evaluation:
   source_only: false
   split: val
-  batch_size: 16
+  batch_size: 10
   num_steps: 1
   num_samples: 1
   aggregation: probability_mean
   sampler: flow_map
   save_predictions: true
   max_visualizations: 32
-  max_batches: null
+  max_batches: 100
   checkpoint: null
   resize: {width: 128, height: 128, keep_ratio: true}
   size_divisor: null

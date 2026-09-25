@@ -22,7 +22,7 @@ source:
   use_loss_align: false
   align_weight: 0.0
   supervision:
-    type: align
+    type: none
     weight: 0.0
   detach_from_flow: false
 
