@@ -62,10 +62,10 @@ source:
   freeze_encoder: false
   decoder_channels: 256
   learned_logvar: false
-  fixed_std: 1.0
+  fixed_std: 2.0
   mu_tanh_scale: 0.0
   input_already_normalized: true
-  supervision: {type: align, weight: 0.20}
+  supervision: {type: align, weight: 0.15}
 
 training:
   max_optimizer_steps: 160000

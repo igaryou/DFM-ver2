@@ -406,6 +406,26 @@ def source_supervision_schedule(
     )
 
 
+def variance_only_kl(logvar: torch.Tensor, target_std: float) -> torch.Tensor:
+    """KL[N(mu, exp(logvar)) || N(mu, target_std**2)] in FP32.
+
+    The two distributions intentionally share the same mean, so this objective
+    contains no mean term and cannot directly create a gradient for ``mu``.
+    """
+    target_var = float(target_std) ** 2
+    logvar_fp32 = logvar.float()
+    variance = torch.exp(logvar_fp32)
+    loss = 0.5 * torch.mean(
+        variance / target_var
+        - logvar_fp32
+        + logvar_fp32.new_tensor(target_var).log()
+        - 1.0
+    )
+    if not torch.isfinite(loss):
+        raise FloatingPointError("variance regularization contains NaN or Inf")
+    return loss
+
+
 def sample_prior(
     config: dict,
     image: torch.Tensor,
@@ -454,6 +474,8 @@ def sample_prior(
         }
         if target_one_hot_state is not None:
             stats["target_x1_abs"] = target_one_hot_state.detach().abs().mean()
+        if retain_source_tensors:
+            stats["_source_mu"] = torch.zeros_like(x0)
         return x0, stats
     if source["prior_type"] == "dirichlet":
         concentration = torch.ones(classes, device=image.device, dtype=torch.float32)
@@ -549,8 +571,17 @@ def sample_prior(
             x0, simplex_stats = _sample_image_simplex_mixture(
                 mu, source["simplex_prior"][sampling_mode]
             )
-    assert x0.shape == mu.shape == logvar.shape
+    assert x0.shape == mu.shape
     assert x0.shape[:2] == (batch, classes)
+    expected_logvar_channels = (
+        1 if source.get("variance_mode", "channelwise") == "pixel_shared"
+        else classes
+    )
+    assert logvar.shape == (batch, expected_logvar_channels, height, width), (
+        "source logvar must have shape "
+        f"[{batch},{expected_logvar_channels},{height},{width}], "
+        f"got {tuple(logvar.shape)}"
+    )
     assert x0.shape[-2:] == (height, width), (
         f"source state {x0.shape[-2:]} != target state {(height, width)}"
     )
@@ -561,15 +592,30 @@ def sample_prior(
         and source.get("supervision", {}).get("type") in {None, "none"}
     )
     source_zero = image.new_zeros(()) if frozen_task_without_supervision else zero
-    loss_var = (
-        source_zero
-        if source["prior_type"] in {
+    variance_regularization = source.get("variance_regularization", {})
+    variance_regularization_enabled = bool(
+        variance_regularization.get("enabled", False)
+    )
+    target_std = float(variance_regularization.get("target_std", 1.0))
+    variance_weight = float(
+        variance_regularization.get("weight", source.get("var_weight", 0.0))
+        if variance_regularization_enabled
+        else source.get("var_weight", 0.0)
+    )
+    variance_is_trainable = (
+        source["prior_type"] not in {
             "image_bounded_gaussian", "image_simplex_mixture"
         }
-        or fixed_std is not None
-        or source_frozen
-        else 0.5 * torch.mean(torch.exp(logvar) - logvar - 1.0)
+        and fixed_std is None
+        and not source_frozen
     )
+    if not variance_is_trainable:
+        loss_var = source_zero
+    elif variance_regularization_enabled:
+        loss_var = variance_only_kl(logvar, target_std)
+    else:
+        # Legacy learned-logvar objective retained unchanged.
+        loss_var = 0.5 * torch.mean(torch.exp(logvar) - logvar - 1.0)
     supervision = source.get("supervision") or {}
     configured_supervision_type = supervision.get("type")
     if configured_supervision_type is not None:
@@ -655,13 +701,20 @@ def sample_prior(
             else mu.new_tensor(float(source["fixed_std"]))
         )
     else:
-        sigma = torch.exp(0.5 * logvar.detach())
+        logvar_fp32 = logvar.detach().float()
+        variance = torch.exp(logvar_fp32)
+        sigma = torch.exp(0.5 * logvar_fp32)
+        if not torch.isfinite(variance).all() or not torch.isfinite(sigma).all():
+            raise FloatingPointError("source variance or sigma contains NaN or Inf")
+    if source["prior_type"] == "image_bounded_gaussian":
+        variance = sigma.float().square()
+    target_variance = target_std**2
     stats = {
         "loss_source_var": loss_var,
         "loss_source_align": loss_align,
         "loss_source_ce": loss_ce,
         "loss_source_supervision": loss_supervision,
-        "weighted_var": source["var_weight"] * loss_var,
+        "weighted_var": variance_weight * loss_var,
         # weighted_align is a legacy dashboard/checkpoint-stat alias.
         "weighted_align": weighted_supervision,
         "weighted_source_supervision": weighted_supervision,
@@ -669,7 +722,20 @@ def sample_prior(
         "source_mu_min": mu.detach().amin(),
         "source_mu_max": mu.detach().amax(),
         "source_logvar_mean": logvar.detach().mean(),
+        "source_logvar_std": logvar.detach().float().std(unbiased=False),
+        "source_logvar_min": logvar.detach().amin(),
+        "source_logvar_max": logvar.detach().amax(),
         "source_sigma_mean": sigma.mean(),
+        "source_sigma_std": sigma.float().std(unbiased=False),
+        "source_sigma_min": sigma.amin(),
+        "source_sigma_max": sigma.amax(),
+        "source_variance_mean": variance.mean(),
+        "source_variance_std": variance.float().std(unbiased=False),
+        "source_variance_min": variance.amin(),
+        "source_variance_max": variance.amax(),
+        "source_target_std": mu.new_tensor(target_std),
+        "source_target_variance": mu.new_tensor(target_variance),
+        "source_variance_ratio": variance.mean() / target_variance,
         "source_x0_abs": x0.detach().abs().mean(),
         "source_frozen": mu.new_tensor(float(source_frozen)),
         "source_checkpoint_loaded": mu.new_tensor(float(
@@ -715,7 +781,8 @@ def sample_prior(
         stats["_path_source_state"] = mu.detach()
     # A tuple retains no tensor storage and lets optional first-batch diagnostics
     # report the source resolution without changing the source model API.
-    stats["_debug_mu_raw_shape"] = tuple(mu.shape)
+    if config.get("runtime", {}).get("debug_first_batch_shapes", False):
+        stats["_debug_mu_raw_shape"] = tuple(mu.shape)
     if retain_source_tensors:
         # Inference-only diagnostic payload from the exact source forward that
         # produced the returned x0. No sampling or forward pass is repeated.

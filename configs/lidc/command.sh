@@ -25,7 +25,7 @@ uv run torchrun \
   --standalone \
   --nproc_per_node=2 \
   src/train_joint.py \
-  --config configs/lidc/psd/segformer_source_align_joint_continue_1200ep.yaml
+  --config configs/lidc/psd/simple_cfm.yaml
 
 DFM/configs/lidc/psd/segformer_souce_no_align.yaml
 cd /home/igarashi_25/DFM

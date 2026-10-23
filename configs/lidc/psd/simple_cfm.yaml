@@ -1,0 +1,16 @@
+extends: ../../_base_/lidc/joint_psd.yaml
+
+experiment:
+  name: dfm_lidc_original_gaussian
+  output_dir: /home/igarashi_25/DFM/results/lidc/original_gaussian_ver3
+
+source:
+  prior_type: gaussian
+  prior_noise_std: 1.5
+
+model:
+  unet:
+    base_channels: 45
+
+wandb:
+  name: dfm-lidc-psd

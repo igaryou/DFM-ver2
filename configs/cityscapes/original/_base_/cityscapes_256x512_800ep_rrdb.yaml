@@ -15,3 +15,13 @@ model:
     neck:
       type: none
       channels: 256
+
+loss:
+  consistency:
+    psd:
+      ignore_void: false
+    
+wandb:
+  project: DFM
+  name: dfm-joint-psd-cityscapes-800ep
+  tags: [cityscapes, rrdb, joint, psd, ignore-void, 800ep]

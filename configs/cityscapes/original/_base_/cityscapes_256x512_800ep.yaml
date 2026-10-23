@@ -34,29 +34,29 @@ augmentation:
 training:
   schedule_unit: epoch
   epochs: 800
-  max_optimizer_steps: null
+  max_optimizer_steps: 595200
   batch_size: 4
   grad_accum_steps: 1
   checkpoint_interval_epochs: 50
   checkpoint_interval_steps: null
-  validation_epochs: [1, 25, 50, 75, 100, 125, 150, 200, 300, 400, 500, 600, 700, 800]
+  validation_epochs: [75, 150, 300, 400, 500, 600, 700, 800]
   optimizer:
     parameter_groups:
       model: {lr: 1.0e-4}
-      source: {lr: 1.0e-5}
+      source: {lr: 5.0e-5}
   scheduler:
-    name: cosine
-    step_unit: epoch
-    warmup_epochs: 10
+    name: poly
+    step_unit: optimizer_step
+    warmup_epochs: 0
     warmup_steps: 0
     warmup_start_factor: 0.1
-    eta_min: 5.0e-7
+    eta_min: 1.0e-6
 evaluation:
   original_resolution: false
-  num_steps: 5
+  num_steps: 1
   num_samples: 1
   aggregation: probability_mean
-  batch_size: 4
+  batch_size: 8
   interval: {unit: epoch, value: 25}
   eval_class_indices: [0, 18]
   ignore_index: 19

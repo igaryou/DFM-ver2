@@ -86,6 +86,9 @@ MAX_REDUCTION_KEYS = {
     "ecld_jvp_output_abs_max",
     "esd_teacher_max",
     "source_mu_max",
+    "source_logvar_max",
+    "source_sigma_max",
+    "source_variance_max",
     "s_max",
     "t_max",
     "path_entropy_max",
@@ -97,6 +100,9 @@ MIN_REDUCTION_KEYS = {
     "esd_log_arg_min",
     "esd_teacher_min",
     "source_mu_min",
+    "source_logvar_min",
+    "source_sigma_min",
+    "source_variance_min",
     "s_min",
     "t_min",
     "diagonal_adaptive_weight_min",
@@ -225,12 +231,22 @@ SOURCE_SUMMARY_ALIASES = (
     ("source_ce_schedule_progress", "source_ce_schedule_progress"),
     ("optimizer_step", "source_optimizer_step"),
     ("logvar_mean", "source_logvar_mean"),
+    ("logvar_std", "source_logvar_std"),
+    ("logvar_min", "source_logvar_min"),
+    ("logvar_max", "source_logvar_max"),
     ("sigma_mean", "source_sigma_mean"),
+    ("sigma_std", "source_sigma_std"),
+    ("sigma_min", "source_sigma_min"),
+    ("sigma_max", "source_sigma_max"),
     ("variance_entropy_mean", "source_variance_entropy_mean"),
     ("variance_difficulty_mean", "source_variance_difficulty_mean"),
     ("variance_mean", "source_variance_mean"),
+    ("variance_std", "source_variance_std"),
     ("variance_min", "source_variance_min"),
     ("variance_max", "source_variance_max"),
+    ("target_std", "source_target_std"),
+    ("target_variance", "source_target_variance"),
+    ("variance_ratio", "source_variance_ratio"),
     ("std_adaptation_rho", "source_std_adaptation_rho"),
     ("std_min", "source_std_min"),
     ("std_max", "source_std_max"),
@@ -549,6 +565,22 @@ def _wandb_epoch_payload(
         "epoch/source/mu_min": "mu_min",
         "epoch/source/mu_max": "mu_max",
         "epoch/source/std_mean": "sigma_mean",
+        "epoch/source/logvar_mean": "logvar_mean",
+        "epoch/source/logvar_std": "logvar_std",
+        "epoch/source/logvar_min": "logvar_min",
+        "epoch/source/logvar_max": "logvar_max",
+        "epoch/source/std_std": "sigma_std",
+        "epoch/source/std_min": "sigma_min",
+        "epoch/source/std_max": "sigma_max",
+        "epoch/source/variance_mean": "variance_mean",
+        "epoch/source/variance_std": "variance_std",
+        "epoch/source/variance_min": "variance_min",
+        "epoch/source/variance_max": "variance_max",
+        "epoch/source/target_std": "target_std",
+        "epoch/source/target_variance": "target_variance",
+        "epoch/source/variance_ratio": "variance_ratio",
+        "epoch/loss/variance_regularization": "loss_var",
+        "epoch/loss/weighted_variance_regularization": "weighted_var",
         "epoch/path/difficulty_mean": "path_difficulty_mean",
         "epoch/path/difficulty_std": "path_difficulty_std",
         "epoch/lr/source": "source_lr",
@@ -972,11 +1004,12 @@ def validate_source_only(
             image = image.to(context.device, non_blocking=True)
             target = target.to(context.device, non_blocking=True)
             with autocast_context(config, context.device):
-                mean, _ = source_statistics(source, image)
+                mean, logvar = source_statistics(source, image)
             entropy_state = shannon_entropy(
                 mean, representation=representation,
                 eps=config["flow"]["probability_eps"],
             )
+            sigma_state = torch.exp(0.5 * logvar.float()).mean(dim=1)
             if "original_shape" in sample:
                 mean_full = state_to_original_continuous(
                     mean.float(), sample["model_shape"], sample["original_shape"],
@@ -985,6 +1018,11 @@ def validate_source_only(
                 )
                 entropy_full = state_to_original_continuous(
                     entropy_state[:, None], sample["model_shape"],
+                    sample["original_shape"], padded_shape=sample["padded_shape"],
+                    align_corners=config["evaluation"]["align_corners"],
+                )[:, 0]
+                sigma_full = state_to_original_continuous(
+                    sigma_state[:, None], sample["model_shape"],
                     sample["original_shape"], padded_shape=sample["padded_shape"],
                     align_corners=config["evaluation"]["align_corners"],
                 )[:, 0]
@@ -999,6 +1037,10 @@ def validate_source_only(
                 )
                 entropy_full = F.interpolate(
                     entropy_state[:, None], target.shape[-2:],
+                    mode="bilinear", align_corners=False,
+                )[:, 0]
+                sigma_full = F.interpolate(
+                    sigma_state[:, None], target.shape[-2:],
                     mode="bilinear", align_corners=False,
                 )[:, 0]
                 display_images = image
@@ -1044,6 +1086,7 @@ def validate_source_only(
                             or config["augmentation"]["normalize"]["enabled"]
                         ),
                         dataset_name=config["dataset"]["name"],
+                        sigma=sigma_full[sample_index],
                     )
                     visualized += 1
 

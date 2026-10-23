@@ -4,7 +4,7 @@ extends: ../../_base_/lidc/joint_psd.yaml
 
 experiment:
   name: dfm_joint_psd_lidc_no_align
-  output_dir: /home/igarashi_25/DFM/results/lidc/segformer_source_no_align_psd
+  output_dir: /home/igarashi_25/DFM/results/lidc/segformer_source_no_align_psd_1000ep_ver3
 
 model:
   state_downsample_factor: 1

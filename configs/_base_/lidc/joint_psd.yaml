@@ -16,7 +16,7 @@ source:
   freeze_encoder: false
   prior_type: image_gaussian
   learned_logvar: false
-  fixed_std: 1.0
+  fixed_std: 1.5
   use_loss_align: true
   detach_from_flow: false
   input_already_normalized: true
@@ -33,8 +33,8 @@ loss:
     enabled: true
     type: psd
     weight: 0.5
-    start_epoch: 0
-    start: {unit: epoch, value: 0}
+    start_epoch: 599
+    start: {unit: epoch, value: 599}
     warmup_epochs: 0
     schedule: linear
     max_weight: 1.0

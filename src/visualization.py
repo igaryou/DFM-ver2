@@ -378,6 +378,7 @@ def save_source_diagnostics(
     num_classes: int,
     imagenet_normalize: bool = False,
     dataset_name: str = "cityscapes",
+    sigma: torch.Tensor | None = None,
 ) -> None:
     """Save the source-only validation view with a fixed entropy scale."""
     image = image.detach().float().cpu()
@@ -388,7 +389,9 @@ def save_source_diagnostics(
     target = target.detach().cpu()
     prediction = prediction.detach().cpu()
     entropy = entropy.detach().float().cpu()
-    figure, axes = plt.subplots(2, 2, figsize=(12, 9))
+    sigma = None if sigma is None else sigma.detach().float().cpu()
+    columns = 3 if sigma is not None else 2
+    figure, axes = plt.subplots(2, columns, figsize=(6 * columns, 9))
     axes = axes.reshape(-1)
     axes[0].imshow(image.clamp(0, 1).permute(1, 2, 0))
     axes[0].set_title("input image")
@@ -404,6 +407,14 @@ def save_source_diagnostics(
         f"max={entropy.max():.3f}"
     )
     figure.colorbar(entropy_image, ax=axes[3], fraction=0.046, pad=0.04)
+    if sigma is not None:
+        sigma_image = axes[4].imshow(sigma, cmap="viridis")
+        axes[4].set_title(
+            f"source sigma(x)\nmin={sigma.min():.3f} mean={sigma.mean():.3f} "
+            f"max={sigma.max():.3f}"
+        )
+        figure.colorbar(sigma_image, ax=axes[4], fraction=0.046, pad=0.04)
+        axes[5].set_visible(False)
     for axis in axes:
         axis.axis("off")
     destination = Path(path)

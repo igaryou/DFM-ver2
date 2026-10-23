@@ -144,9 +144,9 @@ time_sampling:
 training:
   train_endpoint: true
   schedule_unit: epoch
-  epochs: 2000
+  epochs: 1000
   max_iterations: null
-  max_optimizer_steps: 1170000
+  max_optimizer_steps: 585000
   max_batches_per_epoch: null
   batch_size: 16
   grad_accum_steps: 1
@@ -173,7 +173,7 @@ training:
   log_interval: 50
   checkpoint_interval_epochs: 200
   checkpoint_interval_steps: null
-  validation_epochs: [200, 400, 600, 800, 1000, 1200, 1400, 1600, 1800, 2000]
+  validation_epochs: [1, 599, 800, 1000, 1200, 1400, 1600, 1800, 2000]
 
 loss:
   ignore_index: null

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import math
 import os
 from pathlib import Path
 from typing import Any, Iterable
@@ -169,6 +170,23 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "decoder_channels": 128,
         "learned_logvar": False,
         "fixed_std": None,
+        "variance_mode": "channelwise",
+        "logvar_model": {
+            "mode": "shared",
+            "backbone": "segformer",
+            "segformer_variant": "b0",
+            "segformer_decoder": "custom",
+            "pretrained": True,
+            "freeze_encoder": False,
+            "decoder_channels": 128,
+            "input_already_normalized": False,
+        },
+        "variance_regularization": {
+            "enabled": False,
+            "target_std": 1.0,
+            "weight": 0.0,
+            "init_at_target": False,
+        },
         "mu_tanh_scale": 0.0,
         "use_loss_align": True,
         "align_weight": 0.15,
@@ -982,6 +1000,109 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
         raise ValueError(
             "source.segformer_decoder must be custom or standard"
         )
+    variance_mode = config["source"]["variance_mode"]
+    if variance_mode not in {"channelwise", "pixel_shared"}:
+        raise ValueError(
+            "source.variance_mode must be channelwise or pixel_shared"
+        )
+    logvar_model = config["source"]["logvar_model"]
+    if logvar_model["mode"] not in {"shared", "separate"}:
+        raise ValueError("source.logvar_model.mode must be shared or separate")
+    if logvar_model["backbone"] not in {"segformer", "unet"}:
+        raise ValueError(
+            "source.logvar_model.backbone must be segformer or unet"
+        )
+    if logvar_model["segformer_variant"] not in {f"b{i}" for i in range(6)}:
+        raise ValueError(
+            "source.logvar_model.segformer_variant must be b0, b1, b2, b3, b4, or b5"
+        )
+    if logvar_model["segformer_decoder"] not in {"custom", "standard"}:
+        raise ValueError(
+            "source.logvar_model.segformer_decoder must be custom or standard"
+        )
+    for flag in ("pretrained", "freeze_encoder", "input_already_normalized"):
+        if not isinstance(logvar_model[flag], bool):
+            raise ValueError(f"source.logvar_model.{flag} must be boolean")
+    if (
+        isinstance(logvar_model["decoder_channels"], bool)
+        or not isinstance(logvar_model["decoder_channels"], int)
+        or logvar_model["decoder_channels"] <= 0
+    ):
+        raise ValueError(
+            "source.logvar_model.decoder_channels must be a positive integer"
+        )
+    if logvar_model["mode"] == "separate":
+        if config["source"]["type"] != "trainable_segformer":
+            raise ValueError(
+                "source.logvar_model.mode=separate requires type=trainable_segformer"
+            )
+        if not config["source"]["learned_logvar"]:
+            raise ValueError(
+                "source.logvar_model.mode=separate requires learned_logvar=true"
+            )
+        if config["source"]["fixed_std"] is not None:
+            raise ValueError(
+                "source.logvar_model.mode=separate requires fixed_std=null"
+            )
+        if (
+            dataset["in_channels"] != 3
+            and logvar_model["backbone"] == "segformer"
+            and logvar_model["pretrained"]
+        ):
+            raise ValueError(
+                "pretrained logvar SegFormer requires a 3-channel input"
+            )
+    variance_regularization = config["source"]["variance_regularization"]
+    for flag in ("enabled", "init_at_target"):
+        if not isinstance(variance_regularization[flag], bool):
+            raise ValueError(
+                f"source.variance_regularization.{flag} must be boolean"
+            )
+    target_std = variance_regularization["target_std"]
+    if (
+        isinstance(target_std, bool)
+        or not isinstance(target_std, (int, float))
+        or not math.isfinite(target_std)
+        or target_std <= 0
+    ):
+        raise ValueError(
+            "source.variance_regularization.target_std must be positive"
+        )
+    variance_weight = variance_regularization["weight"]
+    if (
+        isinstance(variance_weight, bool)
+        or not isinstance(variance_weight, (int, float))
+        or not math.isfinite(variance_weight)
+        or variance_weight < 0
+    ):
+        raise ValueError(
+            "source.variance_regularization.weight must be non-negative"
+        )
+    if variance_mode == "pixel_shared":
+        if (
+            logvar_model["mode"] == "shared"
+            and config["source"]["backbone"] != "segformer"
+        ):
+            raise ValueError(
+                "shared source.variance_mode=pixel_shared requires backbone=segformer"
+            )
+        if not config["source"]["learned_logvar"]:
+            raise ValueError(
+                "source.variance_mode=pixel_shared requires learned_logvar=true"
+            )
+        if config["source"]["fixed_std"] is not None:
+            raise ValueError(
+                "source.variance_mode=pixel_shared requires fixed_std=null"
+            )
+    if variance_regularization["enabled"]:
+        if not config["source"]["learned_logvar"]:
+            raise ValueError(
+                "variance regularization requires source.learned_logvar=true"
+            )
+        if config["source"]["fixed_std"] is not None:
+            raise ValueError(
+                "variance regularization requires source.fixed_std=null"
+            )
     if config["source"]["representation"] not in {"probability", "logits"}:
         raise ValueError("source.representation must be probability or logits")
     supervision = config["source"]["supervision"]

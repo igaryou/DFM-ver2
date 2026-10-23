@@ -1,0 +1,57 @@
+extends: cityscapes_256x512_800ep.yaml
+
+experiment:
+  name: dfm_original_cityscapes_256x512_800ep_psd500
+  output_dir: /home/igarashi_25/DFM/results/cityscapes/original/base_256x512_800ep_ver4
+  stage: joint_training
+
+model:
+  state_downsample_factor: 1
+  fusion_channels: 128
+  rrdb_blocks: 3
+  rrdb_growth_channels: 32
+
+  image_encoder:
+    type: rrdb
+    variant: tiny
+    pretrained: false
+    freeze: false
+    input_already_normalized: false
+    neck:
+      type: none
+      channels: 256
+
+training:
+  checkpoint_interval_epochs: 100
+  validation_epochs:
+    [499, 600, 700, 800]
+
+loss:
+  consistency:
+    enabled: true
+    type: psd
+    weight: 0.5
+
+    start_epoch: 499
+    start:
+      unit: epoch
+      value: 499
+
+    warmup_epochs: 50
+    warmup_steps: 0
+    schedule: linear
+    max_weight: 1.0
+
+    psd:
+      loss_resolution: state
+      ignore_void: false
+
+evaluation:
+  interval:
+    unit: epoch
+    value: null
+
+wandb:
+  project: DFM
+  name: dfm-joint-psd-cityscapes-800ep-psd500
+  tags: [cityscapes, rrdb, joint, psd, ignore-void, psd550, 800ep]

@@ -1,0 +1,68 @@
+extends: ../_base_/cityscapes_256x512_800ep_rrdb.yaml
+
+experiment:
+  name: dfm_original_cityscapes_b1_learned_sigma_varreg_800ep
+  output_dir: /home/igarashi_25/DFM/results/cityscapes/original/b1_learned_sigma_varreg_800ep
+
+source:
+  type: trainable_segformer
+  prior_type: image_gaussian
+  backbone: segformer
+  segformer_variant: b1
+  segformer_decoder: custom
+  pretrained: true
+  checkpoint: null
+  freeze: false
+  freeze_encoder: false
+  detach_from_flow: false
+  learned_logvar: true
+  fixed_std: null
+  variance_mode: pixel_shared
+  logvar_model:
+    mode: separate
+    backbone: segformer
+    segformer_variant: b1
+    segformer_decoder: custom
+    pretrained: true
+    freeze_encoder: false
+    decoder_channels: 128
+    input_already_normalized: true
+  mu_tanh_scale: 0.0
+  input_already_normalized: true
+  use_loss_align: false
+  align_weight: 0.0
+  supervision:
+    type: none
+    weight: 0.0
+  variance_regularization:
+    enabled: true
+    target_std: 1.0
+    weight: 1.0e-2
+    init_at_target: true
+
+training:
+  epochs: 800
+  stages:
+    enabled: true
+    source_pretrain:
+      enabled: false
+    flow_training:
+      enabled: true
+      start_epoch: 0
+      end_epoch: 800
+      train_source: true
+      train_flow: true
+
+wandb:
+  name: dfm-original-cityscapes-b1-learned-sigma-varreg-800ep
+  tags:
+    - cityscapes
+    - original-protocol
+    - image-gaussian
+    - learned-sigma
+    - independent-mu-logvar
+    - variance-regularization
+    - segformer-b1
+    - no-align
+    - joint-training
+    - 800ep

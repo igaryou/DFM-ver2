@@ -87,12 +87,19 @@ class SegFormerSourceGenerator(nn.Module):
         state_downsample_factor: int = 4,
         decoder_type: str = "custom",
         in_channels: int = 3,
+        variance_mode: str = "channelwise",
+        variance_target_std: float = 1.0,
+        init_logvar_at_target: bool = False,
     ) -> None:
         super().__init__()
         if variant not in self.MODEL_NAMES:
             raise ValueError(f"Unknown SegFormer variant: {variant}")
         if decoder_type not in {"custom", "standard"}:
             raise ValueError("decoder_type must be custom or standard")
+        if variance_mode not in {"channelwise", "pixel_shared"}:
+            raise ValueError("variance_mode must be channelwise or pixel_shared")
+        if variance_mode == "pixel_shared" and not learned_logvar:
+            raise ValueError("variance_mode=pixel_shared requires learned_logvar=true")
         try:
             from transformers import SegformerModel
         except ImportError as exc:
@@ -112,19 +119,38 @@ class SegFormerSourceGenerator(nn.Module):
         self.input_already_normalized = input_already_normalized
         self.state_downsample_factor = state_downsample_factor
         self.segformer_decoder = decoder_type
-        output_channels = num_classes * 2 if self.fixed_std is None else num_classes
+        self.variance_mode = variance_mode
+        output_channels = (
+            num_classes + 1
+            if self.fixed_std is None and variance_mode == "pixel_shared"
+            else num_classes * 2 if self.fixed_std is None else num_classes
+        )
         if decoder_type == "custom":
             hidden_sizes = list(self.encoder.config.hidden_sizes)
             self.projections = nn.ModuleList(
                 nn.Conv2d(size, decoder_channels, 1) for size in hidden_sizes
             )
-            self.decoder = nn.Sequential(
+            decoder_layers = [
                 nn.Conv2d(decoder_channels * 4, decoder_channels, 3, padding=1),
                 group_norm(decoder_channels), nn.SiLU(),
                 nn.Conv2d(decoder_channels, decoder_channels, 3, padding=1),
                 group_norm(decoder_channels), nn.SiLU(),
-                nn.Conv2d(decoder_channels, output_channels, 1),
-            )
+            ]
+            if self.fixed_std is None and variance_mode == "pixel_shared":
+                self.decoder = nn.Sequential(*decoder_layers)
+                self.mu_head = nn.Conv2d(decoder_channels, num_classes, 1)
+                self.logvar_head = nn.Conv2d(decoder_channels, 1, 1)
+                if init_logvar_at_target:
+                    nn.init.zeros_(self.logvar_head.weight)
+                    nn.init.constant_(
+                        self.logvar_head.bias,
+                        math.log(float(variance_target_std) ** 2),
+                    )
+            else:
+                # Preserve the legacy module layout and state-dict names.
+                self.decoder = nn.Sequential(
+                    *decoder_layers, nn.Conv2d(decoder_channels, output_channels, 1)
+                )
         else:
             try:
                 from transformers.models.segformer.modeling_segformer import (
@@ -142,6 +168,16 @@ class SegFormerSourceGenerator(nn.Module):
             # Match SegformerForSemanticSegmentation.post_init() while avoiding
             # construction of a second, immediately discarded MiT encoder.
             self.decode_head.apply(self.encoder._init_weights)
+            if (
+                self.fixed_std is None
+                and variance_mode == "pixel_shared"
+                and init_logvar_at_target
+            ):
+                with torch.no_grad():
+                    self.decode_head.classifier.weight[-1].zero_()
+                    self.decode_head.classifier.bias[-1].fill_(
+                        math.log(float(variance_target_std) ** 2)
+                    )
         normalization = (
             ([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
             if in_channels == 3 else ([0.5], [0.5])
@@ -181,18 +217,106 @@ class SegFormerSourceGenerator(nn.Module):
                 for hidden, projection in zip(hidden_states, self.projections)
             ]
             output = self.decoder(torch.cat(features, dim=1))
-        if self.fixed_std is None:
-            mu, logvar = output.chunk(2, dim=1)
+            if self.fixed_std is None and self.variance_mode == "pixel_shared":
+                mu = self.mu_head(output)
+                logvar = self.logvar_head(output)
+                output = None
+        if self.fixed_std is None and not (
+            self.segformer_decoder == "custom"
+            and self.variance_mode == "pixel_shared"
+        ):
+            if self.variance_mode == "pixel_shared":
+                mu, logvar = output[:, :self.num_classes], output[:, self.num_classes:]
+            else:
+                mu, logvar = output.chunk(2, dim=1)
         else:
-            mu = output
-            logvar = torch.full_like(mu, math.log(float(self.fixed_std) ** 2))
+            if self.fixed_std is not None:
+                mu = output
+                logvar = torch.full_like(mu, math.log(float(self.fixed_std) ** 2))
         if self.mu_tanh_scale > 0:
             mu = torch.tanh(mu) * self.mu_tanh_scale
         return mu, logvar
 
     def forward(self, image: torch.Tensor):
         mu, logvar = self.forward_statistics(image)
-        return mu + torch.exp(0.5 * logvar) * torch.randn_like(mu), mu, logvar
+        sigma = torch.exp(0.5 * logvar.float())
+        if not torch.isfinite(sigma).all():
+            raise FloatingPointError("source sigma contains NaN or Inf")
+        x0 = mu + sigma.to(mu.dtype) * torch.randn_like(mu)
+        if not torch.isfinite(x0.float()).all():
+            raise FloatingPointError("sampled source x0 contains NaN or Inf")
+        return x0, mu, logvar
+
+
+def _initialize_predictor_output(model: nn.Module, value: float) -> None:
+    """Initialize the final predictor to emit one spatially constant value."""
+    if isinstance(model, UNetSourceGenerator):
+        head = model.network[-1]
+    elif isinstance(model, SegFormerSourceGenerator):
+        head = (
+            model.decode_head.classifier
+            if model.segformer_decoder == "standard"
+            else model.decoder[-1]
+        )
+    else:  # pragma: no cover - guarded by the source factory.
+        raise TypeError(f"Unsupported source predictor: {type(model).__name__}")
+    if not isinstance(head, nn.Conv2d):
+        raise TypeError("source predictor output head must be Conv2d")
+    nn.init.zeros_(head.weight)
+    nn.init.constant_(head.bias, value)
+
+
+class IndependentGaussianSourceGenerator(nn.Module):
+    """Gaussian source with independently configured mu and logvar networks."""
+
+    def __init__(
+        self,
+        mu_model: nn.Module,
+        logvar_model: nn.Module,
+        *,
+        num_classes: int,
+        variance_mode: str,
+        target_std: float,
+        init_logvar_at_target: bool,
+    ) -> None:
+        super().__init__()
+        self.mu_model = mu_model
+        self.logvar_model = logvar_model
+        self.num_classes = num_classes
+        self.variance_mode = variance_mode
+        # sample_prior uses this attribute to decide whether variance is learned.
+        self.fixed_std = None
+        if init_logvar_at_target:
+            _initialize_predictor_output(
+                self.logvar_model, math.log(float(target_std) ** 2)
+            )
+
+    def forward_statistics(
+        self, image: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        mu, _ = self.mu_model.forward_statistics(image)
+        logvar, _ = self.logvar_model.forward_statistics(image)
+        expected_channels = 1 if self.variance_mode == "pixel_shared" else self.num_classes
+        if mu.shape[1] != self.num_classes or logvar.shape[1] != expected_channels:
+            raise AssertionError(
+                "independent Gaussian source produced invalid channels: "
+                f"mu={tuple(mu.shape)}, logvar={tuple(logvar.shape)}"
+            )
+        if mu.shape[0] != logvar.shape[0] or mu.shape[-2:] != logvar.shape[-2:]:
+            raise AssertionError(
+                "mu and logvar networks must produce the same batch/spatial shape"
+            )
+        return mu, logvar
+
+    def forward(self, image: torch.Tensor):
+        mu, logvar = self.forward_statistics(image)
+        sigma = torch.exp(0.5 * logvar.float())
+        if not torch.isfinite(sigma).all():
+            raise FloatingPointError("source sigma contains NaN or Inf")
+        x0 = mu + sigma.to(mu.dtype) * torch.randn_like(mu)
+        if not torch.isfinite(x0.float()).all():
+            raise FloatingPointError("sampled source x0 contains NaN or Inf")
+        return x0, mu, logvar
 
 
 class TaskFinetunedSegFormerSourceGenerator(nn.Module):
@@ -357,6 +481,40 @@ def build_source_model(config: dict):
             config["model"].get("state_downsample_factor", 4),
             load_pretrained=source.get("_load_pretrained", True),
         )
+    elif source["logvar_model"]["mode"] == "separate":
+        state_factor = config["model"].get("state_downsample_factor", 4)
+        in_channels = config["dataset"].get("in_channels", 3)
+
+        def build_predictor(settings: dict, outputs: int, mu_tanh_scale: float):
+            if settings["backbone"] == "unet":
+                return UNetSourceGenerator(
+                    outputs, settings["decoder_channels"], False, 1.0,
+                    state_factor, in_channels,
+                )
+            return SegFormerSourceGenerator(
+                outputs, settings["segformer_variant"], settings["pretrained"],
+                settings["decoder_channels"], settings["freeze_encoder"],
+                False, 1.0, mu_tanh_scale,
+                settings["input_already_normalized"], state_factor,
+                settings["segformer_decoder"], in_channels,
+            )
+
+        mu_model = build_predictor(source, config["dataset"]["num_classes"], source["mu_tanh_scale"])
+        logvar_channels = (
+            1 if source["variance_mode"] == "pixel_shared"
+            else config["dataset"]["num_classes"]
+        )
+        logvar_model = build_predictor(
+            source["logvar_model"], logvar_channels, 0.0
+        )
+        regularization = source["variance_regularization"]
+        model = IndependentGaussianSourceGenerator(
+            mu_model, logvar_model,
+            num_classes=config["dataset"]["num_classes"],
+            variance_mode=source["variance_mode"],
+            target_std=regularization["target_std"],
+            init_logvar_at_target=regularization["init_at_target"],
+        )
     elif source["backbone"] == "unet":
         model = UNetSourceGenerator(
             config["dataset"]["num_classes"], source["decoder_channels"],
@@ -373,6 +531,9 @@ def build_source_model(config: dict):
             config["model"].get("state_downsample_factor", 4),
             source["segformer_decoder"],
             config["dataset"].get("in_channels", 3),
+            source.get("variance_mode", "channelwise"),
+            source.get("variance_regularization", {}).get("target_std", 1.0),
+            source.get("variance_regularization", {}).get("init_at_target", False),
         )
     checkpoint_loaded = False
     if source["checkpoint"]:

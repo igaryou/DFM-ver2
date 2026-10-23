@@ -60,6 +60,12 @@ def model_signature(config: dict) -> dict[str, Any]:
     decoder_type = config["source"].get("segformer_decoder", "custom")
     if decoder_type != "custom":
         source_signature["segformer_decoder"] = decoder_type
+    variance_mode = config["source"].get("variance_mode", "channelwise")
+    if variance_mode != "channelwise":
+        source_signature["variance_mode"] = variance_mode
+    logvar_model = config["source"].get("logvar_model", {"mode": "shared"})
+    if logvar_model.get("mode", "shared") != "shared":
+        source_signature["logvar_model"] = copy.deepcopy(logvar_model)
     # Omit the new false default so checkpoints created before include_void
     # existed retain exactly the same architecture signature.
     supervision = source_signature.get("supervision")
