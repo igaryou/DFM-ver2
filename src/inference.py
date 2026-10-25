@@ -8,6 +8,33 @@ from discrete_flow_maps import flow_map, make_time_grid, sample_prior
 from state_space import resize_continuous, state_spatial_size
 
 
+def _source_diagnostics_payload(
+    x0: torch.Tensor, source_stats: dict[str, torch.Tensor]
+) -> dict[str, torch.Tensor]:
+    required = ("_source_mu", "_source_sigma", "_source_logvar")
+    missing = [key for key in required if key not in source_stats]
+    if missing:
+        raise RuntimeError(
+            "source diagnostics are unavailable for this prior; missing "
+            + ", ".join(missing)
+        )
+    return {
+        "x0": x0.detach(),
+        "mu": source_stats["_source_mu"],
+        "sigma": source_stats["_source_sigma"],
+        "logvar": source_stats["_source_logvar"],
+    }
+
+
+def _check_source_return_options(
+    return_source_sample: bool, return_source_diagnostics: bool
+) -> None:
+    if return_source_sample and return_source_diagnostics:
+        raise ValueError(
+            "return_source_sample and return_source_diagnostics are mutually exclusive"
+        )
+
+
 def state_to_prediction(
     continuous: torch.Tensor,
     *,
@@ -129,13 +156,15 @@ def sample_segmentation(
     return_trajectory: bool = False,
     return_terminal_state: bool = False,
     return_source_sample: bool = False,
+    return_source_diagnostics: bool = False,
 ):
+    _check_source_return_options(return_source_sample, return_source_diagnostics)
     model.eval()
     if source_model is not None:
         source_model.eval()
     x0, source_stats = sample_prior(
         config, image, None, source_model, sampling_mode="inference",
-        retain_source_tensors=return_source_sample,
+        retain_source_tensors=(return_source_sample or return_source_diagnostics),
     )
     path_difficulty = None
     if entropy_adaptive_enabled(config):
@@ -157,6 +186,8 @@ def sample_segmentation(
     )
     if return_source_sample:
         return result, x0.detach(), source_stats["_source_mu"]
+    if return_source_diagnostics:
+        return result, _source_diagnostics_payload(x0, source_stats)
     return result
 
 @torch.no_grad()
@@ -167,14 +198,16 @@ def sample_segmentation_probabilities(
     config: dict,
     num_steps: int | None = None,
     return_source_sample: bool = False,
-) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    return_source_diagnostics: bool = False,
+):
     """Return one stochastic sample as full-image class probabilities."""
+    _check_source_return_options(return_source_sample, return_source_diagnostics)
     model.eval()
     if source_model is not None:
         source_model.eval()
     x0, source_stats = sample_prior(
         config, image, None, source_model, sampling_mode="inference",
-        retain_source_tensors=return_source_sample,
+        retain_source_tensors=(return_source_sample or return_source_diagnostics),
     )
     path_difficulty = None
     if entropy_adaptive_enabled(config):
@@ -203,6 +236,8 @@ def sample_segmentation_probabilities(
     ).clamp_min(1.0e-12)
     if return_source_sample:
         return probability, x0.detach(), source_stats["_source_mu"]
+    if return_source_diagnostics:
+        return probability, _source_diagnostics_payload(x0, source_stats)
     return probability
 
 
@@ -217,6 +252,7 @@ def sample_segmentation_ensemble(
     aggregation: str | None = None,
     num_steps: int | None = None,
     return_source_sample: bool = False,
+    return_source_diagnostics: bool = False,
 ):
     """Aggregate stochastic predictions by probability mean or majority vote."""
     count = int(num_samples or config.get("evaluation", {}).get("num_samples", 1))
@@ -227,13 +263,16 @@ def sample_segmentation_ensemble(
         raise ValueError("num_samples must be positive")
     if mode not in {"probability_mean", "majority_vote"}:
         raise ValueError("aggregation must be probability_mean or majority_vote")
+    _check_source_return_options(return_source_sample, return_source_diagnostics)
     samples = []
     source_sample = None
+    source_diagnostics = None
     for sample_index in range(count):
-        if return_source_sample and sample_index == 0:
+        if (return_source_sample or return_source_diagnostics) and sample_index == 0:
             sample_result = sample_segmentation_probabilities(
                 model, source_model, image, config, num_steps=num_steps,
-                return_source_sample=True,
+                return_source_sample=return_source_sample,
+                return_source_diagnostics=return_source_diagnostics,
             )
         else:
             sample_result = sample_segmentation_probabilities(
@@ -242,6 +281,8 @@ def sample_segmentation_ensemble(
         if return_source_sample and sample_index == 0:
             probability, x0, mu = sample_result
             source_sample = (x0, mu)
+        elif return_source_diagnostics and sample_index == 0:
+            probability, source_diagnostics = sample_result
         else:
             probability = sample_result
         samples.append(probability)
@@ -260,6 +301,9 @@ def sample_segmentation_ensemble(
     if return_source_sample:
         assert source_sample is not None
         return prediction, *source_sample
+    if return_source_diagnostics:
+        assert source_diagnostics is not None
+        return prediction, source_diagnostics
     return prediction
 
 
@@ -272,22 +316,27 @@ def sample_lidc_distribution(
     sample_counts: list[int],
     *,
     return_source_sample: bool = False,
+    return_source_diagnostics: bool = False,
 ):
     """Generate one LIDC batch up to max(N), without retaining other batches."""
     if config.get("dataset", {}).get("protocol") != "lidc":
         raise ValueError("sample_lidc_distribution is LIDC-only")
     if not sample_counts or sample_counts != sorted(set(sample_counts)):
         raise ValueError("sample_counts must be a non-empty sorted unique list")
+    _check_source_return_options(return_source_sample, return_source_diagnostics)
     maximum = sample_counts[-1]
     predictions = []
     foreground_probability_sum = torch.zeros(
         image.shape[0], *image.shape[-2:], device=image.device, dtype=torch.float32
     )
     source_sample = None
+    source_diagnostics = None
     for sample_index in range(maximum):
-        if return_source_sample and sample_index == 0:
+        if (return_source_sample or return_source_diagnostics) and sample_index == 0:
             sample_result = sample_segmentation_probabilities(
-                model, source_model, image, config, return_source_sample=True
+                model, source_model, image, config,
+                return_source_sample=return_source_sample,
+                return_source_diagnostics=return_source_diagnostics,
             )
         else:
             sample_result = sample_segmentation_probabilities(
@@ -296,6 +345,8 @@ def sample_lidc_distribution(
         if return_source_sample and sample_index == 0:
             probability, x0, mu = sample_result
             source_sample = (x0, mu)
+        elif return_source_diagnostics and sample_index == 0:
+            probability, source_diagnostics = sample_result
         else:
             probability = sample_result
         if probability.shape[1] != 2:
@@ -307,6 +358,9 @@ def sample_lidc_distribution(
     if return_source_sample:
         assert source_sample is not None
         return stacked, deterministic, *source_sample
+    if return_source_diagnostics:
+        assert source_diagnostics is not None
+        return stacked, deterministic, source_diagnostics
     return stacked, deterministic
 
 

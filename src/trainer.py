@@ -49,6 +49,12 @@ from inference import (
 from metrics import LIDCStochasticMetrics, SegmentationMetrics
 from model_factory import build_models
 from source_model import source_statistics
+from source_noise_diagnostics import (
+    DIAGNOSTIC_RESULT_KEYS,
+    SourceNoiseDiagnosticsAccumulator,
+    source_noise_diagnostic_maps,
+    source_noise_diagnostics_enabled,
+)
 from training_objectives import (
     DDPCompatibleTrainingModel,
     run_model_training_objectives,
@@ -74,6 +80,7 @@ from visualization import (
     save_lidc_source_mu_x0,
     save_prediction,
     save_source_diagnostics,
+    save_source_noise_diagnostics,
 )
 
 
@@ -592,6 +599,10 @@ def _wandb_epoch_payload(
         output_key: report[report_key]
         for output_key, report_key in exact.items()
         if report_key in report
+    })
+    payload.update({
+        f"epoch/source/{key.removeprefix('source_')}": report[key]
+        for key in DIAGNOSTIC_RESULT_KEYS if key in report
     })
     return payload
 
@@ -1184,6 +1195,15 @@ def validate(
     )
     visualized = 0
     source_visualized = 0
+    source_diagnostic_visualized = 0
+    source_diagnostic_config = config["source"]["diagnostics"]
+    source_diagnostic_enabled = source_noise_diagnostics_enabled(config)
+    source_diagnostic_accumulator = (
+        SourceNoiseDiagnosticsAccumulator() if source_diagnostic_enabled else None
+    )
+    source_diagnostic_kwargs = (
+        {"return_source_diagnostics": True} if source_diagnostic_enabled else {}
+    )
     maximum_batches = config["evaluation"]["max_batches"]
     for batch_index, batch in enumerate(loader):
         if maximum_batches is not None and batch_index >= maximum_batches:
@@ -1202,9 +1222,41 @@ def validate(
                     context.device, non_blocking=True
                 )
                 with autocast_context(config, context.device):
-                    terminal = sample_segmentation(
-                        endpoint, source, image, config, return_terminal_state=True
+                    terminal_result = sample_segmentation(
+                        endpoint, source, image, config, return_terminal_state=True,
+                        **source_diagnostic_kwargs,
                     )
+                if source_diagnostic_enabled:
+                    terminal, source_diagnostic_tensors = terminal_result
+                    source_diagnostic_maps = source_noise_diagnostic_maps(
+                        **{key: source_diagnostic_tensors[key] for key in ("x0", "mu", "sigma")}
+                    )
+                    assert source_diagnostic_accumulator is not None
+                    source_diagnostic_accumulator.update(source_diagnostic_maps)
+                    if (
+                        context.is_main_process
+                        and source_diagnostic_config["visualization"]
+                        and source_diagnostic_visualized
+                        < source_diagnostic_config["max_visualizations"]
+                    ):
+                        epoch_name = (
+                            f"epoch_{validation_epoch:04d}"
+                            if validation_epoch is not None else "epoch_0000"
+                        )
+                        save_source_noise_diagnostics(
+                            image[0], target[0],
+                            {key: value[0] for key, value in source_diagnostic_maps.items()},
+                            output_dir / "source_diagnostics" / epoch_name
+                            / f"sample_{source_diagnostic_visualized:04d}.png",
+                            imagenet_normalize=(
+                                config["augmentation"]["imagenet_normalize"]
+                                or config["augmentation"]["normalize"]["enabled"]
+                            ),
+                            dataset_name=config["dataset"]["name"],
+                        )
+                        source_diagnostic_visualized += 1
+                else:
+                    terminal = terminal_result
                 prediction = terminal_state_to_original_prediction(
                     terminal,
                     sample["model_shape"],
@@ -1232,14 +1284,18 @@ def validate(
             with autocast_context(config, context.device):
                 capture_source = _should_capture_lidc_source(
                     config, context, source_visualized
-                )
+                ) and not source_diagnostic_enabled
                 source_sample = None
+                source_diagnostic_tensors = None
                 if lidc_metrics is not None:
                     lidc_result = sample_lidc_distribution(
                         endpoint, source, image, config, stochastic_counts,
                         return_source_sample=capture_source,
+                        **source_diagnostic_kwargs,
                     )
-                    if capture_source:
+                    if source_diagnostic_enabled:
+                        prediction_samples, prediction, source_diagnostic_tensors = lidc_result
+                    elif capture_source:
                         (
                             prediction_samples,
                             prediction,
@@ -1253,8 +1309,11 @@ def validate(
                     segmentation_result = sample_segmentation(
                         endpoint, source, image, config,
                         return_source_sample=capture_source,
+                        **source_diagnostic_kwargs,
                     )
-                    if capture_source:
+                    if source_diagnostic_enabled:
+                        prediction, source_diagnostic_tensors = segmentation_result
+                    elif capture_source:
                         prediction, source_x0, source_mu = segmentation_result
                         source_sample = (source_x0, source_mu)
                     else:
@@ -1263,12 +1322,48 @@ def validate(
                     ensemble_result = sample_segmentation_ensemble(
                         endpoint, source, image, config,
                         return_source_sample=capture_source,
+                        **source_diagnostic_kwargs,
                     )
-                    if capture_source:
+                    if source_diagnostic_enabled:
+                        prediction, source_diagnostic_tensors = ensemble_result
+                    elif capture_source:
                         prediction, source_x0, source_mu = ensemble_result
                         source_sample = (source_x0, source_mu)
                     else:
                         prediction = ensemble_result
+            if source_diagnostic_tensors is not None:
+                source_diagnostic_maps = source_noise_diagnostic_maps(
+                    **{key: source_diagnostic_tensors[key] for key in ("x0", "mu", "sigma")}
+                )
+                assert source_diagnostic_accumulator is not None
+                source_diagnostic_accumulator.update(source_diagnostic_maps)
+                if (
+                    context.is_main_process
+                    and source_diagnostic_config["visualization"]
+                    and source_diagnostic_visualized
+                    < source_diagnostic_config["max_visualizations"]
+                ):
+                    remaining = (
+                        source_diagnostic_config["max_visualizations"]
+                        - source_diagnostic_visualized
+                    )
+                    epoch_name = (
+                        f"epoch_{validation_epoch:04d}"
+                        if validation_epoch is not None else "epoch_0000"
+                    )
+                    for sample_index in range(min(image.shape[0], remaining)):
+                        save_source_noise_diagnostics(
+                            image[sample_index], target[sample_index],
+                            {key: value[sample_index] for key, value in source_diagnostic_maps.items()},
+                            output_dir / "source_diagnostics" / epoch_name
+                            / f"sample_{source_diagnostic_visualized:04d}.png",
+                            imagenet_normalize=(
+                                config["augmentation"]["imagenet_normalize"]
+                                or config["augmentation"]["normalize"]["enabled"]
+                            ),
+                            dataset_name=config["dataset"]["name"],
+                        )
+                        source_diagnostic_visualized += 1
             metrics.update(prediction, target)
             if lidc_metrics is not None:
                 lidc_metrics.update(
@@ -1325,6 +1420,10 @@ def validate(
         metrics.confusion_matrix, context
     )
     result = metrics.compute()
+    if source_diagnostic_accumulator is not None:
+        result.update(source_diagnostic_accumulator.compute(
+            device=context.device, distributed=context.distributed
+        ))
     if lidc_metrics is not None:
         lidc_metrics.synchronize()
         result.update(lidc_metrics.compute())
@@ -1655,6 +1754,12 @@ def run_training(config: dict, *, joint_entrypoint: bool = False) -> dict:
                     displayed_epoch, state.global_step, trigger,
                     result["mIoU"], result["pixel_acc"], result["mAcc"],
                 )
+                diagnostic_summary = " ".join(
+                    f"{key}={result[key]:.6g}"
+                    for key in DIAGNOSTIC_RESULT_KEYS if key in result
+                )
+                if diagnostic_summary:
+                    logger.info("validation source diagnostics %s", diagnostic_summary)
                 if config["dataset"].get("protocol") == "lidc":
                     lidc_summary = " ".join(
                         f"{key}={value:.6g}"
@@ -1677,6 +1782,10 @@ def run_training(config: dict, *, joint_entrypoint: bool = False) -> dict:
                         for key, value in result.items()
                         if (key.startswith("source_") or key.startswith("flow_"))
                         and isinstance(value, (int, float))
+                    })
+                    wandb_payload.update({
+                        f"epoch/source/{key.removeprefix('source_')}": result[key]
+                        for key in DIAGNOSTIC_RESULT_KEYS if key in result
                     })
                     if config["dataset"].get("protocol") == "lidc":
                         wandb_payload.update({

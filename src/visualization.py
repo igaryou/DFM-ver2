@@ -422,3 +422,85 @@ def save_source_diagnostics(
     figure.tight_layout()
     figure.savefig(destination, bbox_inches="tight")
     plt.close(figure)
+
+
+def save_source_noise_diagnostics(
+    image: torch.Tensor,
+    target: torch.Tensor,
+    diagnostic_maps: dict[str, torch.Tensor],
+    path: str | Path,
+    *,
+    imagenet_normalize: bool = False,
+    dataset_name: str = "cityscapes",
+) -> None:
+    """Save the 12-panel view of the exact Gaussian source sample."""
+    image = image.detach().float().cpu()
+    if imagenet_normalize:
+        mean = image.new_tensor([0.485, 0.456, 0.406])[:, None, None]
+        std = image.new_tensor([0.229, 0.224, 0.225])[:, None, None]
+        image = image * std + mean
+    target = target.detach().cpu()
+    maps = {key: value.detach().cpu() for key, value in diagnostic_maps.items()}
+    sigma = maps["sigma_pixel"].float()
+    ratio = maps["noise_signal_ratio"].float()
+    margin_ratio = maps["margin_sigma_ratio"].float()
+    finite_margin_ratio = margin_ratio[torch.isfinite(margin_ratio)]
+    margin_ratio_max = (
+        float(torch.quantile(finite_margin_ratio, 0.95))
+        if finite_margin_ratio.numel() else 1.0
+    )
+    margin_ratio_max = max(margin_ratio_max, 1.0e-8)
+
+    figure, axes = plt.subplots(3, 4, figsize=(22, 14))
+    axes = axes.reshape(-1)
+    axes[0].imshow(image.clamp(0, 1).permute(1, 2, 0))
+    axes[0].set_title("input RGB")
+    axes[1].imshow(colorize(target, dataset_name))
+    axes[1].set_title("ground truth")
+    axes[2].imshow(colorize(maps["mu_prediction"], dataset_name))
+    axes[2].set_title("argmax(mu)")
+    axes[3].imshow(colorize(maps["x0_prediction"], dataset_name))
+    axes[3].set_title("argmax(x0)")
+
+    def heatmap(index: int, values: torch.Tensor, title: str, **kwargs) -> None:
+        artist = axes[index].imshow(values.float(), **kwargs)
+        axes[index].set_title(title)
+        figure.colorbar(artist, ax=axes[index], fraction=0.046, pad=0.04)
+
+    heatmap(
+        4, sigma, f"sigma(x)\nmin={sigma.min():.3f} mean={sigma.mean():.3f} max={sigma.max():.3f}",
+        cmap="viridis",
+    )
+    mu_rms = maps["mu_rms"].float()
+    heatmap(5, mu_rms, f"mu RMS\nmean={mu_rms.mean():.3f}", cmap="viridis")
+    noise_rms = maps["noise_rms"].float()
+    heatmap(
+        6, noise_rms, f"||sigma eps|| RMS\nmean={noise_rms.mean():.3f}", cmap="magma"
+    )
+    heatmap(
+        7, ratio.clamp(0, 3),
+        f"noise / signal\nmean={ratio.mean():.3f} median={ratio.median():.3f}",
+        cmap="magma", vmin=0.0, vmax=3.0,
+    )
+    direction = maps["direction_change"].float()
+    heatmap(
+        8, direction, f"1 - cos(mu,x0)\nmean={direction.mean():.3f}",
+        cmap="magma", vmin=0.0,
+    )
+    flip = maps["flip_map"].float()
+    axes[9].imshow(flip, cmap="gray", vmin=0.0, vmax=1.0)
+    axes[9].set_title(f"argmax flip\nrate={flip.mean():.3f}")
+    margin = maps["margin"].float()
+    heatmap(10, margin, f"mu top1-top2 margin\nmean={margin.mean():.3f}", cmap="viridis")
+    heatmap(
+        11, margin_ratio.clamp(0, margin_ratio_max),
+        f"margin / noise std\nmean={margin_ratio.mean():.3f}",
+        cmap="viridis", vmin=0.0, vmax=margin_ratio_max,
+    )
+    for axis in axes:
+        axis.axis("off")
+    destination = Path(path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    figure.tight_layout()
+    figure.savefig(destination, bbox_inches="tight")
+    plt.close(figure)

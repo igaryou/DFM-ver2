@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from contextlib import nullcontext
 
 import torch
@@ -476,6 +477,14 @@ def sample_prior(
             stats["target_x1_abs"] = target_one_hot_state.detach().abs().mean()
         if retain_source_tensors:
             stats["_source_mu"] = torch.zeros_like(x0)
+            prior_std = float(source["prior_noise_std"])
+            stats["_source_sigma"] = torch.full(
+                (batch, 1, height, width), prior_std,
+                device=x0.device, dtype=torch.float32,
+            )
+            stats["_source_logvar"] = torch.full_like(
+                stats["_source_sigma"], 2.0 * math.log(prior_std)
+            )
         return x0, stats
     if source["prior_type"] == "dirichlet":
         concentration = torch.ones(classes, device=image.device, dtype=torch.float32)
@@ -787,6 +796,8 @@ def sample_prior(
         # Inference-only diagnostic payload from the exact source forward that
         # produced the returned x0. No sampling or forward pass is repeated.
         stats["_source_mu"] = mu.detach()
+        stats["_source_logvar"] = logvar.detach()
+        stats["_source_sigma"] = sigma.detach()
     return x0, stats
 
 

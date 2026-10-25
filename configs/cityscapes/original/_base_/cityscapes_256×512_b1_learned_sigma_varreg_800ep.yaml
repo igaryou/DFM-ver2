@@ -1,4 +1,4 @@
-extends: ../_base_/cityscapes_256x512_800ep_rrdb.yaml
+extends: cityscapes_256x512_800ep_rrdb_ver2.yaml
 
 experiment:
   name: dfm_original_cityscapes_b1_learned_sigma_varreg_800ep
@@ -21,7 +21,7 @@ source:
   logvar_model:
     mode: separate
     backbone: segformer
-    segformer_variant: b1
+    segformer_variant: b0
     segformer_decoder: custom
     pretrained: true
     freeze_encoder: false
@@ -37,13 +37,13 @@ source:
   variance_regularization:
     enabled: true
     target_std: 1.0
-    weight: 1.0e-2
+    weight: 1.0
     init_at_target: true
 
 training:
   epochs: 800
   stages:
-    enabled: true
+    enabled: false
     source_pretrain:
       enabled: false
     flow_training:

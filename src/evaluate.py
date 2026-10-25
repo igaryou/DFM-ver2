@@ -26,8 +26,14 @@ from inference import (
 )
 from metrics import LIDCStochasticMetrics, SegmentationMetrics
 from model_factory import build_models
+from source_noise_diagnostics import (
+    DIAGNOSTIC_RESULT_KEYS,
+    SourceNoiseDiagnosticsAccumulator,
+    source_noise_diagnostic_maps,
+    source_noise_diagnostics_enabled,
+)
 from utils import autocast_context, init_wandb, seed_everything
-from visualization import save_prediction
+from visualization import save_prediction, save_source_noise_diagnostics
 
 
 @torch.no_grad()
@@ -147,6 +153,15 @@ def evaluate(config: dict, checkpoint_path: str | Path) -> dict:
             output_dir.mkdir(parents=True, exist_ok=True)
         barrier(context)
         visualized = 0
+        source_diagnostic_visualized = 0
+        source_diagnostic_config = config["source"]["diagnostics"]
+        source_diagnostic_enabled = source_noise_diagnostics_enabled(config)
+        source_diagnostic_accumulator = (
+            SourceNoiseDiagnosticsAccumulator() if source_diagnostic_enabled else None
+        )
+        source_diagnostic_kwargs = (
+            {"return_source_diagnostics": True} if source_diagnostic_enabled else {}
+        )
         for batch_index, batch in enumerate(loader):
             maximum_batches = config["evaluation"]["max_batches"]
             if maximum_batches is not None and batch_index >= maximum_batches:
@@ -160,10 +175,38 @@ def evaluate(config: dict, checkpoint_path: str | Path) -> dict:
                     image = sample["image"].unsqueeze(0).to(device, non_blocking=True)
                     target = sample["target"].unsqueeze(0).to(device, non_blocking=True)
                     with autocast_context(config, device):
-                        terminal = sample_segmentation(
+                        terminal_result = sample_segmentation(
                             model, source_model, image, config,
                             return_terminal_state=True,
+                            **source_diagnostic_kwargs,
                         )
+                    if source_diagnostic_enabled:
+                        terminal, source_diagnostic_tensors = terminal_result
+                        source_diagnostic_maps = source_noise_diagnostic_maps(
+                            **{key: source_diagnostic_tensors[key] for key in ("x0", "mu", "sigma")}
+                        )
+                        assert source_diagnostic_accumulator is not None
+                        source_diagnostic_accumulator.update(source_diagnostic_maps)
+                        if (
+                            context.is_main_process
+                            and source_diagnostic_config["visualization"]
+                            and source_diagnostic_visualized
+                            < source_diagnostic_config["max_visualizations"]
+                        ):
+                            save_source_noise_diagnostics(
+                                image[0], target[0],
+                                {key: value[0] for key, value in source_diagnostic_maps.items()},
+                                output_dir / "source_diagnostics"
+                                / f"sample_{source_diagnostic_visualized:04d}.png",
+                                imagenet_normalize=(
+                                    config["augmentation"]["imagenet_normalize"]
+                                    or config["augmentation"]["normalize"]["enabled"]
+                                ),
+                                dataset_name=config["dataset"]["name"],
+                            )
+                            source_diagnostic_visualized += 1
+                    else:
+                        terminal = terminal_result
                     prediction = terminal_state_to_original_prediction(
                         terminal, sample["model_shape"], sample["original_shape"],
                         padded_shape=sample["padded_shape"],
@@ -182,19 +225,64 @@ def evaluate(config: dict, checkpoint_path: str | Path) -> dict:
                     image, target = batch
                 image = image.to(device, non_blocking=True)
                 target = target.to(device, non_blocking=True)
+                source_diagnostic_tensors = None
                 with autocast_context(config, device):
                     if lidc_metrics is not None:
-                        prediction_samples, prediction = sample_lidc_distribution(
-                            model, source_model, image, config, stochastic_counts
+                        lidc_result = sample_lidc_distribution(
+                            model, source_model, image, config, stochastic_counts,
+                            **source_diagnostic_kwargs,
                         )
+                        if source_diagnostic_enabled:
+                            prediction_samples, prediction, source_diagnostic_tensors = lidc_result
+                        else:
+                            prediction_samples, prediction = lidc_result
                     elif config["evaluation"]["num_samples"] == 1:
-                        prediction = sample_segmentation(
-                            model, source_model, image, config
+                        segmentation_result = sample_segmentation(
+                            model, source_model, image, config,
+                            **source_diagnostic_kwargs,
                         )
+                        if source_diagnostic_enabled:
+                            prediction, source_diagnostic_tensors = segmentation_result
+                        else:
+                            prediction = segmentation_result
                     else:
-                        prediction = sample_segmentation_ensemble(
-                            model, source_model, image, config
+                        ensemble_result = sample_segmentation_ensemble(
+                            model, source_model, image, config,
+                            **source_diagnostic_kwargs,
                         )
+                        if source_diagnostic_enabled:
+                            prediction, source_diagnostic_tensors = ensemble_result
+                        else:
+                            prediction = ensemble_result
+                if source_diagnostic_tensors is not None:
+                    source_diagnostic_maps = source_noise_diagnostic_maps(
+                        **{key: source_diagnostic_tensors[key] for key in ("x0", "mu", "sigma")}
+                    )
+                    assert source_diagnostic_accumulator is not None
+                    source_diagnostic_accumulator.update(source_diagnostic_maps)
+                    if (
+                        context.is_main_process
+                        and source_diagnostic_config["visualization"]
+                        and source_diagnostic_visualized
+                        < source_diagnostic_config["max_visualizations"]
+                    ):
+                        remaining = (
+                            source_diagnostic_config["max_visualizations"]
+                            - source_diagnostic_visualized
+                        )
+                        for index in range(min(image.shape[0], remaining)):
+                            save_source_noise_diagnostics(
+                                image[index], target[index],
+                                {key: value[index] for key, value in source_diagnostic_maps.items()},
+                                output_dir / "source_diagnostics"
+                                / f"sample_{source_diagnostic_visualized:04d}.png",
+                                imagenet_normalize=(
+                                    config["augmentation"]["imagenet_normalize"]
+                                    or config["augmentation"]["normalize"]["enabled"]
+                                ),
+                                dataset_name=config["dataset"]["name"],
+                            )
+                            source_diagnostic_visualized += 1
                 metrics.update(prediction, target)
                 if lidc_metrics is not None:
                     lidc_metrics.update(
@@ -227,6 +315,10 @@ def evaluate(config: dict, checkpoint_path: str | Path) -> dict:
             metrics.confusion_matrix, context
         )
         result = metrics.compute()
+        if source_diagnostic_accumulator is not None:
+            result.update(source_diagnostic_accumulator.compute(
+                device=device, distributed=context.distributed
+            ))
         if lidc_metrics is not None:
             lidc_metrics.synchronize()
             result.update(lidc_metrics.compute())
@@ -245,7 +337,10 @@ def evaluate(config: dict, checkpoint_path: str | Path) -> dict:
             print(json.dumps(result, indent=2))
             wandb_run = (
                 init_wandb(config)
-                if config["dataset"].get("protocol") == "lidc" else None
+                if (
+                    config["dataset"].get("protocol") == "lidc"
+                    or source_diagnostic_enabled
+                ) else None
             )
             if wandb_run is not None:
                 split = config["evaluation"]["split"]
@@ -253,6 +348,10 @@ def evaluate(config: dict, checkpoint_path: str | Path) -> dict:
                     f"{split}/{key}": value
                     for key, value in result.items()
                     if isinstance(value, (int, float))
+                })
+                wandb_run.log({
+                    f"epoch/source/{key.removeprefix('source_')}": result[key]
+                    for key in DIAGNOSTIC_RESULT_KEYS if key in result
                 })
         barrier(context)
         return result

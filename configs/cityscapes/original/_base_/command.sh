@@ -4,7 +4,7 @@ uv run torchrun \
   --standalone \
   --nproc_per_node=2 \
   src/train_joint.py \
-  --config /home/igarashi_25/DFM/configs/cityscapes/original/_base_/cityscapes_256x512_800ep_rrdb.yaml
+  --config /home/igarashi_25/DFM/configs/cityscapes/original/_base_/cityscapes_256×512_b1_learned_sigma_varreg_800ep.yaml
 
 
 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
