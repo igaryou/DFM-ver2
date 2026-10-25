@@ -1420,6 +1420,13 @@ def validate(
         metrics.confusion_matrix, context
     )
     result = metrics.compute()
+    evaluation_cfg = config["evaluation"]["cfg"]
+    result.update({
+        "cfg_enabled": bool(evaluation_cfg["enabled"]),
+        "guidance_scale": float(evaluation_cfg["guidance_scale"]),
+        "num_steps": int(config["evaluation"]["num_steps"]),
+        "num_samples": int(config["evaluation"]["num_samples"]),
+    })
     if source_diagnostic_accumulator is not None:
         result.update(source_diagnostic_accumulator.compute(
             device=context.device, distributed=context.distributed
@@ -1750,9 +1757,14 @@ def run_training(config: dict, *, joint_entrypoint: bool = False) -> dict:
                 })
                 logger.info(
                     "validation epoch=%d optimizer_step=%d trigger=%s "
-                    "mIoU=%.6g pixel_acc=%.6g mAcc=%.6g",
+                    "mIoU=%.6g pixel_acc=%.6g mAcc=%.6g cfg_enabled=%s "
+                    "guidance_scale=%g num_steps=%d num_samples=%d",
                     displayed_epoch, state.global_step, trigger,
                     result["mIoU"], result["pixel_acc"], result["mAcc"],
+                    result.get("cfg_enabled", False),
+                    result.get("guidance_scale", 1.0),
+                    result.get("num_steps", config["evaluation"]["num_steps"]),
+                    result.get("num_samples", config["evaluation"]["num_samples"]),
                 )
                 diagnostic_summary = " ".join(
                     f"{key}={result[key]:.6g}"
@@ -1776,6 +1788,10 @@ def run_training(config: dict, *, joint_entrypoint: bool = False) -> dict:
                         "validation/mIoU": result["mIoU"],
                         "validation/pixel_acc": result["pixel_acc"],
                         "validation/mAcc": result["mAcc"],
+                        "validation/cfg_enabled": int(result.get("cfg_enabled", False)),
+                        "validation/guidance_scale": result.get("guidance_scale", 1.0),
+                        "validation/num_steps": result.get("num_steps", 1),
+                        "validation/num_samples": result.get("num_samples", 1),
                     }
                     wandb_payload.update({
                         f"validation/{key}": value

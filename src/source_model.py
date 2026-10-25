@@ -444,6 +444,32 @@ def source_statistics(source_model: nn.Module, image: torch.Tensor) -> tuple[tor
     return mean, log_variance
 
 
+def unconditional_source_mean(
+    source_model: nn.Module,
+    *,
+    batch_size: int,
+    spatial_size: tuple[int, int],
+    dtype: torch.dtype,
+    device: torch.device,
+) -> torch.Tensor:
+    """Broadcast the learned image-free source mean without allocating copies."""
+    position = getattr(source_model, "pos_source", None)
+    if position is None:
+        raise RuntimeError(
+            "CFG unconditional source is unavailable; the model was not built "
+            "with cfg.enabled=true"
+        )
+    mean = position
+    if mean.shape[-2:] != spatial_size:
+        mean = F.interpolate(
+            mean.unsqueeze(0), size=spatial_size,
+            mode="bilinear", align_corners=False,
+        ).squeeze(0)
+    return mean.to(device=device, dtype=dtype).unsqueeze(0).expand(
+        batch_size, -1, -1, -1
+    )
+
+
 def freeze_source_model(model: nn.Module) -> nn.Module:
     """Completely freeze a source and keep it in eval mode across train calls."""
     model.requires_grad_(False)
@@ -546,6 +572,20 @@ def build_source_model(config: dict):
         state = checkpoint.get("source_model", checkpoint.get("model", checkpoint))
         model.load_state_dict(state, strict=True)
         checkpoint_loaded = True
+    cfg = config.get("cfg", {})
+    if cfg.get("enabled", False) and cfg.get("uncond_source", {}).get(
+        "enabled", True
+    ):
+        state_size = state_spatial_size(
+            config["dataset"]["image_size"],
+            config["model"].get("state_downsample_factor", 4),
+        )
+        model.register_parameter(
+            "pos_source",
+            nn.Parameter(torch.zeros(
+                config["dataset"]["num_classes"], *state_size
+            )),
+        )
     model._source_checkpoint_loaded = checkpoint_loaded
     model._source_frozen = False
     if source["freeze"]:

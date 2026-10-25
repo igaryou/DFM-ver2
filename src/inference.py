@@ -85,11 +85,41 @@ def run_flow_from_state(
     )
     assert x.shape[-2:] == expected_state_size
     trajectory = [x.argmax(dim=1)]
+    evaluation_cfg = config.get("evaluation", {}).get("cfg", {})
+    cfg_enabled = bool(evaluation_cfg.get("enabled", False))
+    conditional_image_feat = None
+    unconditional_image_feat = None
+    if cfg_enabled:
+        if not bool(getattr(model, "cfg_enabled", False)):
+            raise RuntimeError(
+                "CFG evaluation was requested, but this endpoint has no learned "
+                "unconditional image branch"
+            )
+        conditional_image_feat = model.encode_image(image)
+        unconditional_image_feat = model.unconditional_image_feature(
+            image.shape[0], tuple(conditional_image_feat.shape[-2:]),
+            dtype=conditional_image_feat.dtype,
+            device=conditional_image_feat.device,
+        )
+        guidance_scale = float(evaluation_cfg.get("guidance_scale", 1.0))
     for scalar_s, scalar_t in make_time_grid(num_steps, image.device):
         batch = image.shape[0]
         s = scalar_s.expand(batch)
         t = scalar_t.expand(batch)
-        logits = model.forward_logits(x, image, s, t)
+        if cfg_enabled:
+            logits_cond = model.forward_logits_with_image_feat(
+                x, conditional_image_feat, s, t
+            )
+            logits_uncond = model.forward_logits_with_image_feat(
+                x, unconditional_image_feat, s, t
+            )
+            logits = logits_uncond + guidance_scale * (
+                logits_cond - logits_uncond
+            )
+        else:
+            # Preserve the original CFG-free call path exactly, including no
+            # extra unconditional endpoint forward.
+            logits = model.forward_logits(x, image, s, t)
         assert logits.shape == x.shape
         probability = torch.softmax(logits.float(), dim=1).to(x.dtype)
         x = flow_map(

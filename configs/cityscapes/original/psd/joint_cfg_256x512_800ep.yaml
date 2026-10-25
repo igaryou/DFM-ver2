@@ -1,0 +1,36 @@
+extends: ../_base_/cityscapes_256x512_800ep_rrdb_ver2.yaml
+
+experiment:
+  name: dfm_cityscapes_cfg_256x512_800ep
+  output_dir: /home/igarashi_25/DFM/results/cityscapes/original/cfg_256x512_800ep
+
+source:
+  prior_type: image_gaussian
+  learned_logvar: false
+  fixed_std: 1.0
+  detach_from_flow: false
+  use_loss_align: false
+  align_weight: 0.0
+  supervision:
+    type: none
+    weight: 0.0
+
+cfg:
+  enabled: true
+  dropout_prob: 0.1
+  uncond_source:
+    enabled: true
+    init: zeros
+  uncond_image:
+    enabled: true
+    channels: 64
+    init: zeros
+    projection:
+      type: conv1x1
+
+evaluation:
+  num_steps: 1
+  num_samples: 1
+  cfg:
+    enabled: true
+    guidance_scale: 1.5

@@ -2,7 +2,7 @@ extends: cityscapes_256x512_800ep_rrdb_ver2.yaml
 
 experiment:
   name: dfm_original_cityscapes_b1_learned_sigma_varreg_800ep
-  output_dir: /home/igarashi_25/DFM/results/cityscapes/original/b1_learned_sigma_varreg_800ep
+  output_dir: /home/igarashi_25/DFM/results/cityscapes/original/b1_learned_sigma_varreg_800ep_no_val_reg
 
 source:
   type: trainable_segformer
@@ -35,10 +35,10 @@ source:
     type: none
     weight: 0.0
   variance_regularization:
-    enabled: true
+    enabled: false
     target_std: 1.0
     weight: 1.0
-    init_at_target: true
+    init_at_target: false
 
 training:
   epochs: 800

@@ -16,7 +16,7 @@ from adaptive_path import (
     path_config as _path_config,
 )
 from state_space import resize_continuous, state_spatial_size
-from source_model import source_statistics
+from source_model import source_statistics, unconditional_source_mean
 from training_stages import schedule_value
 
 
@@ -441,6 +441,7 @@ def sample_prior(
     epoch_index: int = 0,
     source_trainable: bool | None = None,
     retain_source_tensors: bool = False,
+    condition_drop_mask: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Sample state-resolution x0 and compute optional full-resolution supervision."""
     if sampling_mode not in {"training", "inference"}:
@@ -460,6 +461,18 @@ def sample_prior(
         )
     classes = config["dataset"]["num_classes"]
     source = config["source"]
+    cfg_enabled = bool(config.get("cfg", {}).get("enabled", False))
+    if condition_drop_mask is not None:
+        if not cfg_enabled or sampling_mode != "training":
+            raise ValueError(
+                "condition_drop_mask is only valid for CFG training"
+            )
+        if condition_drop_mask.shape != (batch,) or condition_drop_mask.dtype != torch.bool:
+            raise ValueError("condition_drop_mask must be boolean with shape [B]")
+        condition_drop_mask = condition_drop_mask.to(device=image.device)
+        source_model._last_condition_drop_mask = (
+            condition_drop_mask.detach().clone()
+        )
     dtype = image.dtype
     zero = image.sum() * 0.0
     if source["prior_type"] == "gaussian":
@@ -516,8 +529,28 @@ def sample_prior(
     bounded_sigma_map: torch.Tensor | None = None
     mu_state: torch.Tensor | None = None
     with source_context:
-        if sample_state and source["prior_type"] == "image_gaussian":
-            x0, mu, logvar = source_model(image)
+        if source["prior_type"] == "image_gaussian":
+            if condition_drop_mask is not None:
+                conditional_mu, logvar = source_statistics(source_model, image)
+                unconditional_mu = unconditional_source_mean(
+                    source_model,
+                    batch_size=batch,
+                    spatial_size=(height, width),
+                    dtype=conditional_mu.dtype,
+                    device=conditional_mu.device,
+                )
+                selector = condition_drop_mask[:, None, None, None]
+                mu = torch.where(selector, unconditional_mu, conditional_mu)
+                if sample_state:
+                    sigma = torch.exp(0.5 * logvar.float()).to(mu.dtype)
+                    x0 = mu + sigma * torch.randn_like(mu)
+                else:
+                    x0 = mu
+            elif sample_state:
+                x0, mu, logvar = source_model(image)
+            else:
+                mu, logvar = source_statistics(source_model, image)
+                x0 = mu
         else:
             if (
                 source["prior_type"] == "image_simplex_mixture"
@@ -761,6 +794,11 @@ def sample_prior(
         "source_ce_schedule_progress": mu.new_tensor(schedule_progress),
         "source_optimizer_step": mu.new_tensor(float(optimizer_step)),
     }
+    if condition_drop_mask is not None:
+        stats.update({
+            "cfg_dropout_ratio": condition_drop_mask.float().mean().detach(),
+            "cfg_dropout_count": condition_drop_mask.sum().detach(),
+        })
     if mu_state is not None:
         stats.update({
             "source_mu_raw_abs": mu.detach().abs().mean(),

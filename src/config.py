@@ -240,6 +240,22 @@ DEFAULT_CONFIG: dict[str, Any] = {
             },
         },
     },
+    "cfg": {
+        "enabled": False,
+        "dropout_prob": 0.1,
+        # Backward-compatible shorthand accepted by early CFG experiment files.
+        "uncond_image_channels": None,
+        "uncond_source": {
+            "enabled": True,
+            "init": "zeros",
+        },
+        "uncond_image": {
+            "enabled": True,
+            "channels": 64,
+            "init": "zeros",
+            "projection": {"type": "conv1x1"},
+        },
+    },
     "flow": {
         "time_eps": 1.0e-5,
         "probability_eps": 1.0e-8,
@@ -429,6 +445,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "exclude_void_from_prediction": True,
         "interval": {"unit": "epoch", "value": None},
         "test_time_augmentation": {"enabled": False, "flip": False},
+        "cfg": {"enabled": False, "guidance_scale": 1.0},
     },
     "wandb": {
         "enabled": True,
@@ -440,10 +457,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
     },
 }
 
-# `distributed` was added after the original YAML format. Let older single-GPU
-# configs inherit its safe defaults instead of breaking config compatibility.
+# These sections were added after the original YAML format. Let older configs
+# inherit their disabled/safe defaults instead of breaking compatibility.
 REQUIRED_SECTIONS = tuple(
-    section for section in DEFAULT_CONFIG if section != "distributed"
+    section for section in DEFAULT_CONFIG if section not in {"distributed", "cfg"}
 )
 REQUIRED_KEYS = (
     "experiment.name",
@@ -532,6 +549,81 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("dataset.in_channels must be 1 or 3")
     if dataset["num_classes"] != config["model"]["num_classes"]:
         raise ValueError("dataset.num_classes and model.num_classes must match")
+    cfg = config["cfg"]
+    if not isinstance(cfg["enabled"], bool):
+        raise ValueError("cfg.enabled must be a boolean")
+    dropout_prob = cfg["dropout_prob"]
+    if (
+        isinstance(dropout_prob, bool)
+        or not isinstance(dropout_prob, (int, float))
+        or not math.isfinite(dropout_prob)
+        or not 0.0 <= dropout_prob <= 1.0
+    ):
+        raise ValueError("cfg.dropout_prob must be in [0,1]")
+    for block_name in ("uncond_source", "uncond_image"):
+        block = cfg[block_name]
+        if not isinstance(block["enabled"], bool):
+            raise ValueError(f"cfg.{block_name}.enabled must be a boolean")
+        if block["init"] != "zeros":
+            raise ValueError(f"cfg.{block_name}.init currently supports only zeros")
+    shorthand_channels = cfg.get("uncond_image_channels")
+    if shorthand_channels is not None:
+        if (
+            isinstance(shorthand_channels, bool)
+            or not isinstance(shorthand_channels, int)
+            or shorthand_channels <= 0
+        ):
+            raise ValueError("cfg.uncond_image_channels must be null or a positive integer")
+        cfg["uncond_image"]["channels"] = shorthand_channels
+    uncond_channels = cfg["uncond_image"]["channels"]
+    if (
+        isinstance(uncond_channels, bool)
+        or not isinstance(uncond_channels, int)
+        or uncond_channels <= 0
+    ):
+        raise ValueError("cfg.uncond_image.channels must be a positive integer")
+    if cfg["uncond_image"]["projection"]["type"] != "conv1x1":
+        raise ValueError("cfg.uncond_image.projection.type must be conv1x1")
+    if cfg["enabled"]:
+        if config["source"]["prior_type"] != "image_gaussian":
+            raise ValueError("CFG training requires source.prior_type=image_gaussian")
+        if config["source"]["learned_logvar"] is not False:
+            raise ValueError("CFG training requires source.learned_logvar=false")
+        fixed_std = config["source"]["fixed_std"]
+        if (
+            isinstance(fixed_std, bool)
+            or not isinstance(fixed_std, (int, float))
+            or fixed_std <= 0
+        ):
+            raise ValueError("CFG training requires source.fixed_std > 0")
+        if config["source"]["freeze"]:
+            raise ValueError("CFG training requires source.freeze=false")
+        if config["source"].get("use_loss_align", False):
+            raise ValueError("CFG training requires source.use_loss_align=false")
+        supervision = config["source"].get("supervision") or {}
+        if supervision.get("type") not in {None, "none"} or float(
+            supervision.get("weight") or 0.0
+        ) != 0.0:
+            raise ValueError("CFG training requires source.supervision.type=none and weight=0")
+        if not cfg["uncond_source"]["enabled"] or not cfg["uncond_image"]["enabled"]:
+            raise ValueError("CFG training requires both unconditional branches enabled")
+        if config["model"].get("endpoint", {}).get("type", "unet") != "unet":
+            raise ValueError("CFG currently supports model.endpoint.type=unet")
+    evaluation_cfg = config["evaluation"]["cfg"]
+    if not isinstance(evaluation_cfg["enabled"], bool):
+        raise ValueError("evaluation.cfg.enabled must be a boolean")
+    guidance_scale = evaluation_cfg["guidance_scale"]
+    if (
+        isinstance(guidance_scale, bool)
+        or not isinstance(guidance_scale, (int, float))
+        or not math.isfinite(guidance_scale)
+        or guidance_scale < 0
+    ):
+        raise ValueError("evaluation.cfg.guidance_scale must be non-negative")
+    if evaluation_cfg["enabled"] and not cfg["enabled"]:
+        raise ValueError(
+            "evaluation CFG requires a CFG-trained model (cfg.enabled=true)"
+        )
     exclude_void = config["evaluation"]["exclude_void_from_prediction"]
     if not isinstance(exclude_void, bool):
         raise ValueError("evaluation.exclude_void_from_prediction must be a boolean")

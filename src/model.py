@@ -641,6 +641,7 @@ class DiscreteFlowMapModel(nn.Module):
         num_classes = config["num_classes"]
         self.num_classes = num_classes
         self.state_downsample_factor = config.get("state_downsample_factor", 4)
+        self.cfg_enabled = bool(config.get("cfg", {}).get("enabled", False))
         endpoint = config.get("endpoint", {})
         self.endpoint_type = endpoint.get("type", "unet")
         if self.endpoint_type == "segformer":
@@ -686,6 +687,15 @@ class DiscreteFlowMapModel(nn.Module):
         unet = config["unet"]
         self.mask_encoder = nn.Conv2d(num_classes, channels, 3, padding=1)
         self.image_encoder = build_image_encoder(config)
+        if self.cfg_enabled:
+            cfg = config["cfg"]
+            uncond = cfg["uncond_image"]
+            uncond_channels = int(uncond["channels"])
+            state_size = tuple(int(value) for value in config["state_size"])
+            self.pos_UNet = nn.Parameter(torch.zeros(uncond_channels, *state_size))
+            self.uncond_image_projection = nn.Conv2d(
+                uncond_channels, config["fusion_channels"], 1
+            )
         self.unet = DFMUNet(
             in_channels=channels,
             out_channels=num_classes,
@@ -707,6 +717,47 @@ class DiscreteFlowMapModel(nn.Module):
         if getattr(self, "_debug_capture_shapes", False):
             self._debug_last_shapes = {"image_feat": tuple(feature.shape)}
         return feature
+
+    def unconditional_image_feature(
+        self,
+        batch_size: int,
+        spatial_size: tuple[int, int],
+        *,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """Project one learned positional feature, then batch-broadcast it."""
+        if not self.cfg_enabled or not hasattr(self, "pos_UNet"):
+            raise RuntimeError(
+                "CFG unconditional image feature is unavailable; build the "
+                "model with cfg.enabled=true"
+            )
+        feature = self.uncond_image_projection(self.pos_UNet.unsqueeze(0))
+        if feature.shape[-2:] != spatial_size:
+            feature = F.interpolate(
+                feature, size=spatial_size, mode="bilinear", align_corners=False
+            )
+        feature = feature.to(device=device, dtype=dtype)
+        return feature.expand(batch_size, -1, -1, -1)
+
+    def condition_image_feature(
+        self,
+        image_feat: torch.Tensor,
+        condition_drop_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Select conditional/unconditional features with one sample-wise mask."""
+        if condition_drop_mask.shape != (image_feat.shape[0],):
+            raise ValueError("condition_drop_mask must have shape [B]")
+        if condition_drop_mask.dtype != torch.bool:
+            raise ValueError("condition_drop_mask must have boolean dtype")
+        unconditional = self.unconditional_image_feature(
+            image_feat.shape[0], tuple(image_feat.shape[-2:]),
+            dtype=image_feat.dtype, device=image_feat.device,
+        )
+        self._last_condition_drop_mask = condition_drop_mask.detach().clone()
+        return torch.where(
+            condition_drop_mask[:, None, None, None], unconditional, image_feat
+        )
 
     def expected_image_feature_size(self, image: torch.Tensor) -> tuple[int, int]:
         if self.endpoint_type == "segformer":

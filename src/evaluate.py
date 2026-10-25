@@ -7,7 +7,7 @@ from pathlib import Path
 import torch
 from torch.utils.data import DataLoader,Subset
 
-from checkpoint import _without_module_prefix
+from checkpoint import _without_module_prefix, validate_cfg_checkpoint
 from config import load_config
 from dataset import ade20k_eval_collate, build_dataset
 from distributed import (
@@ -57,6 +57,7 @@ def evaluate(config: dict, checkpoint_path: str | Path) -> dict:
             config["experiment"]["seed"], config["runtime"]["deterministic"]
         )
         checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+        validate_cfg_checkpoint(checkpoint, config, checkpoint_path)
         model, source_model = build_models(config, device)
         model.load_state_dict(
             _without_module_prefix(checkpoint["model"]),
@@ -145,9 +146,15 @@ def evaluate(config: dict, checkpoint_path: str | Path) -> dict:
             if stochastic_counts else None
         )
         checkpoint_stem = Path(checkpoint_path).stem
+        cfg_evaluation = config["evaluation"]["cfg"]
+        cfg_suffix = (
+            f"cfg_on_w{cfg_evaluation['guidance_scale']:g}"
+            if cfg_evaluation["enabled"] else "cfg_off"
+        )
         output_dir = (
             Path(config["experiment"]["output_dir"])
-            / f"evaluation_{checkpoint_stem}_{config['evaluation']['num_steps']}steps"
+            / f"evaluation_{checkpoint_stem}_{cfg_suffix}_"
+            f"{config['evaluation']['num_steps']}steps"
         )
         if context.is_main_process:
             output_dir.mkdir(parents=True, exist_ok=True)
@@ -327,6 +334,9 @@ def evaluate(config: dict, checkpoint_path: str | Path) -> dict:
             "evaluation_resolution": list(config["dataset"]["image_size"]),
             "original_resolution": bool(config["evaluation"]["original_resolution"]),
             "num_samples": int(config["evaluation"]["num_samples"]),
+            "num_steps": int(config["evaluation"]["num_steps"]),
+            "cfg_enabled": bool(cfg_evaluation["enabled"]),
+            "guidance_scale": float(cfg_evaluation["guidance_scale"]),
             "aggregation": config["evaluation"]["aggregation"],
         })
         if context.is_main_process:
@@ -339,6 +349,7 @@ def evaluate(config: dict, checkpoint_path: str | Path) -> dict:
                 init_wandb(config)
                 if (
                     config["dataset"].get("protocol") == "lidc"
+                    or cfg_evaluation["enabled"]
                     or source_diagnostic_enabled
                 ) else None
             )

@@ -199,6 +199,15 @@ def compute_model_training_objectives(
     consistency_config = config["loss"]["consistency"]
     time_config = config["time_sampling"]
     batch_size = image.shape[0]
+    cfg_enabled = bool(config.get("cfg", {}).get("enabled", False))
+    condition_drop_mask = None
+    if cfg_enabled:
+        condition_drop_mask = torch.rand(
+            batch_size, device=image.device
+        ) < float(config["cfg"]["dropout_prob"])
+        # Retained only for diagnostics/tests; all branches below receive this
+        # exact tensor rather than drawing their own dropout decisions.
+        adapter._last_condition_drop_mask = condition_drop_mask.detach().clone()
 
     target_full = target
     factor = config.get("model", {}).get("state_downsample_factor", 1)
@@ -249,6 +258,7 @@ def compute_model_training_objectives(
         source_trainable=(
             active_stage.train_source if active_stage is not None else None
         ),
+        condition_drop_mask=condition_drop_mask,
     )
     detach_source_from_flow = bool(
         config["source"].get("detach_from_flow", False)
@@ -340,6 +350,10 @@ def compute_model_training_objectives(
     if capture_debug_shapes:
         endpoint._debug_capture_shapes = True
     image_feat = endpoint.encode_image(image)
+    if condition_drop_mask is not None:
+        image_feat = endpoint.condition_image_feature(
+            image_feat, condition_drop_mask
+        )
     assert x0.shape == x1_state.shape == targets.one_hot_state.shape
     expected_image_size = (
         endpoint.expected_image_feature_size(image)
@@ -454,6 +468,10 @@ def compute_model_training_objectives(
         ):
             with torch.autocast(device_type=image.device.type, enabled=False):
                 consistency_image_feat = endpoint.encode_image(image.float())
+                if condition_drop_mask is not None:
+                    consistency_image_feat = endpoint.condition_image_feature(
+                        consistency_image_feat, condition_drop_mask
+                    )
         consistency_valid_mask = (
             psd_masks.psd_state if psd_masks is not None
             else targets.valid_mask_state

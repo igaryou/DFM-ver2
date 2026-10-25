@@ -71,11 +71,46 @@ def model_signature(config: dict) -> dict[str, Any]:
     supervision = source_signature.get("supervision")
     if isinstance(supervision, dict) and not supervision.get("include_void", False):
         supervision.pop("include_void", None)
-    return {
+    signature = {
         "num_classes": config["dataset"]["num_classes"],
         "model": model_config,
         "source": source_signature,
     }
+    if config.get("cfg", {}).get("enabled", False):
+        cfg = config["cfg"]
+        signature["cfg"] = {
+            "enabled": True,
+            "uncond_source": copy.deepcopy(cfg["uncond_source"]),
+            "uncond_image": copy.deepcopy(cfg["uncond_image"]),
+        }
+    return signature
+
+
+def validate_cfg_checkpoint(
+    checkpoint: dict, config: dict, path: str | Path
+) -> None:
+    """Give a targeted error when a legacy checkpoint lacks CFG parameters."""
+    if not config.get("cfg", {}).get("enabled", False):
+        return
+    model_state = _without_module_prefix(checkpoint.get("model") or {})
+    source_state = _without_module_prefix(checkpoint.get("source_model") or {})
+    missing = []
+    if "pos_UNet" not in model_state:
+        missing.append("model.pos_UNet")
+    for key in (
+        "uncond_image_projection.weight", "uncond_image_projection.bias"
+    ):
+        if key not in model_state:
+            missing.append(f"model.{key}")
+    if "pos_source" not in source_state:
+        missing.append("source_model.pos_source")
+    if missing:
+        raise RuntimeError(
+            "CFG-enabled loading requires learned unconditional parameters, but "
+            f"checkpoint {path} is missing: {', '.join(missing)}. This appears "
+            "to be a CFG-free checkpoint; load it with cfg.enabled=false or use "
+            "it only to initialize the conditional components explicitly."
+        )
 
 
 def _configured_source_decoder(config: dict) -> str | None:
@@ -566,6 +601,7 @@ def initialize_or_resume(
     strict = checkpoint_config["strict_model"]
     if weights_from:
         checkpoint = torch.load(weights_from, map_location="cpu", weights_only=False)
+        validate_cfg_checkpoint(checkpoint, config, weights_from)
         _validate_weights_checkpoint(checkpoint, config, weights_from)
         model_state = _model_state_for_current_transformers(
             _without_module_prefix(checkpoint["model"]), model
@@ -622,6 +658,7 @@ def initialize_or_resume(
         return TrainingState()
     if init_from:
         checkpoint = torch.load(init_from, map_location="cpu", weights_only=False)
+        validate_cfg_checkpoint(checkpoint, config, init_from)
         _validate_stage2_init_checkpoint(checkpoint, config, init_from)
         saved_source = checkpoint.get("source_model")
         if source_model is not None:
@@ -667,6 +704,7 @@ def initialize_or_resume(
         )
     if resume:
         checkpoint = torch.load(resume, map_location="cpu", weights_only=False)
+        validate_cfg_checkpoint(checkpoint, config, resume)
         validate_source_decoder_checkpoint(checkpoint, config, resume)
         if not _resume_stage_compatible(checkpoint, config):
             raise RuntimeError(
